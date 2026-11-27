@@ -17,7 +17,9 @@ export interface TuningPanel {
   dispose(): void;
 }
 
-type ParamKey = keyof CarParams;
+/** Numeric fields are found at run time (see paramKeys), so a key is just a name here. */
+type ParamKey = string;
+type ParamValues = Record<ParamKey, number>;
 
 interface ParamRange {
   group: string;
@@ -48,8 +50,13 @@ function range(group: string, min: number, max: number, step: number): ParamRang
   return { group, min, max, step };
 }
 
-/** One slider per CarParams field, in display order. The Record type makes a missing field a compile error. */
-const RANGES: Record<ParamKey, ParamRange> = {
+const OTHER_GROUP = 'Other';
+
+/**
+ * Hand-picked slider travel for the fields we know, in display order. A numeric field that is not listed here
+ * (one added to CarParams later) still gets a slider: see autoRange.
+ */
+const RANGES: Readonly<Record<ParamKey, ParamRange | undefined>> = {
   mass: range('Chassis', 400, 2500, 10),
   inertia: range('Chassis', 300, 4000, 10),
   cgToFront: range('Chassis', 0.5, 2.5, 0.01),
@@ -92,6 +99,34 @@ const TELEMETRY: readonly TelemetryField[] = [
   { label: 'Rear slide', read: (car) => car.rearSlide.toFixed(2) },
 ];
 
+/** CarParams is all numbers today; this view lets the panel treat whatever numeric fields it finds alike. */
+function values(params: CarParams): ParamValues {
+  return params as unknown as ParamValues;
+}
+
+/** A workable slider for a field nobody has tuned a range for: zero to three times the shipped value. */
+function autoRange(value: number): ParamRange {
+  const size = Math.max(Math.abs(value), 0.5);
+  let step = 0.01;
+  if (size >= 300) step = 10;
+  else if (size >= 30) step = 1;
+  else if (size >= 3) step = 0.1;
+  const max = Math.ceil((size * 3) / step) * step;
+  return range(OTHER_GROUP, value < 0 ? -max : 0, max, step);
+}
+
+function rangeFor(key: ParamKey, defaults: ParamValues): ParamRange {
+  return RANGES[key] ?? autoRange(defaults[key]);
+}
+
+/** Every numeric field of the shipped car: the known ones in table order, then any newcomers. */
+function paramKeys(defaults: ParamValues): ParamKey[] {
+  const isNumeric = (key: ParamKey): boolean => typeof defaults[key] === 'number' && Number.isFinite(defaults[key]);
+  const known = Object.keys(RANGES).filter(isNumeric);
+  const extra = Object.keys(defaults).filter((key) => RANGES[key] === undefined && isNumeric(key));
+  return known.concat(extra);
+}
+
 function digitsFor(step: number): number {
   if (step >= 1) return 0;
   return step >= 0.1 ? 1 : 2;
@@ -102,8 +137,8 @@ function showValue(row: ParamRow, value: number): void {
   row.readout.textContent = value.toFixed(row.digits);
 }
 
-function buildRow(key: ParamKey, defaults: CarParams): { node: HTMLElement; row: ParamRow } {
-  const { min, max, step } = RANGES[key];
+function buildRow(key: ParamKey, travel: ParamRange, defaults: ParamValues): { node: HTMLElement; row: ParamRow } {
+  const { min, max, step } = travel;
   const slider = el('input', 'sd-range');
   slider.type = 'range';
   // The table is a guess at useful travel: never let it exclude the value the car actually ships with.
@@ -128,16 +163,17 @@ function buildTelemetry(): { node: HTMLElement; cells: HTMLElement[] } {
   return { node, cells };
 }
 
-function buildRows(defaults: CarParams): { node: HTMLElement; rows: ParamRow[] } {
+function buildRows(defaults: ParamValues): { node: HTMLElement; rows: ParamRow[] } {
   const node = el('div', 'sd-tune-body');
   const rows: ParamRow[] = [];
   let group = '';
-  for (const key of Object.keys(RANGES) as ParamKey[]) {
-    if (RANGES[key].group !== group) {
-      group = RANGES[key].group;
+  for (const key of paramKeys(defaults)) {
+    const travel = rangeFor(key, defaults);
+    if (travel.group !== group) {
+      group = travel.group;
       node.appendChild(el('h3', 'sd-label sd-tune-group', group));
     }
-    const built = buildRow(key, defaults);
+    const built = buildRow(key, travel, defaults);
     node.appendChild(built.node);
     rows.push(built.row);
   }
@@ -159,7 +195,7 @@ export function createTuningPanel(root: HTMLElement, opts: TuningOptions): Tunin
 
   const panel = el('div', 'sd-ui sd-panel sd-tune sd-hidden');
   const telemetry = buildTelemetry();
-  const { node: body, rows } = buildRows(opts.defaults);
+  const { node: body, rows } = buildRows(values(opts.defaults));
   const copyButton = smallButton(COPY_LABEL, copyJson);
   const actions = el('div', 'sd-tune-actions');
   actions.append(smallButton('Reset to defaults', resetToDefaults), copyButton);
@@ -169,13 +205,14 @@ export function createTuningPanel(root: HTMLElement, opts: TuningOptions): Tunin
   root.appendChild(panel);
 
   function syncFromParams(): void {
-    const params = opts.getParams();
+    const params = values(opts.getParams());
     for (const row of rows) showValue(row, params[row.key]);
   }
 
   function resetToDefaults(): void {
-    const params = opts.getParams();
-    for (const row of rows) params[row.key] = opts.defaults[row.key];
+    const params = values(opts.getParams());
+    const defaults = values(opts.defaults);
+    for (const row of rows) params[row.key] = defaults[row.key];
     syncFromParams();
     opts.onChange?.();
   }
@@ -210,7 +247,7 @@ export function createTuningPanel(root: HTMLElement, opts: TuningOptions): Tunin
   for (const row of rows) {
     row.slider.addEventListener('input', () => {
       const value = row.slider.valueAsNumber;
-      opts.getParams()[row.key] = value;
+      values(opts.getParams())[row.key] = value;
       row.readout.textContent = value.toFixed(row.digits);
       opts.onChange?.();
     });

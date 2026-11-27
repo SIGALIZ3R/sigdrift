@@ -1,30 +1,16 @@
 /**
  * Mode 1: drive from the start pad to the goal through every checkpoint, against the clock.
  *
- * The mode owns the rules (countdown, gates, resets, drift scoring) and tells the world when to step. It never
- * touches car physics.
+ * The mode owns the rules (countdown, gates, resets) and tells the world when to step. Drift scoring is in
+ * driftScore.ts, shared with endless mode. It never touches car physics.
  */
 import { cos, sin } from '../core/fixedMath';
 import type { Gate, InputState, Pose, RunMode, RunState, World } from '../types';
-import { DT, SIM_HZ } from '../types';
+import { SIM_HZ } from '../types';
+import { DriftScorer } from './driftScore';
 
 export const COUNTDOWN_TICKS = 3 * SIM_HZ;
 
-const DRIFT_MIN_SPEED = 7;
-const DRIFT_MIN_ANGLE = 0.2;
-/**
- * Past ninety degrees the car is travelling tail first, and a slide that deep still scores up to this angle.
- * Plain reversing reads as an angle near pi, far outside it.
- */
-const DRIFT_MAX_ANGLE = 1.9;
-const DRIFT_POINTS_RATE = 10;
-/** A chain survives this long without drifting, so that linked drifts count as one. */
-const CHAIN_GRACE_TICKS = Math.round(1.2 * SIM_HZ);
-const MULTIPLIER_STEP_TICKS = 2 * SIM_HZ;
-const MAX_MULTIPLIER = 8;
-const CRASH_IMPACT = 3;
-const SPIN_ANGLE = 2.2;
-const SPIN_MIN_SPEED = 5;
 /** Below this the roll-out swaps the brake for the handbrake, because a held brake selects reverse at a standstill. */
 const ROLL_OUT_BRAKE_SPEED = 1;
 
@@ -103,13 +89,12 @@ class Run implements RunMode {
   private readonly gates: GateLine[];
   private readonly rollOutInput: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
   private resetHeld = false;
-  /** Ticks spent drifting in the live chain; 0 means there is no chain. */
-  private chainDriftTicks = 0;
-  private chainIdleTicks = 0;
+  private readonly drift: DriftScorer;
 
   constructor(world: World) {
     this.world = world;
     this.state = freshState(world);
+    this.drift = new DriftScorer(this.state);
     this.gates = [...world.level.checkpoints, world.level.goal].map(gateLine);
     this.restart();
   }
@@ -138,7 +123,7 @@ class Run implements RunMode {
     state.lastCheckpointTick = -1;
     state.lastChainBreakTick = -1;
     this.resetHeld = false;
-    this.clearChain();
+    this.drift.clear();
   }
 
   private stepCountdown(): void {
@@ -157,7 +142,7 @@ class Run implements RunMode {
     const fromX = car.x;
     const fromZ = car.z;
     world.step(input);
-    this.scoreDrift();
+    this.drift.update(car, world.lastCollision);
     if (crossesForwards(this.gates[state.nextCheckpoint], fromX, fromZ, car.x, car.z)) this.passGate();
   }
 
@@ -175,7 +160,7 @@ class Run implements RunMode {
   private respawn(): void {
     this.world.placeCar(this.state.respawn);
     this.state.resets++;
-    this.loseChain();
+    this.drift.lose();
   }
 
   private passGate(): void {
@@ -183,57 +168,13 @@ class Run implements RunMode {
     if (state.nextCheckpoint === state.checkpointCount) {
       state.phase = 'finished';
       state.drifting = false;
-      this.bankChain();
+      this.drift.bank();
       return;
     }
     copyPose(world.level.checkpoints[state.nextCheckpoint].respawn, state.respawn);
     state.nextCheckpoint++;
     state.splits.push(state.ticks);
     state.lastCheckpointTick = state.ticks;
-  }
-
-  private scoreDrift(): void {
-    const { world, state } = this;
-    const car = world.car;
-    const angle = Math.abs(car.driftAngle);
-    const hit = world.lastCollision;
-    if ((hit !== null && hit.impact > CRASH_IMPACT) || (angle > SPIN_ANGLE && car.speed > SPIN_MIN_SPEED)) {
-      state.drifting = false;
-      this.loseChain();
-      return;
-    }
-    // No "nose first" condition: driftAngle is atan2(lateral, forward), so that would cap the angle at pi / 2 and
-    // turn the deepest part of a big slide into dead time.
-    const drifting = car.speed > DRIFT_MIN_SPEED && angle > DRIFT_MIN_ANGLE && angle < DRIFT_MAX_ANGLE;
-    state.drifting = drifting;
-    if (drifting) {
-      state.chainScore += car.speed * angle * DT * DRIFT_POINTS_RATE;
-      this.chainDriftTicks++;
-      this.chainIdleTicks = 0;
-      const steps = Math.floor(this.chainDriftTicks / MULTIPLIER_STEP_TICKS);
-      state.multiplier = Math.min(MAX_MULTIPLIER, 1 + steps);
-    } else if (this.chainDriftTicks > 0 && ++this.chainIdleTicks >= CHAIN_GRACE_TICKS) {
-      this.bankChain();
-    }
-  }
-
-  private bankChain(): void {
-    this.state.driftScore += Math.round(this.state.chainScore * this.state.multiplier);
-    this.clearChain();
-  }
-
-  /** Throws the live chain away. With no chain there is nothing to lose and nothing to flash on the HUD. */
-  private loseChain(): void {
-    if (this.chainDriftTicks > 0) this.state.lastChainBreakTick = this.state.ticks;
-    this.clearChain();
-  }
-
-  private clearChain(): void {
-    this.state.chainScore = 0;
-    this.state.multiplier = 1;
-    this.state.drifting = false;
-    this.chainDriftTicks = 0;
-    this.chainIdleTicks = 0;
   }
 }
 

@@ -31,3 +31,15 @@ export function formatScore(n: number): string {
   const digits = String(Math.abs(rounded)).replace(/\B(?=(\d{3})+$)/g, ',');
   return rounded < 0 ? `-${digits}` : digits;
 }
+
+const METRES_PER_KM = 1000;
+
+/**
+ * A distance along the road: whole metres up to a kilometre ("842 m"), then kilometres to 10 m ("2.41 km").
+ * Always rounded down, so a distance is never shown before it has been reached. Negative input reads as zero.
+ */
+export function formatDistance(m: number): string {
+  const metres = Number.isFinite(m) && m > 0 ? m : 0;
+  if (metres < METRES_PER_KM) return `${Math.floor(metres)} m`;
+  return `${(Math.floor(metres / 10) / 100).toFixed(2)} km`;
+}

@@ -1,4 +1,6 @@
 import type { CarState } from '../types';
+import { createTyreMix, tyreMix } from './mapping';
+import { createGlide } from './param';
 
 export interface TireVoice {
   /** `now` is the AudioContext time. `active = false` fades the tyres out. */
@@ -6,19 +8,31 @@ export interface TireVoice {
   dispose(): void;
 }
 
-/** Tyres make no noise below this speed (m/s) and reach full volume `SPEED_RANGE` above it. */
-const QUIET_SPEED = 2;
-const SPEED_RANGE = 10;
-const MAX_LEVEL = 0.9;
-/** Drift angle (rad) at which the squeal stops rising in pitch. */
-const MAX_DRIFT = 1.2;
+/** Wide band for the scrub: it should roar, not sing. */
+export const SCRUB_Q = 0.8;
+/** A band-pass that wide lets a lot of hiss through above it; rubber on tarmac has very little up there. */
+export const SCRUB_TOP_HZ = 3000;
+/**
+ * The squeal is noise through two identical narrow band-passes in series. Noise that narrow is very nearly a
+ * tone, but one whose loudness and pitch never quite hold still, which is exactly what a squealing tyre does.
+ */
+export const SQUEAL_Q = 14;
+/** A second, weaker resonance above the main one keeps the squeal from sounding like a whistle. */
+export const SQUEAL_OVERTONE = 2.04;
+export const SQUEAL_OVERTONE_LEVEL = 0.3;
+/**
+ * Narrow-band noise is quiet; this brings the squeal up to just under the level of a full scrub. It sits where
+ * hearing is keenest, so it carries without being as loud.
+ */
+export const SQUEAL_MAKEUP = 1.4;
+
 const WOBBLE_HZ = 6.5;
+/** Share of the wobble that is a steady warble; the rest wanders at random. */
+const WOBBLE_STEADY = 0.45;
+const WANDER_RATE = 9;
 const SMOOTH = 0.05;
 const FADE_SMOOTH = 0.08;
-
-function clamp01(value: number): number {
-  return value < 0 ? 0 : value > 1 ? 1 : value;
-}
+const MAX_STEP = 0.1;
 
 /** Mono white noise, long enough that the loop point is not heard as a rhythm. */
 export function createNoiseBuffer(ctx: BaseAudioContext, seconds = 2): AudioBuffer {
@@ -28,35 +42,99 @@ export function createNoiseBuffer(ctx: BaseAudioContext, seconds = 2): AudioBuff
   return buffer;
 }
 
-export function createTireVoice(ctx: BaseAudioContext, noise: AudioBuffer, destination: AudioNode): TireVoice {
-  const source = ctx.createBufferSource();
-  source.buffer = noise;
-  source.loop = true;
+function bandPass(ctx: BaseAudioContext, hz: number, q: number): BiquadFilterNode {
   const filter = ctx.createBiquadFilter();
   filter.type = 'bandpass';
-  filter.frequency.value = 900;
-  filter.Q.value = 3;
-  const output = ctx.createGain();
-  output.gain.value = 0;
-  source.connect(filter).connect(output).connect(destination);
-  source.start();
+  filter.frequency.value = hz;
+  filter.Q.value = q;
+  return filter;
+}
+
+function silentGain(ctx: BaseAudioContext): GainNode {
+  const gain = ctx.createGain();
+  gain.gain.value = 0;
+  return gain;
+}
+
+export function createTireVoice(ctx: BaseAudioContext, noise: AudioBuffer, destination: AudioNode): TireVoice {
+  // Two readers of the same noise, started far apart so the layers are not copies of each other.
+  const scrubSource = ctx.createBufferSource();
+  scrubSource.buffer = noise;
+  scrubSource.loop = true;
+  const squealSource = ctx.createBufferSource();
+  squealSource.buffer = noise;
+  squealSource.loop = true;
+
+  // Scrub: noise -> wide band-pass -> low-pass (fixed) -> gain -> destination.
+  const scrubBand = bandPass(ctx, 500, SCRUB_Q);
+  const scrubTop = ctx.createBiquadFilter();
+  scrubTop.type = 'lowpass';
+  scrubTop.frequency.value = SCRUB_TOP_HZ;
+  scrubTop.Q.value = -3;
+  const scrubGain = silentGain(ctx);
+  scrubSource.connect(scrubBand).connect(scrubTop).connect(scrubGain).connect(destination);
+
+  // Squeal: noise -> narrow band-pass -> narrow band-pass -> gain -> destination,
+  //         and from the first band-pass's input a parallel overtone band-pass -> its level -> the same gain.
+  const squealFirst = bandPass(ctx, 800, SQUEAL_Q);
+  const squealSecond = bandPass(ctx, 800, SQUEAL_Q);
+  const squealOvertone = bandPass(ctx, 800 * SQUEAL_OVERTONE, SQUEAL_Q * 1.5);
+  const overtoneLevel = ctx.createGain();
+  overtoneLevel.gain.value = SQUEAL_OVERTONE_LEVEL;
+  const squealMakeup = ctx.createGain();
+  squealMakeup.gain.value = SQUEAL_MAKEUP;
+  const squealGain = silentGain(ctx);
+  squealSource.connect(squealFirst).connect(squealSecond).connect(squealMakeup);
+  squealSource.connect(squealOvertone).connect(overtoneLevel).connect(squealMakeup);
+  squealMakeup.connect(squealGain).connect(destination);
+
+  const startAt = ctx.currentTime;
+  scrubSource.start(startAt, 0.11);
+  squealSource.start(startAt, 1.03);
+
+  const scrubLevel = createGlide(scrubGain.gain);
+  const scrubCentre = createGlide(scrubBand.frequency);
+  const squealLevel = createGlide(squealGain.gain);
+  const squealCentreFirst = createGlide(squealFirst.frequency);
+  const squealCentreSecond = createGlide(squealSecond.frequency);
+  const squealCentreOvertone = createGlide(squealOvertone.frequency);
+
+  const mix = createTyreMix();
+  let wander = 0;
+  let lastNow = -1;
 
   return {
     update(car, active, now) {
-      const slide = clamp01(Math.max(car.rearSlide, car.frontSlide));
-      const speed = clamp01((car.speed - QUIET_SPEED) / SPEED_RANGE);
-      // Slightly convex so a light slide whispers and a full slide howls.
-      const level = active ? MAX_LEVEL * speed * slide * (0.4 + 0.6 * slide) : 0;
-      output.gain.setTargetAtTime(level, now, active ? SMOOTH : FADE_SMOOTH);
+      const dt = lastNow < 0 ? 0 : Math.min(Math.max(now - lastNow, 0), MAX_STEP);
+      lastNow = now;
+      // A random walk pulled back to zero, mixed with a steady warble.
+      wander += (Math.random() * 2 - 1 - wander) * Math.min(1, WANDER_RATE * dt);
+      const wobble = WOBBLE_STEADY * Math.sin(now * WOBBLE_HZ * 2 * Math.PI) + (1 - WOBBLE_STEADY) * wander;
 
-      const drift = Math.min(Math.abs(car.driftAngle), MAX_DRIFT);
-      const wobble = Math.sin(now * WOBBLE_HZ * 2 * Math.PI) * drift;
-      filter.frequency.setTargetAtTime(880 + 460 * drift + 6 * car.speed + 90 * wobble, now, SMOOTH);
-      filter.Q.setTargetAtTime(3 + 3 * drift + 1.2 * wobble, now, SMOOTH);
+      tyreMix(
+        car.speed,
+        car.rearSlide,
+        car.frontSlide,
+        car.driftAngle,
+        car.handbrake === true,
+        car.airborne === true,
+        wobble,
+        mix,
+      );
+
+      const smooth = active ? SMOOTH : FADE_SMOOTH;
+      scrubLevel.to(active ? mix.scrubGain : 0, now, smooth);
+      squealLevel.to(active ? mix.squealGain : 0, now, smooth);
+      scrubCentre.to(mix.scrubHz, now, SMOOTH);
+      squealCentreFirst.to(mix.squealHz, now, SMOOTH);
+      squealCentreSecond.to(mix.squealHz, now, SMOOTH);
+      squealCentreOvertone.to(mix.squealHz * SQUEAL_OVERTONE, now, SMOOTH);
     },
     dispose() {
-      source.stop();
-      output.disconnect();
+      scrubSource.stop();
+      squealSource.stop();
+      scrubGain.disconnect();
+      squealGain.disconnect();
     },
   };
 }

@@ -194,8 +194,10 @@ describe('bot', () => {
  */
 describe('driveability of the weekly levels', () => {
   it.each(WEEKS)('%s: the bot finishes in under 150 s with at most 3 resets', (id) => {
-    const { run } = botDrive(generateLevel(id), TIME_LIMIT_S);
+    const { run, contacts } = botDrive(generateLevel(id), TIME_LIMIT_S);
     expect(run.state.phase).toBe('finished');
+    // It does better than the limits ask: no wall and no pillar is so much as brushed on the way.
+    expect(contacts).toBe(0);
     expect(run.state.ticks * DT).toBeLessThan(TIME_LIMIT_S);
     expect(run.state.resets).toBeLessThanOrEqual(MAX_RESETS);
     expect(run.state.nextCheckpoint).toBe(run.state.checkpointCount);
@@ -295,7 +297,7 @@ describe('driveability of the weekly levels on a keyboard, assist on', () => {
     expect(drive.seconds).toBeLessThan(90);
   });
 
-  it('copes with twitchy hands on every level, where the same hands without the assist mostly spin', () => {
+  it('copes with twitchy hands on every level, where the same hands without the assist spin', () => {
     let assistedSpins = 0;
     let unaidedSpins = 0;
     let unaidedFinishes = 0;
@@ -311,7 +313,10 @@ describe('driveability of the weekly levels on a keyboard, assist on', () => {
     }
     expect(assistedSpins).toBeLessThanOrEqual(WEEKS.length / 2);
     // With the assist off the car is as loose as it was built to be: these hands are not good enough for it.
-    expect(unaidedSpins).toBeGreaterThan(30);
+    // (About one spin a level. It was three before braking stopped unloading the rear axle past
+    // BRAKE_TRANSFER_LIMIT: most of those spins came from the brake pedal, not from the hands.)
+    expect(unaidedSpins).toBeGreaterThan(8);
+    expect(unaidedSpins).toBeGreaterThan(2 * assistedSpins);
     expect(unaidedFinishes).toBeLessThan(WEEKS.length);
   });
 });

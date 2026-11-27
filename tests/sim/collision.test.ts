@@ -1,9 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import type { InputState, Level, Prop, World } from '../../src/types';
+import type { CarState, InputState, Level, Prop, Segment, World } from '../../src/types';
 import { DT } from '../../src/types';
 import { atan2, cos, hypot, sin } from '../../src/core/fixedMath';
-import { createCarState } from '../../src/sim/car';
-import { buildCollider, resolveCollisions } from '../../src/sim/collision';
+import { Rng } from '../../src/core/rng';
+import { createCarState, stepCar } from '../../src/sim/car';
+import type { Collider } from '../../src/sim/collision';
+import {
+  WALL_CLEAR_HEIGHT,
+  addSolids,
+  buildCollider,
+  colliderStats,
+  createCollider,
+  removeSolids,
+  resolveCollisions,
+} from '../../src/sim/collision';
 import { DEFAULT_CAR_PARAMS } from '../../src/sim/params';
 import { createWorld } from '../../src/sim/world';
 import { makeOpenLevel, makeStraightLevel } from '../helpers/handLevel';
@@ -186,7 +196,8 @@ describe('walls', () => {
   it('never speed up a car that was not spinning', () => {
     for (let heading = -3; heading <= 3; heading += 0.5) {
       for (let travel = -1.4; travel <= 1.4; travel += 0.35) {
-        const report = crash(launch(ARENA, 97.5, 0, heading, 35, travel), 0.6);
+        // Close enough that even a car rolling almost parallel to the wall reaches it before its tyres bite.
+        const report = crash(launch(ARENA, 98.2, 0, heading, 35, travel), 0.6);
         expect(report.hits).toBeGreaterThan(0);
         expect(report.speedAfterFirstHit).toBeLessThanOrEqual(report.speedBeforeFirstHit + 1e-9);
       }
@@ -324,5 +335,151 @@ describe('pillars', () => {
       expect(world.lastCollision).toBeNull();
     }
     expect(world.car.x).toBeGreaterThan(pillar.x + 10);
+  });
+});
+
+describe('a collider that changes while the car drives', () => {
+  const wallAt = (x: number): Segment => ({ ax: x, az: -40, bx: x, bz: 40 });
+  const pillarAt = (x: number, z = 0): Prop => ({ kind: 'pillar', x, z, radius: 1.5, height: 4, hue: 0 });
+
+  /** Drives a car along +x from `fromX` at 30 m/s for `seconds` and returns it. */
+  function run(collider: Collider, fromX: number, seconds: number, walls = true, z = 0): { car: CarState; hits: number } {
+    const car = createCarState({ x: fromX, z, heading: 0 });
+    car.vx = 30;
+    let hits = 0;
+    for (let i = 0; i < seconds / DT; i++) {
+      stepCar(car, DEFAULT_CAR_PARAMS, { ...IDLE, throttle: 1 }, DT);
+      if (resolveCollisions(car, DEFAULT_CAR_PARAMS, collider, walls)) hits++;
+    }
+    return { car, hits };
+  }
+
+  it('starts empty and stops nothing', () => {
+    const collider = createCollider();
+    expect(colliderStats(collider)).toEqual({ walls: 0, props: 0, cells: 0, owners: 0 });
+    const { car, hits } = run(collider, 0, 2);
+    expect(hits).toBe(0);
+    expect(car.x).toBeGreaterThan(55);
+  });
+
+  it('adds and removes walls by owner, leaving no ghost behind', () => {
+    const collider = createCollider();
+    addSolids(collider, 1, [wallAt(30)], []);
+    addSolids(collider, 2, [wallAt(60)], []);
+    expect(colliderStats(collider)).toMatchObject({ walls: 2, owners: 2 });
+    expect(run(collider, 0, 3).car.x).toBeLessThan(30);
+
+    removeSolids(collider, 1);
+    expect(colliderStats(collider)).toMatchObject({ walls: 1, owners: 1 });
+    const second = run(collider, 0, 3);
+    expect(second.car.x).toBeGreaterThan(30);
+    expect(second.car.x).toBeLessThan(60);
+    expect(second.hits).toBeGreaterThan(0);
+
+    removeSolids(collider, 2);
+    expect(colliderStats(collider)).toEqual({ walls: 0, props: 0, cells: 0, owners: 0 });
+    const third = run(collider, 0, 3);
+    expect(third.hits).toBe(0);
+    expect(third.car.x).toBeGreaterThan(85);
+  });
+
+  it('reuses the room a removed owner left without bringing its walls back', () => {
+    const collider = createCollider();
+    for (let round = 0; round < 50; round++) {
+      // Each owner's walls go where the previous owner's were not.
+      const x = 30 + (round % 5) * 10;
+      addSolids(collider, round, [wallAt(x), wallAt(x + 200)], [pillarAt(x + 100, 80)]);
+      const { car, hits } = run(collider, 0, 3);
+      expect(hits).toBeGreaterThan(0);
+      expect(car.x).toBeLessThan(x);
+      expect(car.x).toBeGreaterThan(x - 12);
+      removeSolids(collider, round);
+    }
+    expect(colliderStats(collider)).toEqual({ walls: 0, props: 0, cells: 0, owners: 0 });
+  });
+
+  it('removes everything an owner added over several calls, and ignores owners it never saw', () => {
+    const collider = createCollider();
+    addSolids(collider, 7, [wallAt(30)], []);
+    addSolids(collider, 7, [wallAt(31)], [pillarAt(20)]);
+    addSolids(collider, 8, [], [pillarAt(50)]);
+    removeSolids(collider, 99);
+    expect(colliderStats(collider)).toMatchObject({ walls: 2, props: 2, owners: 2 });
+    removeSolids(collider, 7);
+    expect(colliderStats(collider)).toMatchObject({ walls: 0, props: 1, owners: 1 });
+    const { car } = run(collider, 0, 3);
+    // Past where owner 7's pillar and walls were, stopped by owner 8's pillar.
+    expect(car.x).toBeGreaterThan(31);
+    expect(car.x).toBeLessThan(50);
+    removeSolids(collider, 7);
+    removeSolids(collider, 8);
+    expect(colliderStats(collider)).toEqual({ walls: 0, props: 0, cells: 0, owners: 0 });
+  });
+
+  it('behaves exactly like a collider built in one go', () => {
+    const level: Level = { ...makeOpenLevel(120), props: [pillarAt(25, 6), pillarAt(-20, -25), pillarAt(10, 40)] };
+    const whole = buildCollider(level);
+    const pieces = createCollider();
+    // Scrambled order, one owner per piece, with some unrelated geometry added and removed along the way.
+    addSolids(pieces, 50, [wallAt(0)], [pillarAt(0)]);
+    level.props.forEach((prop, i) => addSolids(pieces, 10 + i, [], [prop]));
+    [3, 0, 2, 1].forEach((i) => addSolids(pieces, i, [level.walls[i]], []));
+    removeSolids(pieces, 50);
+
+    const a = createCarState(level.start);
+    const b = createCarState(level.start);
+    const rng = new Rng('pieces');
+    let held = IDLE;
+    let hits = 0;
+    for (let i = 0; i < 60 / DT; i++) {
+      if (i % 40 === 0) {
+        held = { ...IDLE, steer: rng.range(-1, 1), throttle: rng.chance(0.9) ? 1 : 0, handbrake: rng.chance(0.1) };
+      }
+      stepCar(a, DEFAULT_CAR_PARAMS, held, DT);
+      stepCar(b, DEFAULT_CAR_PARAMS, held, DT);
+      const hitA = resolveCollisions(a, DEFAULT_CAR_PARAMS, whole);
+      const hitB = resolveCollisions(b, DEFAULT_CAR_PARAMS, pieces);
+      expect(hitB).toEqual(hitA);
+      if (hitA) hits++;
+    }
+    expect(b).toEqual(a);
+    expect(hits).toBeGreaterThan(50);
+  });
+
+  it('works just as well far from the origin and on the negative side', () => {
+    for (const origin of [-5000, 123456.5, -300000, 2.5e6]) {
+      const collider = createCollider();
+      addSolids(collider, 1, [wallAt(origin + 30)], [pillarAt(origin + 20, 20)]);
+      const { car, hits } = run(collider, origin, 3);
+      expect(hits).toBeGreaterThan(0);
+      expect(car.x + REACH + RADIUS).toBeLessThan(origin + 30.01);
+      const blocked = run(collider, origin, 3, true, 20);
+      expect(blocked.car.x).toBeLessThan(origin + 20);
+    }
+  });
+
+  it('lets a car that is flying clear of the walls pass over them, but never through a pillar', () => {
+    expect(WALL_CLEAR_HEIGHT).toBeGreaterThan(0.7);
+    const collider = createCollider();
+    addSolids(collider, 1, [wallAt(30)], [pillarAt(60)]);
+    const over = run(collider, 0, 3, false);
+    expect(over.car.x).toBeGreaterThan(30);
+    expect(over.car.x + REACH + RADIUS).toBeLessThan(60 - 1.5 + 0.01);
+    expect(over.hits).toBeGreaterThan(0);
+    // The same car on the ground does not get past the wall.
+    expect(run(collider, 0, 3, true).car.x).toBeLessThan(30);
+  });
+
+  it('survives geometry that makes no sense', () => {
+    const collider = createCollider();
+    addSolids(collider, 1, [{ ax: NaN, az: 0, bx: 10, bz: 0 }, { ax: 0, az: 0, bx: Infinity, bz: 0 }, wallAt(30)], [
+      { ...pillarAt(NaN), radius: 2 },
+      { ...pillarAt(10, 30), radius: Infinity },
+    ]);
+    const { car } = run(collider, 0, 3);
+    expect(car.x).toBeLessThan(30);
+    expect(Number.isFinite(car.x)).toBe(true);
+    removeSolids(collider, 1);
+    expect(colliderStats(collider)).toEqual({ walls: 0, props: 0, cells: 0, owners: 0 });
   });
 });

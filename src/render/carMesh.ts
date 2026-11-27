@@ -12,7 +12,9 @@ import {
 } from 'three';
 import type { BufferGeometry, Material, Texture } from 'three';
 import type { CarParams, RenderFrame } from '../types';
-import { GeometryBuilder, builderMaterial } from './levelMesh';
+import { GeometryBuilder, builderMaterial } from './geometry';
+import { FLAT_GROUND } from './ground';
+import type { Ground } from './ground';
 import { CAR } from './palette';
 
 /**
@@ -71,6 +73,38 @@ const PITCH_PER_ACCEL = 0.003;
 const LEAN_RATE = 10;
 const BRAKE_LIGHT_RATE = 22;
 
+// Jumps (endless mode). On the ground the whole car tilts with the slope under its axles; in the air its nose
+// follows the flight path, gently.
+/** How fast the body takes up the slope of the ground, 1/s: quick, the wheels are on it. */
+const GROUND_PITCH_RATE = 40;
+/** How fast it turns towards the flight path once in the air, 1/s. */
+const FLIGHT_PITCH_RATE = 7;
+/** Share of the flight path's angle the nose takes on, and the most it ever shows, rad. */
+const FLIGHT_PITCH_GAIN = 0.7;
+const FLIGHT_PITCH_MAX = 0.24;
+/** Below this speed the flight path's angle is worked out as if the car were doing this, m/s. */
+const FLIGHT_MIN_SPEED = 8;
+
+// What stays on the ground while the car is in the air: a dark blob and the underglow. Both shrink and fade as
+// the car climbs, which is what makes its height readable from a camera that never moves.
+const SHADOW_MARGIN = 1.5;
+const SHADOW_OPACITY = 0.7;
+/** Height at which the shadow and the glow have shrunk and faded as far as they go, m. */
+const SHADOW_FADE_HEIGHT = 3.5;
+const SHADOW_MIN_SCALE = 0.62;
+const SHADOW_MIN_OPACITY = 0.5;
+const UNDERGLOW_MIN_SCALE = 0.7;
+const UNDERGLOW_MIN_LIGHT = 0.55;
+const BEAM_MIN_LIGHT = 0.35;
+const Y_SHADOW = 0.06;
+const Y_UNDERGLOW = 0.07;
+const Y_BEAM = 0.075;
+
+/** Emissive colour of the body at the peak of a crash flash: far past white in red, so it blooms. */
+const CRASH_R = 1.7;
+const CRASH_G = 0.1;
+const CRASH_B = 0.16;
+
 /** Extrudes a side silhouette across the car, centred on the car's long axis. */
 function extrudeProfile(points: readonly (readonly [number, number])[], halfLength: number, width: number): ExtrudeGeometry {
   const shape = new Shape();
@@ -111,9 +145,18 @@ function tailGeometry(halfLength: number, halfWidth: number): BufferGeometry {
   return b.build();
 }
 
-function groundGlow(length: number, width: number, texture: Texture, color: Color): Mesh {
+type GroundMesh = Mesh<PlaneGeometry, MeshBasicMaterial>;
+
+function groundPlane(length: number, width: number, material: MeshBasicMaterial, order: number): GroundMesh {
   const geometry = new PlaneGeometry(length, width);
   geometry.rotateX(-Math.PI / 2);
+  const mesh = new Mesh(geometry, material);
+  mesh.renderOrder = order;
+  return mesh;
+}
+
+/** Soft additive light lying on the road. */
+function groundGlow(length: number, width: number, texture: Texture, color: Color): GroundMesh {
   const material = new MeshBasicMaterial({
     map: texture,
     color,
@@ -121,25 +164,50 @@ function groundGlow(length: number, width: number, texture: Texture, color: Colo
     blending: AdditiveBlending,
     depthWrite: false,
   });
-  const mesh = new Mesh(geometry, material);
-  mesh.renderOrder = 2;
-  return mesh;
+  return groundPlane(length, width, material, 2);
+}
+
+/** Soft dark blob lying on the road. Drawn after the skid marks and before the lights. */
+function groundShadow(length: number, width: number, texture: Texture): GroundMesh {
+  const material = new MeshBasicMaterial({
+    map: texture,
+    color: 0x000000,
+    transparent: true,
+    opacity: SHADOW_OPACITY,
+    depthWrite: false,
+  });
+  return groundPlane(length, width, material, 1.5);
 }
 
 export interface CarVisual {
   readonly group: Group;
-  update(frame: RenderFrame): void;
+  /**
+   * Poses the car for this frame. `ground` is the road it is on or above (flat when left out); `flash`, 0..1,
+   * lights the body red for a counted crash.
+   */
+  update(frame: RenderFrame, ground?: Ground, flash?: number): void;
   dispose(): void;
 }
 
 class CarModel implements CarVisual {
+  /** At the car's position on the ground plane, turned to its heading. Never leaves y = 0. */
   readonly group = new Group();
-  /** Everything that leans with the body; the wheels stay flat on the road. */
+  /** The car itself: raised to its height, pitched with the slope or the flight path. */
+  private readonly body = new Group();
+  /** Everything that leans with the bodywork; the wheels do not. */
   private readonly chassis = new Group();
   private readonly frontLeft = new Group();
   private readonly frontRight = new Group();
+  /** Shadow and underglow: on the ground under the car, tilted with the ground, wherever the car is. */
+  private readonly groundRig = new Group();
   private readonly tailMaterial = builderMaterial();
   private readonly owned: (BufferGeometry | Material)[] = [];
+  private bodyMaterial: MeshLambertMaterial | null = null;
+  private shadow: GroundMesh | null = null;
+  private underglow: GroundMesh | null = null;
+  private beam: GroundMesh | null = null;
+  /** How far ahead of the pose the middle of the headlight beam falls, m. */
+  private beamReach = 0;
 
   // The dimensions the current meshes were built for; the tuning panel can change them live.
   private halfLength = 0;
@@ -150,12 +218,17 @@ class CarModel implements CarVisual {
   private roll = 0;
   private pitch = 0;
   private brakeLight = 0;
+  /** Pitch of the whole car from the slope it stands on, or from its flight path. Positive = nose up. */
+  private bodyPitch = 0;
+  /** How far the car sits above or below the ground at its centre because its axles are on higher or lower ground. */
+  private ride = 0;
 
   constructor(private readonly softTexture: Texture) {
-    this.group.add(this.chassis, this.frontLeft, this.frontRight);
+    this.body.add(this.chassis, this.frontLeft, this.frontRight);
+    this.group.add(this.body, this.groundRig);
   }
 
-  update(frame: RenderFrame): void {
+  update(frame: RenderFrame, ground: Ground = FLAT_GROUND, flash = 0): void {
     const { pose, car, params, dt } = frame;
     if (this.isStale(params)) this.rebuild(params);
 
@@ -164,25 +237,90 @@ class CarModel implements CarVisual {
     this.frontLeft.rotation.y = -car.steerAngle;
     this.frontRight.rotation.y = -car.steerAngle;
 
-    // Lean away from the turn and squat under power. Purely visual.
-    const lateral = clamp(car.forwardSpeed * car.yawRate, MAX_LATERAL_ACCEL);
-    const long = clamp(car.accelLong, MAX_LONG_ACCEL);
+    const airborne = car.airborne === true;
+    const cos = Math.cos(pose.heading);
+    const sin = Math.sin(pose.heading);
+    const groundY = ground.heightAt(pose.x, pose.z);
+    const frontY = ground.heightAt(pose.x + cos * params.cgToFront, pose.z + sin * params.cgToFront);
+    const rearY = ground.heightAt(pose.x - cos * params.cgToRear, pose.z - sin * params.cgToRear);
+    const axleY = (frontY + rearY) / 2;
+    const wheelbase = params.cgToFront + params.cgToRear;
+    const groundPitch = wheelbase > 0 ? Math.atan2(frontY - rearY, wheelbase) : 0;
+    const carY = frame.height || 0;
+
+    // On the ground the car stands on its axles; in the air its nose follows where it is going.
+    let pitchTarget = groundPitch;
+    let rideTarget = axleY - groundY;
+    let rate = GROUND_PITCH_RATE;
+    if (airborne) {
+      const along = Math.max(FLIGHT_MIN_SPEED, Math.abs(car.forwardSpeed));
+      const path = Math.atan2(car.vy || 0, along) * (car.forwardSpeed < 0 ? -1 : 1);
+      pitchTarget = clamp(path * FLIGHT_PITCH_GAIN, FLIGHT_PITCH_MAX);
+      rideTarget = 0;
+      rate = FLIGHT_PITCH_RATE;
+    }
+    const settle = 1 - Math.exp(-rate * dt);
+    this.bodyPitch += (pitchTarget - this.bodyPitch) * settle;
+    this.ride += (rideTarget - this.ride) * settle;
+    this.body.position.y = carY + this.ride;
+    this.body.rotation.z = this.bodyPitch;
+
+    // Lean away from the turn and squat under power. Purely visual, and only with the tyres on the road.
+    const lateral = airborne ? 0 : clamp(car.forwardSpeed * car.yawRate, MAX_LATERAL_ACCEL);
+    const long = airborne ? 0 : clamp(car.accelLong, MAX_LONG_ACCEL);
     const k = 1 - Math.exp(-LEAN_RATE * dt);
     this.roll += (-lateral * ROLL_PER_ACCEL - this.roll) * k;
     this.pitch += (long * PITCH_PER_ACCEL - this.pitch) * k;
     this.chassis.rotation.x = this.roll;
     this.chassis.rotation.z = this.pitch;
 
+    this.updateGroundLights(ground, pose.x, pose.z, cos, sin, Math.max(groundY, axleY), groundPitch, carY - groundY);
+
     const braking = car.handbrake ? 1 : Math.min(1, Math.max(0, car.brake));
     this.brakeLight += (braking - this.brakeLight) * (1 - Math.exp(-BRAKE_LIGHT_RATE * dt));
     const glow = CAR.tailIdle + (CAR.tailBraking - CAR.tailIdle) * this.brakeLight;
     this.tailMaterial.color.copy(CAR.tail).multiplyScalar(glow);
+    this.bodyMaterial?.emissive.setRGB(CRASH_R * flash, CRASH_G * flash, CRASH_B * flash);
   }
 
   dispose(): void {
     this.group.removeFromParent();
     this.disposeParts();
     this.tailMaterial.dispose();
+  }
+
+  /**
+   * The shadow and the lights the car throws on the road stay on the road: at `restY`, tilted with the ground,
+   * shrinking and fading with the car's `altitude` above it.
+   */
+  private updateGroundLights(
+    ground: Ground,
+    x: number,
+    z: number,
+    cos: number,
+    sin: number,
+    restY: number,
+    groundPitch: number,
+    altitude: number,
+  ): void {
+    const up = Math.min(1, Math.max(0, altitude / SHADOW_FADE_HEIGHT));
+    this.groundRig.position.y = restY;
+    this.groundRig.rotation.z = groundPitch;
+    if (this.shadow) {
+      const scale = 1 + (SHADOW_MIN_SCALE - 1) * up;
+      this.shadow.scale.set(scale, 1, scale);
+      this.shadow.material.opacity = SHADOW_OPACITY * (1 + (SHADOW_MIN_OPACITY - 1) * up);
+    }
+    if (this.underglow) {
+      const scale = 1 + (UNDERGLOW_MIN_SCALE - 1) * up;
+      this.underglow.scale.set(scale, 1, scale);
+      this.underglow.material.color.copy(CAR.underglow).multiplyScalar(1 + (UNDERGLOW_MIN_LIGHT - 1) * up);
+    }
+    if (this.beam) {
+      // The beam lands ahead of the car, on whatever height the road has there.
+      this.beam.position.y = Y_BEAM + ground.heightAt(x + cos * this.beamReach, z + sin * this.beamReach);
+      this.beam.material.color.copy(CAR.headlightBeam).multiplyScalar(1 + (BEAM_MIN_LIGHT - 1) * up);
+    }
   }
 
   private isStale(params: CarParams): boolean {
@@ -200,9 +338,15 @@ class CarModel implements CarVisual {
     this.chassis.clear();
     this.frontLeft.clear();
     this.frontRight.clear();
-    for (const child of [...this.group.children]) {
-      if (child !== this.chassis && child !== this.frontLeft && child !== this.frontRight) this.group.remove(child);
+    this.groundRig.clear();
+    for (const child of [...this.body.children]) {
+      if (child !== this.chassis && child !== this.frontLeft && child !== this.frontRight) this.body.remove(child);
     }
+    if (this.beam) this.group.remove(this.beam);
+    this.bodyMaterial = null;
+    this.shadow = null;
+    this.underglow = null;
+    this.beam = null;
   }
 
   private rebuild(params: CarParams): void {
@@ -228,8 +372,9 @@ class CarModel implements CarVisual {
     const hl = this.halfLength;
     const hw = this.halfWidth;
     const profile = [...BODY_TOP, ...BODY_UNDERSIDE];
+    this.bodyMaterial = new MeshLambertMaterial({ color: CAR.body });
     this.chassis.add(
-      this.part(extrudeProfile(profile, hl, hw * 2), new MeshLambertMaterial({ color: CAR.body })),
+      this.part(extrudeProfile(profile, hl, hw * 2), this.bodyMaterial),
       this.part(extrudeProfile(CABIN, hl, hw * 2 * CABIN_WIDTH), new MeshLambertMaterial({ color: CAR.glass })),
       this.part(glowGeometry(hl, hw), builderMaterial()),
       this.part(tailGeometry(hl, hw), this.tailMaterial, true),
@@ -240,15 +385,18 @@ class CarModel implements CarVisual {
     const hl = this.halfLength;
     const hw = this.halfWidth;
     const centre = this.chassis.position.x;
-    const underglow = groundGlow(hl * 2 + 2.2, hw * 2 + 2.2, this.softTexture, CAR.underglow);
-    underglow.position.set(centre, 0.07, 0);
-    const beam = groundGlow(11, 6.5, this.softTexture, CAR.headlightBeam);
-    beam.position.set(centre + hl + 4.6, 0.075, 0);
-    // Parented to the root, not the chassis: light on the road must not tilt with the body.
-    for (const mesh of [underglow, beam]) {
-      this.owned.push(mesh.geometry, mesh.material as Material);
-      this.group.add(mesh);
-    }
+    this.shadow = groundShadow(hl * 2 + SHADOW_MARGIN, hw * 2 + SHADOW_MARGIN, this.softTexture);
+    this.shadow.position.set(centre, Y_SHADOW, 0);
+    this.underglow = groundGlow(hl * 2 + 2.2, hw * 2 + 2.2, this.softTexture, CAR.underglow);
+    this.underglow.position.set(centre, Y_UNDERGLOW, 0);
+    this.beam = groundGlow(11, 6.5, this.softTexture, CAR.headlightBeam);
+    this.beamReach = centre + hl + 4.6;
+    this.beam.position.set(this.beamReach, Y_BEAM, 0);
+    // None of these is part of the body: light and shadow on the road must not lean or jump with the car. The
+    // beam is not in the rig either, or the slope under the car would swing its far end into the air.
+    this.groundRig.add(this.shadow, this.underglow);
+    this.group.add(this.beam);
+    for (const mesh of [this.shadow, this.underglow, this.beam]) this.owned.push(mesh.geometry, mesh.material);
   }
 
   private buildWheels(params: CarParams): void {
@@ -262,7 +410,7 @@ class CarModel implements CarVisual {
       const wheel = new Mesh(geometry, material);
       if (w >= 2) {
         wheel.position.set(x, WHEEL_RADIUS, z);
-        this.group.add(wheel);
+        this.body.add(wheel);
         continue;
       }
       // Front wheels hang from a pivot so they can turn with the steering.

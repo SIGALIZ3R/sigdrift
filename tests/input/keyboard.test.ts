@@ -108,6 +108,58 @@ describe('keyboard', () => {
     expect(keyboard.pressed.pause).toBe(true);
   });
 
+  it('raises toggleMute once per press of M, in menus and while driving', () => {
+    const { keyboard, send, activity } = setup();
+    expect(keyboard.pressed.toggleMute).toBe(false);
+    // While driving: other keys are held and stay held.
+    send('keydown', 'KeyW');
+    const before = activity();
+    expect(send('keydown', 'KeyM').prevented).toBe(false);
+    expect(keyboard.pressed.toggleMute).toBe(true);
+    expect(keyboard.held.throttle).toBe(1);
+    expect(activity()).toBe(before + 1);
+    // The flag is an edge: once the caller clears it, holding the key (auto-repeat) does not raise it again.
+    keyboard.pressed.toggleMute = false;
+    send('keydown', 'KeyM', { repeat: true });
+    expect(keyboard.pressed.toggleMute).toBe(false);
+    send('keyup', 'KeyM');
+    expect(keyboard.pressed.toggleMute).toBe(false);
+    send('keydown', 'KeyM');
+    expect(keyboard.pressed.toggleMute).toBe(true);
+    // M touches no other flag and no driving input.
+    expect(keyboard.pressed).toMatchObject({ pause: false, restart: false, confirm: false, toggleTuning: false });
+    expect(keyboard.held).toMatchObject({ steer: 0, brake: 0, handbrake: false, reset: false });
+  });
+
+  it.each([
+    ['a button', BUTTON],
+    ['a switch', CHECKBOX],
+    ['a slider', RANGE],
+  ])('still mutes with M while %s has focus', (_name, target) => {
+    const { keyboard, send } = setup();
+    send('keydown', 'KeyM', { target });
+    expect(keyboard.pressed.toggleMute).toBe(true);
+  });
+
+  it.each([
+    ['a text input', TEXT],
+    ['an input with no type', { tagName: 'INPUT' }],
+    ['a textarea', { tagName: 'TEXTAREA' }],
+    ['a select', { tagName: 'SELECT' }],
+    ['editable content', { tagName: 'DIV', isContentEditable: true }],
+  ])('ignores M while typing in %s', (_name, target) => {
+    const { keyboard, send, activity } = setup();
+    send('keydown', 'KeyM', { target });
+    expect(keyboard.pressed.toggleMute).toBe(false);
+    expect(activity()).toBe(0);
+  });
+
+  it('leaves Cmd+M and Ctrl+M to the browser', () => {
+    const { keyboard, send } = setup();
+    send('keydown', 'KeyM', { metaKey: true });
+    expect(keyboard.pressed.toggleMute).toBe(false);
+  });
+
   it('lets Space reach a focused button so the browser can click it', () => {
     const { keyboard, send } = setup();
     expect(send('keydown', 'Space', { target: BUTTON }).prevented).toBe(false);

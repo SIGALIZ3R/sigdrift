@@ -24,7 +24,7 @@ export function createInput(target: Window): GameInput {
   });
   const gamepad = createGamepad(target);
   const state: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
-  const flags: MetaInput = { pause: false, restart: false, toggleTuning: false, confirm: false };
+  const flags: MetaInput = { pause: false, restart: false, toggleTuning: false, confirm: false, toggleMute: false };
 
   function pollGamepad(): void {
     if (gamepad.poll()) lastDevice = 'gamepad';
@@ -54,6 +54,7 @@ export function createInput(target: Window): GameInput {
       take('restart');
       take('toggleTuning');
       take('confirm');
+      take('toggleMute');
       return flags;
     },
     get lastDevice() {

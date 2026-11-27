@@ -3,6 +3,15 @@
 const STYLE_ELEMENT_ID = 'sigdrift-ui-styles';
 
 /**
+ * The mute button's box, in viewport units so every component (whatever its own font size) can keep clear of it.
+ * 4.3vmin is 2.6em of the UI font; 44px is the minimum comfortable touch target.
+ */
+const MUTE_SIZE = 'clamp(44px, 4.3vmin, 88px)';
+const MUTE_INSET = 'clamp(8px, 1vmin, 20px)';
+/** Distance from the top of the viewport to just below the mute button. */
+const MUTE_CLEARANCE = `calc(max(${MUTE_INSET}, env(safe-area-inset-top)) + ${MUTE_SIZE} + ${MUTE_INSET})`;
+
+/**
  * Sizes are in em, off one viewport-scaled font size on `.sd-ui`, so the same layout holds from a phone to 4K.
  * `--sd-rgb` is the accent of the current component; `--sd-pop`, `--sd-flash` and `--sd-pop-in` name the keyframes
  * of the attention animations so reduced-motion and the reduced-flash setting (`.sd-calm` on the UI root) can swap them.
@@ -12,6 +21,7 @@ export const UI_CSS = `
   --sd-cyan: #33f0ff;
   --sd-magenta: #ff2bd6;
   --sd-amber: #ffb62e;
+  --sd-red: #ff3b5c;
   --sd-text: #eef3ff;
   --sd-dim: rgba(238, 243, 255, 0.62);
   --sd-faint: rgba(238, 243, 255, 0.14);
@@ -158,6 +168,90 @@ export const UI_CSS = `
 }
 .sd-hud-speed-value { min-width: 3ch; font-size: 2.3em; font-weight: 600; line-height: 1.1; text-align: right; }
 
+/* ---- HUD: endless mode ---- */
+.sd-hud-etop { width: 15em; }
+.sd-hud-level { display: flex; align-items: center; gap: 0.7em; }
+.sd-hud-level .sd-label { color: var(--sd-magenta); }
+.sd-hud-meter { display: flex; gap: 2px; }
+.sd-hud-meter i { width: 0.4em; height: 0.78em; background: var(--sd-faint); transform: skewX(-14deg); }
+.sd-hud-meter i.is-on { background: var(--sd-cyan); box-shadow: 0 0 0.5em rgba(51, 240, 255, 0.7); }
+.sd-hud-meter i.is-on:nth-child(n + 4) { background: var(--sd-amber); box-shadow: 0 0 0.5em rgba(255, 182, 46, 0.7); }
+.sd-hud-meter i.is-on:nth-child(n + 7) { background: var(--sd-red); box-shadow: 0 0 0.5em rgba(255, 59, 92, 0.75); }
+.sd-hud-dist { display: flex; align-items: baseline; gap: 0.16em; }
+.sd-hud-unit { font-size: 0.36em; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--sd-dim); text-shadow: none; }
+.sd-hud-lives {
+  position: absolute;
+  top: calc(max(0.9em, env(safe-area-inset-top)) + 1.97em);
+  right: calc(50% + 8.7em);
+  display: flex;
+  gap: 0.5em;
+}
+.sd-life { position: relative; width: 1.3em; height: 1.3em; filter: drop-shadow(0 0 0.3em rgba(51, 240, 255, 0.85)); }
+.sd-life i { position: absolute; inset: 0; background: var(--sd-cyan); }
+.sd-life i:first-child { --sd-side: -1; clip-path: polygon(50% 0, 0 50%, 50% 100%); }
+.sd-life i:last-child { --sd-side: 1; clip-path: polygon(50% 0, 100% 50%, 50% 100%); }
+.sd-life.is-last { filter: drop-shadow(0 0 0.35em rgba(255, 182, 46, 0.9)); animation: sd-pulse 0.8s ease-in-out infinite; }
+.sd-life.is-last i { background: var(--sd-amber); }
+.sd-life.is-broken { filter: none; }
+.sd-life.is-broken i {
+  background: var(--sd-red);
+  opacity: 0.4;
+  transform: translate(calc(var(--sd-side) * 0.13em), calc(var(--sd-side) * -0.09em)) rotate(calc(var(--sd-side) * 12deg));
+  animation: sd-crack 0.5s ease-out;
+}
+.sd-hud-flash.is-crash { color: var(--sd-red); text-shadow: 0 0 0.6em rgba(255, 59, 92, 0.75); }
+.sd-hud-flash.is-crash .sd-num { font-size: 1.05em; letter-spacing: 0.12em; text-transform: uppercase; }
+.sd-hud-air {
+  position: absolute;
+  left: 50%;
+  bottom: calc(max(1em, env(safe-area-inset-bottom)) + 0.55em);
+  padding-left: 0.32em;
+  transform: translateX(-50%);
+  opacity: 0;
+  font-size: 1.7em;
+  font-weight: 800;
+  font-style: italic;
+  line-height: 1;
+  letter-spacing: 0.32em;
+  color: var(--sd-cyan);
+  text-shadow: 0.05em 0.05em 0 var(--sd-magenta), 0 0 0.6em rgba(51, 240, 255, 0.7);
+  transition: opacity 0.1s;
+}
+.sd-hud-air.is-on { opacity: 1; }
+
+/* ---- Mute button ---- */
+.sd-mute {
+  position: absolute;
+  top: max(${MUTE_INSET}, env(safe-area-inset-top));
+  right: max(${MUTE_INSET}, env(safe-area-inset-right));
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  width: ${MUTE_SIZE};
+  height: ${MUTE_SIZE};
+  padding: 0;
+  border: 1px solid rgba(var(--sd-rgb), 0.5);
+  border-radius: 2px;
+  background: rgba(5, 7, 16, 0.76);
+  color: rgb(var(--sd-rgb));
+  cursor: pointer;
+  pointer-events: auto;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 0.12s, border-color 0.12s, box-shadow 0.12s, color 0.12s;
+}
+.sd-mute:hover, .sd-mute:focus-visible {
+  border-color: rgb(var(--sd-rgb));
+  background: rgba(var(--sd-rgb), 0.16);
+  box-shadow: 0 0 1.2em rgba(var(--sd-rgb), 0.35);
+}
+.sd-mute:focus-visible { outline: 2px solid var(--sd-text); outline-offset: 2px; }
+.sd-mute[aria-pressed="true"] { --sd-rgb: 255, 182, 46; }
+.sd-mute svg { display: block; width: 54%; height: 54%; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.sd-mute .sd-mute-body { fill: currentColor; stroke-width: 1.2; }
+.sd-mute .sd-mute-off, .sd-mute[aria-pressed="true"] .sd-mute-on { display: none; }
+.sd-mute[aria-pressed="true"] .sd-mute-off { display: inline; }
+
 /* ---- Buttons and form controls ---- */
 .sd-btn {
   padding: 0.85em 1.4em;
@@ -194,6 +288,8 @@ export const UI_CSS = `
 .sd-btn[aria-pressed="true"] { border-color: rgb(var(--sd-rgb)); background: rgba(var(--sd-rgb), 0.92); color: var(--sd-ink); }
 .sd-seg { display: inline-flex; }
 .sd-seg .sd-btn + .sd-btn { margin-left: -1px; }
+.sd-seg-wide { display: flex; }
+.sd-seg-wide .sd-btn { flex: 1 1 0; padding-left: 0.3em; padding-right: 0.3em; }
 
 .sd-range {
   -webkit-appearance: none;
@@ -305,16 +401,27 @@ export const UI_CSS = `
   text-transform: uppercase;
   text-shadow: 0 0 0.6em rgba(51, 240, 255, 0.5);
 }
-.sd-title-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 1.6em 2em; }
-.sd-col { display: grid; gap: 1.5em; align-content: start; }
+.sd-title-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.4em 1.6em; }
 .sd-section { display: grid; gap: 0.6em; align-content: start; }
-.sd-feature { padding: 1em 1.1em; border-left: 2px solid var(--sd-cyan); background: rgba(51, 240, 255, 0.05); }
-.sd-feature > .sd-label { color: var(--sd-cyan); }
+.sd-mode {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 0.9em;
+  padding: 1em 1.1em;
+  border-left: 2px solid rgb(var(--sd-rgb));
+  background: rgba(var(--sd-rgb), 0.05);
+}
+.sd-mode-endless { --sd-rgb: 255, 43, 214; }
+.sd-mode-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.3em 1em; }
+.sd-mode-head h2 { font-size: 0.86em; color: rgb(var(--sd-rgb)); }
+.sd-mode-head .sd-num { font-size: 0.86em; color: var(--sd-dim); }
+.sd-mode-body { display: grid; gap: 0.8em; align-content: start; }
+.sd-mode-text { margin: 0; font-size: 0.92em; line-height: 1.5; color: var(--sd-dim); }
 .sd-feature-row { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 0.9em 1.2em; }
-.sd-feature-time { font-size: 1.9em; font-weight: 600; line-height: 1.15; }
-.sd-feature .sd-btn { flex: 1 0 auto; padding: 1em 2.4em; font-size: 0.95em; }
+.sd-feature-time { font-size: 1.9em; font-weight: 600; line-height: 1.15; white-space: nowrap; }
+.sd-feature-row .sd-btn { flex: 1 0 auto; padding: 1em 1.6em; font-size: 0.95em; white-space: nowrap; }
 
-.sd-weeks { display: grid; max-height: 13.5em; overflow: auto; overscroll-behavior: contain; }
+.sd-weeks { display: grid; max-height: 7.6em; overflow: auto; overscroll-behavior: contain; }
 .sd-week {
   display: flex;
   justify-content: space-between;
@@ -340,6 +447,8 @@ export const UI_CSS = `
 .sd-setting { display: flex; align-items: center; justify-content: space-between; gap: 1em; min-height: 2.3em; font-size: 0.92em; }
 .sd-setting-control { display: flex; align-items: center; gap: 0.7em; }
 .sd-setting-control .sd-num { min-width: 4ch; text-align: right; color: var(--sd-dim); }
+.sd-setting-control { transition: opacity 0.12s; }
+.sd-setting.is-off .sd-setting-control { opacity: 0.35; }
 label.sd-setting { cursor: pointer; }
 
 .sd-actions { display: grid; gap: 0.65em; }
@@ -356,6 +465,19 @@ label.sd-setting { cursor: pointer; }
   animation: var(--sd-pop-in) 0.5s ease-out both;
 }
 .sd-badge-muted { border-color: var(--sd-amber); box-shadow: none; letter-spacing: 0.14em; }
+.sd-over { display: grid; gap: 0.45em; }
+.sd-over-title {
+  margin: 0;
+  font-size: clamp(1.5em, 8.4vw, 2em);
+  font-weight: 800;
+  font-style: italic;
+  line-height: 1.05;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--sd-red);
+  text-shadow: 0 0 0.5em rgba(255, 59, 92, 0.55);
+}
+.sd-over-title.is-off-road { color: var(--sd-amber); text-shadow: 0 0 0.5em rgba(255, 182, 46, 0.55); }
 .sd-delta.is-faster { color: var(--sd-cyan); }
 .sd-delta.is-slower { color: var(--sd-amber); }
 .sd-stats { display: grid; margin: 0; }
@@ -365,7 +487,7 @@ label.sd-setting { cursor: pointer; }
 /* ---- Tuning panel ---- */
 .sd-tune {
   position: absolute;
-  top: max(0.7em, env(safe-area-inset-top));
+  top: ${MUTE_CLEARANCE};
   right: max(0.7em, env(safe-area-inset-right));
   bottom: max(0.7em, env(safe-area-inset-bottom));
   z-index: 2;
@@ -417,14 +539,37 @@ label.sd-setting { cursor: pointer; }
   0% { opacity: 0; }
   100% { opacity: 1; }
 }
+/* A life pip breaking: both halves flash white, then fall into the split, dimmed pose its rule describes. */
+@keyframes sd-crack {
+  0% { background: #fff; opacity: 1; transform: scale(1.4); }
+  30% { background: #fff; opacity: 1; transform: scale(1.1); }
+}
+@keyframes sd-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
 .sd-calm .sd-ui { --sd-pop: sd-fade; --sd-flash: sd-fade; --sd-pop-in: sd-fade-in; }
 .sd-calm .sd-hud-drift.is-live { box-shadow: 0 0 1.4em rgba(var(--sd-rgb), 0.16); }
+.sd-calm .sd-life.is-last, .sd-calm .sd-life.is-broken i { animation: none; }
 @media (prefers-reduced-motion: reduce) {
   .sd-ui { --sd-pop: sd-fade; --sd-flash: sd-fade; --sd-pop-in: sd-fade-in; }
   .sd-ui, .sd-ui *, .sd-ui *::before, .sd-ui *::after { transition: none !important; }
+  .sd-life.is-last, .sd-life.is-broken i { animation: none; }
 }
 @media (max-width: 760px) {
   .sd-title-grid { grid-template-columns: minmax(0, 1fr); }
+}
+/* Too narrow for the life pips to sit beside the distance: they keep to the left edge instead. */
+@media (max-width: 440px) {
+  .sd-hud-lives { right: auto; left: max(0.6em, env(safe-area-inset-left)); gap: 0.4em; }
+}
+/* Too narrow for "AIR" to fit between the drift and speed panels: it rides above them. */
+@media (max-width: 560px) {
+  .sd-hud-air { bottom: calc(max(1em, env(safe-area-inset-bottom)) + 4.6em); }
+}
+/* Where a menu panel can reach the top right corner, it starts below the mute button instead of under it. */
+@media (max-width: 960px), (max-aspect-ratio: 5/4) {
+  .sd-menu { padding-top: ${MUTE_CLEARANCE}; }
 }
 `;
 

@@ -1,8 +1,12 @@
 import type { CarParams } from '../types';
 
 /**
- * The one car: a light, loose, rear-wheel-drive coupe. Tuned by the scripted drivers in tests/sim/handling.test.ts;
- * change a value here and those tests say which part of the feel moved.
+ * The one car: a light rear-wheel-drive coupe that is planted until it is provoked. Tuned by the scripted drivers
+ * in tests/sim/handling.test.ts; change a value here and those tests say which part of the feel moved.
+ *
+ * `engineForce` is the thrust off the line; how it tapers with speed, and how the throttle loosens the rear tyres,
+ * is set by ENGINE in car.ts. Drag and rolling resistance are low on purpose (the car coasts freely): the top
+ * speed comes from the rev limit, not from the air.
  */
 export const DEFAULT_CAR_PARAMS: CarParams = Object.freeze({
   mass: 1000,
@@ -11,25 +15,25 @@ export const DEFAULT_CAR_PARAMS: CarParams = Object.freeze({
   cgToRear: 1.25,
   cgHeight: 0.45,
   weightTransfer: 0.5,
-  cornerStiffFront: 11,
-  cornerStiffRear: 12,
-  gripFront: 1.25,
-  gripRear: 1.45,
-  handbrakeGrip: 0.3,
-  powerSlip: 0.55,
-  slideGrip: 0.8,
-  engineForce: 7500,
+  cornerStiffFront: 12,
+  cornerStiffRear: 15.7,
+  gripFront: 1.24,
+  gripRear: 1.48,
+  handbrakeGrip: 0.16,
+  powerSlip: 0.58,
+  slideGrip: 0.78,
+  engineForce: 8900,
   reverseForce: 4000,
-  brakeForce: 11000,
+  brakeForce: 12000,
   handbrakeForce: 4000,
-  drag: 3.4,
-  rollingResistance: 30,
+  drag: 0.72,
+  rollingResistance: 5,
   maxSteer: 0.6,
   maxSteerAtSpeed: 0.22,
   steerSpeedRef: 35,
-  steerRate: 3.5,
+  steerRate: 3.65,
   steerReturnRate: 6,
-  yawDamping: 0.5,
+  yawDamping: 0.64,
   steerAssist: 0,
   collisionRadius: 0.9,
   halfLength: 2.1,

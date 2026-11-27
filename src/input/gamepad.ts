@@ -70,7 +70,8 @@ function pickPad(pads: ArrayLike<Gamepad | null>): Gamepad | null {
 
 export function createGamepad(target: Window): GamepadDevice {
   const held: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
-  const pressed: MetaInput = { pause: false, restart: false, toggleTuning: false, confirm: false };
+  // The pad has no mute control: `toggleMute` stays false.
+  const pressed: MetaInput = { pause: false, restart: false, toggleTuning: false, confirm: false, toggleMute: false };
   let available = typeof target.navigator?.getGamepads === 'function';
   let lastPollMs = -Infinity;
   let lastMask = 0;

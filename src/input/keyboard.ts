@@ -27,6 +27,7 @@ const META_CODES: ReadonlyMap<string, keyof MetaInput> = new Map([
   ['Backspace', 'restart'],
   ['Enter', 'confirm'],
   ['Backquote', 'toggleTuning'],
+  ['KeyM', 'toggleMute'],
 ]);
 
 /** Keys whose browser default would scroll the page or navigate back. */
@@ -54,8 +55,8 @@ const CONTROL_INPUT_TYPES: ReadonlySet<string> = new Set([
 
 /**
  * What the key event's target does with keys of its own:
- * - `text`: typing goes into it, so the game takes nothing but Escape.
- * - `control`: a slider or switch. It needs the arrows and Space; menu keys (Enter, P, Backspace) still work, so
+ * - `text`: typing goes into it, so the game takes nothing but Escape (M must type an "m", not mute).
+ * - `control`: a slider or switch. It needs the arrows and Space; menu keys (Enter, P, Backspace, M) still work, so
  *   a menu stays usable after its volume slider or assist switch has been clicked and kept focus.
  * - `button`: Space is its activation key and must reach it untouched.
  */
@@ -77,7 +78,7 @@ function targetKind(target: EventTarget | null): TargetKind {
 export function createKeyboard(target: Window, onActivity: () => void): KeyboardDevice {
   const down = new Set<string>();
   const held: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
-  const pressed: MetaInput = { pause: false, restart: false, toggleTuning: false, confirm: false };
+  const pressed: MetaInput = { pause: false, restart: false, toggleTuning: false, confirm: false, toggleMute: false };
 
   function either(a: string, b: string): number {
     return down.has(a) || down.has(b) ? 1 : 0;

@@ -69,8 +69,11 @@ const GAIN = 9;
 
 export interface Smoke {
   readonly mesh: InstancedMesh;
-  /** Adds one puff at ground position (x, z) that drifts with (vx, vz). `intensity` is 0..1. */
-  spawn(x: number, z: number, vx: number, vz: number, intensity: number): void;
+  /**
+   * Adds one puff at ground position (x, z) that drifts with (vx, vz). `intensity` is 0..1; `groundY` is the
+   * height of the ground there (0 on flat road).
+   */
+  spawn(x: number, z: number, vx: number, vz: number, intensity: number, groundY?: number): void;
   update(dt: number): void;
   setEnabled(enabled: boolean): void;
   /**
@@ -112,12 +115,12 @@ class SmokePool implements Smoke {
     this.mesh.visible = false;
   }
 
-  spawn(x: number, z: number, vx: number, vz: number, intensity: number): void {
+  spawn(x: number, z: number, vx: number, vz: number, intensity: number, groundY = 0): void {
     if (!this.enabled || this.alive === MAX_PUFFS) return;
     const s = this.state;
     const o = this.alive * STRIDE;
     s[o + PX] = x + (Math.random() - 0.5) * 0.3;
-    s[o + PY] = 0.25;
+    s[o + PY] = groundY + 0.25;
     s[o + PZ] = z + (Math.random() - 0.5) * 0.3;
     s[o + VX] = vx + (Math.random() - 0.5) * 1.4;
     s[o + VY] = 0.9 + Math.random() * 0.7;
@@ -242,8 +245,11 @@ const SPARK_IMPACT_MAX = 20;
 
 export interface Sparks {
   readonly points: Points;
-  /** Throws `count` sparks off a wall hit at (x, z); (nx, nz) is the normal pointing back at the car. */
-  burst(x: number, z: number, nx: number, nz: number, impact: number, count: number): void;
+  /**
+   * Throws `count` sparks off a wall hit at (x, z); (nx, nz) is the normal pointing back at the car and `groundY`
+   * the height of the ground there (0 on flat road).
+   */
+  burst(x: number, z: number, nx: number, nz: number, impact: number, count: number, groundY?: number): void;
   update(dt: number): void;
   /** While on, the points are drawn even with no live spark (all black), to build their program ahead of time. */
   setWarmUp(on: boolean): void;
@@ -284,7 +290,7 @@ class SparkPool implements Sparks {
     this.points.visible = false;
   }
 
-  burst(x: number, z: number, nx: number, nz: number, impact: number, count: number): void {
+  burst(x: number, z: number, nx: number, nz: number, impact: number, count: number, groundY = 0): void {
     const speed = Math.min(impact, SPARK_IMPACT_MAX);
     const p = this.positions.array;
     const v = this.velocity;
@@ -296,7 +302,7 @@ class SparkPool implements Sparks {
       const out = speed * (0.25 + Math.random() * 0.6);
       const along = speed * (Math.random() - 0.5) * 1.4;
       p[o] = x;
-      p[o + 1] = 0.35;
+      p[o + 1] = groundY + 0.35;
       p[o + 2] = z;
       v[o] = nx * out - nz * along;
       v[o + 1] = 2 + Math.random() * 4;

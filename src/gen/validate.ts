@@ -235,7 +235,7 @@ export class WallIndex {
 // ---------------------------------------------------------------------------------------------------------------
 
 /** Collects failures per rule: the first offender is spelled out, the rest are counted. */
-class Report {
+export class Report {
   private readonly first = new Map<string, string>();
   private readonly extra = new Map<string, number>();
 
@@ -258,7 +258,7 @@ class Report {
   }
 }
 
-function fmt(v: number): string {
+export function fmt(v: number): string {
   return String(Math.round(v * 100) / 100);
 }
 

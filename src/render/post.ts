@@ -1,6 +1,13 @@
 import { HalfFloatType } from 'three';
 import type { Camera, Scene, WebGLRenderer } from 'three';
-import { BloomEffect, EffectComposer, EffectPass, RenderPass, VignetteEffect } from 'postprocessing';
+import {
+  BloomEffect,
+  EffectComposer,
+  EffectPass,
+  HueSaturationEffect,
+  RenderPass,
+  VignetteEffect,
+} from 'postprocessing';
 import { BLOOM } from './palette';
 
 /**
@@ -25,10 +32,12 @@ export interface PostFx {
   /** Call after the renderer's own size and pixel ratio have been set. `lean` asks for the cheaper buffers. */
   setSize(width: number, height: number, lean?: boolean): void;
   setReducedFlash(reduced: boolean): void;
+  /** -1 (grey) .. 0 (as drawn). Drains the colour from the picture once a run is over. */
+  setSaturation(saturation: number): void;
   dispose(): void;
 }
 
-/** The high-quality path: scene into a half-float buffer, then bloom and a vignette in one pass. */
+/** The high-quality path: scene into a half-float buffer, then bloom, saturation and a vignette in one pass. */
 export function createPost(renderer: WebGLRenderer, scene: Scene, camera: Camera): PostFx {
   const composer = new EffectComposer(renderer, { frameBufferType: HalfFloatType });
   const bloom = new BloomEffect({
@@ -40,7 +49,10 @@ export function createPost(renderer: WebGLRenderer, scene: Scene, camera: Camera
   });
   const vignette = new VignetteEffect({ offset: 0.32, darkness: 0.55 });
   composer.addPass(new RenderPass(scene, camera));
-  composer.addPass(new EffectPass(camera, bloom, vignette));
+  // Last in the chain: the effect clamps to the displayable range, which the screen does anyway at that point but
+  // which would dull the neon if the vignette still had to darken it. At 0 it changes nothing.
+  const colour = new HueSaturationEffect({ saturation: 0 });
+  composer.addPass(new EffectPass(camera, bloom, vignette, colour));
 
   return {
     render(dt) {
@@ -52,6 +64,10 @@ export function createPost(renderer: WebGLRenderer, scene: Scene, camera: Camera
     },
     setReducedFlash(reduced) {
       bloom.intensity = reduced ? BLOOM.intensityReduced : BLOOM.intensity;
+    },
+    setSaturation(saturation) {
+      const value = Math.min(0, Math.max(-1, saturation));
+      if (colour.saturation !== value) colour.saturation = value;
     },
     dispose() {
       composer.dispose();

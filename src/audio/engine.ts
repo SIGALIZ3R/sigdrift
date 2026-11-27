@@ -1,111 +1,231 @@
 import type { CarParams, CarState } from '../types';
+import { createEngineTone, engineTone, engineWave, gritCurve } from './mapping';
+import type { EngineWaveKind } from './mapping';
+import { createGlide } from './param';
+import { IDLE_RPM, createDriveInput, createPowertrain, readDrive, stepPowertrain } from './rpm';
 
 export interface EngineVoice {
-  /** `now` is the AudioContext time. `active = false` fades the engine out. */
+  /** `now` is the AudioContext time. `active = false` fades the engine out and freezes the revs. */
   update(car: CarState, params: CarParams, active: boolean, now: number): void;
+  /** Engine speed and gear (0-based, -1 = reverse) as last updated. */
+  readonly rpm: number;
+  readonly gear: number;
   dispose(): void;
 }
 
-/** Top speed of each gear as a fraction of the car's estimated top speed. */
-const GEAR_TOPS = [0.2, 0.37, 0.57, 0.79, 1.06];
-const UPSHIFT_REV = 0.95;
-/** Shift down once the lower gear would sit below this share of its range. */
-const DOWNSHIFT_REV = 0.78;
+/**
+ * The exhaust and body of the car: fixed resonances that every engine speed is heard through. Because they stay
+ * put while the harmonics sweep past them, the engine sounds like one object revving, not a tone sliding in pitch.
+ */
+export const EXHAUST_BODY: readonly { hz: number; q: number; gain: number }[] = [
+  { hz: 170, q: 1.3, gain: 0.85 },
+  { hz: 480, q: 2, gain: 0.85 },
+  { hz: 1300, q: 2.4, gain: 1 },
+  { hz: 2700, q: 3, gain: 0.6 },
+];
+/** Share of the unfiltered signal mixed in with the resonances. */
+export const BODY_DRY = 0.25;
+/** Band of the combustion noise before it is pulsed at the firing frequency. */
+export const NOISE_BAND_HZ = 1100;
+export const NOISE_BAND_Q = 0.7;
+/** The two saws of the synth layer sit this many cents either side of the firing frequency and beat slowly. */
+export const SAW_DETUNE_CENTS = 9;
+/** Below this nothing is audible on any speaker; it would only eat headroom. */
+export const RUMBLE_CUT_HZ = 40;
+/** Resonance of the low-pass filters, dB (0 dB is already a slight peak; -3 dB is flat). */
+export const TONE_Q_DB = -1;
+export const SAW_Q_DB = 1.4;
 
-const IDLE_HZ = 58;
-const REDLINE_HZ = 228;
-const MAX_REV = 1.08;
-/** Below this speed (m/s) the throttle revs the engine freely, as if the clutch were slipping. */
-const LAUNCH_SPEED = 6;
-const LAUNCH_REV = 0.34;
-/** Extra revs from spinning rear wheels at full throttle and full slide. */
-const WHEELSPIN_REV = 0.16;
-const THROTTLE_PITCH = 0.05;
-
-const MIN_TOP_SPEED = 25;
-const MAX_TOP_SPEED = 70;
-
-const PITCH_SMOOTH = 0.055;
-const TONE_SMOOTH = 0.07;
+const PITCH_SMOOTH = 0.016;
+const TONE_SMOOTH = 0.03;
+/** Fast enough to follow a 90 ms shift and the limiter's stutter, slow enough not to click. */
+const LEVEL_SMOOTH = 0.012;
 const FADE_SMOOTH = 0.09;
+/** A frame longer than this (tab switch, breakpoint) is not simulated in one go. */
+const MAX_STEP = 0.1;
+/** Seconds between changes of the overrun flutter: 12 to 25 pops a second. */
+const FLUTTER_MIN = 0.04;
+const FLUTTER_SPREAD = 0.045;
+/**
+ * No engine holds its speed to the last rev. A quarter of a percent of wander (a few cents) is too little to hear
+ * as vibrato and enough to stop a steady note from sounding like a test tone.
+ */
+const PITCH_WANDER = 0.005;
 
-function clamp(value: number, min: number, max: number): number {
-  return value < min ? min : value > max ? max : value;
+function periodicWave(ctx: BaseAudioContext, kind: EngineWaveKind): PeriodicWave {
+  const table = engineWave(kind);
+  // Normalised by the browser: every wave peaks at 1 whatever its spectrum.
+  return ctx.createPeriodicWave(table.real, table.imag);
 }
 
-/** Speed at which engine force balances drag and rolling resistance, kept within a sane range. */
-function estimateTopSpeed(params: CarParams): number {
-  const drag = params.drag;
-  const rolling = params.rollingResistance;
-  const force = params.engineForce;
-  let speed = MAX_TOP_SPEED;
-  if (drag > 1e-6) speed = (Math.sqrt(rolling * rolling + 4 * drag * force) - rolling) / (2 * drag);
-  else if (rolling > 1e-6) speed = force / rolling;
-  return clamp(speed, MIN_TOP_SPEED, MAX_TOP_SPEED);
-}
+export function createEngineVoice(ctx: BaseAudioContext, noise: AudioBuffer, destination: AudioNode): EngineVoice {
+  const sources: AudioScheduledSourceNode[] = [];
 
-function createOscillator(
-  ctx: BaseAudioContext,
-  type: OscillatorType,
-  detuneCents: number,
-  level: number,
-  destination: AudioNode,
-): OscillatorNode {
-  const oscillator = ctx.createOscillator();
-  const gain = ctx.createGain();
-  oscillator.type = type;
-  oscillator.frequency.value = IDLE_HZ;
-  oscillator.detune.value = detuneCents;
-  gain.gain.value = level;
-  oscillator.connect(gain).connect(destination);
-  oscillator.start();
-  return oscillator;
-}
-
-export function createEngineVoice(ctx: BaseAudioContext, destination: AudioNode): EngineVoice {
-  const filter = ctx.createBiquadFilter();
-  filter.type = 'lowpass';
-  filter.frequency.value = 300;
-  filter.Q.value = 1.4;
+  // ---- output: everything -> output gain -> destination -------------------------------------------------------
   const output = ctx.createGain();
   output.gain.value = 0;
-  filter.connect(output).connect(destination);
+  output.connect(destination);
 
-  // Two slightly detuned saws beat against each other; the square an octave down adds body.
-  const upper = createOscillator(ctx, 'sawtooth', -11, 0.5, filter);
-  const lower = createOscillator(ctx, 'sawtooth', 13, 0.5, filter);
-  const sub = createOscillator(ctx, 'square', 0, 0.3, filter);
+  // ---- combustion: harmonics + pulsed noise -> drive -> waveshaper ---------------------------------------------
+  const drive = ctx.createGain();
+  drive.gain.value = 0.3;
+  const shaper = ctx.createWaveShaper();
+  shaper.curve = gritCurve();
+  shaper.oversample = '2x';
+  drive.connect(shaper);
 
-  let gear = 0;
-
-  /** Engine speed 0..MAX_REV for the current gear, shifting gear when it leaves the gear's range. */
-  function revFromSpeed(speed: number, topSpeed: number): number {
-    if (gear < GEAR_TOPS.length - 1 && speed > GEAR_TOPS[gear] * topSpeed * UPSHIFT_REV) gear++;
-    else if (gear > 0 && speed < GEAR_TOPS[gear - 1] * topSpeed * DOWNSHIFT_REV) gear--;
-    return speed / (GEAR_TOPS[gear] * topSpeed);
+  function cycleOscillator(kind: EngineWaveKind): OscillatorNode {
+    const oscillator = ctx.createOscillator();
+    oscillator.setPeriodicWave(periodicWave(ctx, kind));
+    oscillator.frequency.value = IDLE_RPM / 120;
+    sources.push(oscillator);
+    return oscillator;
   }
+
+  const loadOsc = cycleOscillator('load');
+  const loadGain = ctx.createGain();
+  loadGain.gain.value = 0;
+  loadOsc.connect(loadGain).connect(drive);
+
+  const coastOsc = cycleOscillator('coast');
+  const coastGain = ctx.createGain();
+  coastGain.gain.value = 0;
+  coastOsc.connect(coastGain).connect(drive);
+
+  // Noise -> band-pass -> a gain that swings between 0 and 1 once per firing -> level -> drive.
+  const noiseSource = ctx.createBufferSource();
+  noiseSource.buffer = noise;
+  noiseSource.loop = true;
+  sources.push(noiseSource);
+  const noiseBand = ctx.createBiquadFilter();
+  noiseBand.type = 'bandpass';
+  noiseBand.frequency.value = NOISE_BAND_HZ;
+  noiseBand.Q.value = NOISE_BAND_Q;
+  const noisePulse = ctx.createGain();
+  noisePulse.gain.value = 0.5;
+  const noiseGain = ctx.createGain();
+  noiseGain.gain.value = 0;
+  noiseSource.connect(noiseBand).connect(noisePulse).connect(noiseGain).connect(drive);
+  const pulseOsc = cycleOscillator('pulse');
+  const pulseDepth = ctx.createGain();
+  pulseDepth.gain.value = 0.5;
+  pulseOsc.connect(pulseDepth).connect(noisePulse.gain);
+
+  // ---- exhaust body: shaper -> (dry + resonances) -> low-pass -> rumble cut -> output --------------------------
+  const tone = ctx.createBiquadFilter();
+  tone.type = 'lowpass';
+  tone.frequency.value = 600;
+  tone.Q.value = TONE_Q_DB;
+  const rumbleCut = ctx.createBiquadFilter();
+  rumbleCut.type = 'highpass';
+  rumbleCut.frequency.value = RUMBLE_CUT_HZ;
+  rumbleCut.Q.value = -3;
+  tone.connect(rumbleCut).connect(output);
+
+  const dry = ctx.createGain();
+  dry.gain.value = BODY_DRY;
+  shaper.connect(dry).connect(tone);
+  for (const formant of EXHAUST_BODY) {
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = formant.hz;
+    filter.Q.value = formant.q;
+    const gain = ctx.createGain();
+    gain.gain.value = formant.gain;
+    shaper.connect(filter).connect(gain).connect(tone);
+  }
+
+  // ---- synth layer: two detuned saws at the firing frequency -> gain -> low-pass -> output ----------------------
+  const sawGain = ctx.createGain();
+  sawGain.gain.value = 0;
+  const sawFilter = ctx.createBiquadFilter();
+  sawFilter.type = 'lowpass';
+  sawFilter.frequency.value = 300;
+  sawFilter.Q.value = SAW_Q_DB;
+  sawGain.connect(sawFilter).connect(output);
+
+  function saw(detuneCents: number): OscillatorNode {
+    const oscillator = ctx.createOscillator();
+    oscillator.type = 'sawtooth';
+    oscillator.frequency.value = IDLE_RPM / 30;
+    oscillator.detune.value = detuneCents;
+    oscillator.connect(sawGain);
+    sources.push(oscillator);
+    return oscillator;
+  }
+  const sawLow = saw(-SAW_DETUNE_CENTS);
+  const sawHigh = saw(SAW_DETUNE_CENTS);
+
+  // One start time for all of them: the three cycle oscillators must stay in phase with each other.
+  const startAt = ctx.currentTime;
+  noiseSource.start(startAt, 0.37);
+  for (const source of sources) if (source !== noiseSource) source.start(startAt);
+
+  const loadPitch = createGlide(loadOsc.frequency);
+  const coastPitch = createGlide(coastOsc.frequency);
+  const pulsePitch = createGlide(pulseOsc.frequency);
+  const sawLowPitch = createGlide(sawLow.frequency);
+  const sawHighPitch = createGlide(sawHigh.frequency);
+  const loadLevel = createGlide(loadGain.gain);
+  const coastLevel = createGlide(coastGain.gain);
+  const noiseLevel = createGlide(noiseGain.gain);
+  const driveLevel = createGlide(drive.gain);
+  const toneCutoff = createGlide(tone.frequency);
+  const sawLevel = createGlide(sawGain.gain);
+  const sawCutoff = createGlide(sawFilter.frequency);
+  const outputLevel = createGlide(output.gain);
+
+  const powertrain = createPowertrain();
+  const driveInput = createDriveInput();
+  const mix = createEngineTone();
+  let lastNow = -1;
+  let flutter = 0;
+  let flutterUntil = 0;
 
   return {
     update(car, params, active, now) {
-      const throttle = clamp(car.throttle, 0, 1);
-      const launch = throttle * LAUNCH_REV * (1 - clamp(car.speed / LAUNCH_SPEED, 0, 1));
-      const wheelspin = throttle * car.rearSlide * WHEELSPIN_REV;
-      const road = revFromSpeed(car.speed, estimateTopSpeed(params));
-      const rev = clamp(Math.max(road, launch) + wheelspin, 0, MAX_REV);
+      const dt = lastNow < 0 ? 0 : Math.min(Math.max(now - lastNow, 0), MAX_STEP);
+      lastNow = now;
+      if (active) stepPowertrain(powertrain, readDrive(car, params, driveInput), dt);
+      if (now >= flutterUntil) {
+        flutter = Math.random();
+        flutterUntil = now + FLUTTER_MIN + FLUTTER_SPREAD * Math.random();
+      }
+      engineTone(powertrain.rpm, powertrain.torque, powertrain.gate, flutter, mix);
 
-      const pitch = (IDLE_HZ + (REDLINE_HZ - IDLE_HZ) * rev) * (1 + THROTTLE_PITCH * throttle);
-      upper.frequency.setTargetAtTime(pitch, now, PITCH_SMOOTH);
-      lower.frequency.setTargetAtTime(pitch, now, PITCH_SMOOTH);
-      sub.frequency.setTargetAtTime(pitch * 0.5, now, PITCH_SMOOTH);
+      const wander = active ? 1 + PITCH_WANDER * (flutter - 0.5) : 1;
+      const cycleHz = mix.cycleHz * wander;
+      const firingHz = mix.firingHz * wander;
+      loadPitch.to(cycleHz, now, PITCH_SMOOTH);
+      coastPitch.to(cycleHz, now, PITCH_SMOOTH);
+      pulsePitch.to(cycleHz, now, PITCH_SMOOTH);
+      sawLowPitch.to(firingHz, now, PITCH_SMOOTH);
+      sawHighPitch.to(firingHz, now, PITCH_SMOOTH);
 
-      filter.frequency.setTargetAtTime(320 + 1500 * throttle + 700 * rev, now, TONE_SMOOTH);
-      const level = active ? 0.07 + 0.13 * throttle + 0.04 * rev : 0;
-      output.gain.setTargetAtTime(level, now, active ? TONE_SMOOTH : FADE_SMOOTH);
+      loadLevel.to(mix.loadGain, now, TONE_SMOOTH);
+      coastLevel.to(mix.coastGain, now, TONE_SMOOTH);
+      noiseLevel.to(mix.noiseGain, now, TONE_SMOOTH);
+      driveLevel.to(mix.drive, now, TONE_SMOOTH);
+      toneCutoff.to(mix.cutoff, now, TONE_SMOOTH);
+      sawLevel.to(mix.sawGain, now, TONE_SMOOTH);
+      sawCutoff.to(mix.sawCutoff, now, TONE_SMOOTH);
+      outputLevel.to(active ? mix.level : 0, now, active ? LEVEL_SMOOTH : FADE_SMOOTH);
+    },
+    get rpm() {
+      return powertrain.rpm;
+    },
+    get gear() {
+      return powertrain.gear;
     },
     dispose() {
-      upper.stop();
-      lower.stop();
-      sub.stop();
+      for (const source of sources) {
+        try {
+          source.stop();
+        } catch {
+          // Already stopped.
+        }
+        source.disconnect();
+      }
       output.disconnect();
     },
   };

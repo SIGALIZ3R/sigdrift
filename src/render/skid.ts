@@ -1,6 +1,8 @@
 import { BufferAttribute, BufferGeometry, DoubleSide, DynamicDrawUsage, Mesh, MeshBasicMaterial } from 'three';
 import type { CarParams, CarState } from '../types';
 import { WHEEL_COUNT, wheelOffsetX, wheelOffsetZ } from './carMesh';
+import { FLAT_GROUND } from './ground';
+import type { Ground } from './ground';
 import { SKID } from './palette';
 
 /**
@@ -11,7 +13,7 @@ import { SKID } from './palette';
 const QUADS_PER_WHEEL = 4096;
 const VERTS_PER_WHEEL = QUADS_PER_WHEEL * 4;
 const HALF_WIDTH = 0.12;
-/** Just above the road paint, below the gate bars. */
+/** Just above the road paint, below the gate bars. Measured from the ground, which a bump raises. */
 const MARK_Y = 0.04;
 /** A new quad is laid once the wheel has moved this far, m. */
 const MIN_STEP = 0.3;
@@ -23,8 +25,9 @@ const REAR_ALPHA_MAX = 0.85;
 const FRONT_ALPHA_MIN = 0.1;
 const FRONT_ALPHA_MAX = 0.45;
 
-// Layout of the per-wheel record in `prev`: last anchor point, its left and right ribbon edge, its alpha.
-const PREV_STRIDE = 7;
+// Layout of the per-wheel record in `prev`: last anchor point, its left and right ribbon edge, its alpha and the
+// height of the ground under it.
+const PREV_STRIDE = 8;
 const AX = 0;
 const AZ = 1;
 const LX = 2;
@@ -32,6 +35,7 @@ const LZ = 3;
 const RX = 4;
 const RZ = 5;
 const ALPHA = 6;
+const GROUND_Y = 7;
 
 interface UpdateRange {
   start: number;
@@ -40,8 +44,11 @@ interface UpdateRange {
 
 export interface SkidMarks {
   readonly mesh: Mesh;
-  /** Call once per simulation tick. */
-  lay(car: CarState, params: CarParams): void;
+  /**
+   * Call once per simulation tick. Marks are laid on `ground`, so they climb a bump with the tyres; a car in the
+   * air leaves none.
+   */
+  lay(car: CarState, params: CarParams, ground?: Ground): void;
   /** Call once per rendered frame, before drawing: schedules the upload of whatever `lay` wrote. */
   flush(): void;
   clear(): void;
@@ -108,7 +115,11 @@ class SkidRibbons implements SkidMarks {
     this.mesh.renderOrder = 1;
   }
 
-  lay(car: CarState, params: CarParams): void {
+  lay(car: CarState, params: CarParams, ground: Ground = FLAT_GROUND): void {
+    if (car.airborne) {
+      this.sliding.fill(0);
+      return;
+    }
     const cos = Math.cos(car.heading);
     const sin = Math.sin(car.heading);
     for (let w = 0; w < WHEEL_COUNT; w++) {
@@ -119,7 +130,9 @@ class SkidRibbons implements SkidMarks {
       }
       const lx = wheelOffsetX(params, w);
       const lz = wheelOffsetZ(params, w);
-      this.extend(w, car.x + lx * cos - lz * sin, car.z + lx * sin + lz * cos, markAlpha(w, slide));
+      const x = car.x + lx * cos - lz * sin;
+      const z = car.z + lx * sin + lz * cos;
+      this.extend(w, x, z, ground.heightAt(x, z), markAlpha(w, slide));
     }
   }
 
@@ -165,7 +178,7 @@ class SkidRibbons implements SkidMarks {
   }
 
   /** Continues wheel `w`'s ribbon to (x, z), or starts a new strip there if the wheel was not sliding. */
-  private extend(w: number, x: number, z: number, alpha: number): void {
+  private extend(w: number, x: number, z: number, y: number, alpha: number): void {
     const prev = this.prev;
     const o = w * PREV_STRIDE;
     const dx = x - prev[o + AX];
@@ -177,6 +190,7 @@ class SkidRibbons implements SkidMarks {
       prev[o + AX] = x;
       prev[o + AZ] = z;
       prev[o + ALPHA] = alpha;
+      prev[o + GROUND_Y] = y;
       return;
     }
     if (d2 < MIN_STEP * MIN_STEP) return;
@@ -197,7 +211,7 @@ class SkidRibbons implements SkidMarks {
       pz = -pz;
     }
 
-    this.writeQuad(w, x - px, z - pz, x + px, z + pz, alpha);
+    this.writeQuad(w, x - px, z - pz, x + px, z + pz, y, alpha);
     prev[o + AX] = x;
     prev[o + AZ] = z;
     prev[o + LX] = x - px;
@@ -205,28 +219,31 @@ class SkidRibbons implements SkidMarks {
     prev[o + RX] = x + px;
     prev[o + RZ] = z + pz;
     prev[o + ALPHA] = alpha;
+    prev[o + GROUND_Y] = y;
   }
 
-  /** Writes the quad from the wheel's previous edge to the new edge (lx, lz)-(rx, rz). */
-  private writeQuad(w: number, lx: number, lz: number, rx: number, rz: number, alpha: number): void {
+  /** Writes the quad from the wheel's previous edge to the new edge (lx, lz)-(rx, rz) on ground of height `y`. */
+  private writeQuad(w: number, lx: number, lz: number, rx: number, rz: number, y: number, alpha: number): void {
     const prev = this.prev;
     const o = w * PREV_STRIDE;
     const q = this.cursor[w];
     const v = w * VERTS_PER_WHEEL + q * 4;
 
     const p = this.positions.array;
+    const y0 = MARK_Y + prev[o + GROUND_Y];
+    const y1 = MARK_Y + y;
     let i = v * 3;
     p[i++] = prev[o + LX];
-    p[i++] = MARK_Y;
+    p[i++] = y0;
     p[i++] = prev[o + LZ];
     p[i++] = prev[o + RX];
-    p[i++] = MARK_Y;
+    p[i++] = y0;
     p[i++] = prev[o + RZ];
     p[i++] = rx;
-    p[i++] = MARK_Y;
+    p[i++] = y1;
     p[i++] = rz;
     p[i++] = lx;
-    p[i++] = MARK_Y;
+    p[i++] = y1;
     p[i] = lz;
 
     const rgb = w < 2 ? SKID.front : SKID.rear;

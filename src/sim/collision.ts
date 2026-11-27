@@ -5,6 +5,9 @@
  * whatever it overlaps and the car's velocity gets an impulse at that circle. Walls have no thickness, so each wall
  * test also checks whether the circle's centre went through the wall during the tick and, if so, sends it back to
  * the side it came from: the car cannot tunnel however fast it moves.
+ *
+ * Walls and props live in an unbounded hash grid and belong to an owner (a level, or one chunk of endless road),
+ * so an owner's geometry can be added and removed without touching anyone else's.
  */
 import type { CarParams, CarState, CollisionEvent, Level, Prop, Segment } from '../types';
 import { DT } from '../types';
@@ -13,28 +16,38 @@ import { MAX_YAW_RATE, settleVelocity, updateKinematics } from './car';
 
 declare const colliderBrand: unique symbol;
 
-/** Built once per level by `buildCollider`. Its contents are private to this module. */
+/** Made by `buildCollider` or `createCollider`. Its contents are private to this module. */
 export interface Collider {
   readonly [colliderBrand]: true;
 }
 
 /**
- * Uniform grid in compressed-row form: the items of cell `c` are `items[cellStart[c] .. cellStart[c + 1])`.
- * Item ids below `wallCount` are walls, the rest are props.
+ * Walls are 0.7 m high. A car whose wheels are more than this far above the ground under it passes over them;
+ * props (pillars) are tall and always solid. The caller decides: see `resolveCollisions`.
+ */
+export const WALL_CLEAR_HEIGHT = 0.8;
+
+/** What one owner put into the grid, so that it can be taken out again. */
+interface Owned {
+  walls: number[];
+  props: number[];
+}
+
+/**
+ * Hash grid of square cells. A cell's list holds wall slots as they are and prop slots as `-1 - slot`.
+ * Slots are reused once their owner has been removed.
  */
 interface Grid {
-  minX: number;
-  minZ: number;
-  invCell: number;
-  cols: number;
-  rows: number;
-  cellStart: Int32Array;
-  items: Int32Array;
-  /** ax, az, bx, bz per wall. */
+  cells: Map<number, number[]>;
+  /** ax, az, bx, bz per wall slot. */
   walls: Float64Array;
-  wallCount: number;
-  /** x, z, radius per prop. */
+  wallSlots: number;
+  freeWalls: number[];
+  /** x, z, radius per prop slot. */
   props: Float64Array;
+  propSlots: number;
+  freeProps: number[];
+  owners: Map<number, Owned>;
   /** Scratch: the contact found by the latest overlap test. */
   nx: number;
   nz: number;
@@ -44,8 +57,16 @@ interface Grid {
   event: CollisionEvent;
 }
 
-const MIN_CELL_SIZE = 6;
-const MAX_CELLS = 1 << 18;
+const CELL_SIZE = 8;
+const INV_CELL = 1 / CELL_SIZE;
+/**
+ * Cell coordinates are wrapped into 15 bits each, so a key is a small integer whatever the coordinates. Cells
+ * 262 km apart share a list, which only costs a wasted test: everything solid at any one time is far closer together.
+ */
+const CELL_MASK = 0x7fff;
+const CELL_BITS = 15;
+/** A query wider than this many cells is nonsense (a broken state); it finds nothing rather than loop for ever. */
+const MAX_QUERY_SPAN = 64;
 /** Push-out passes over the whole body per tick, and contacts per circle per pass. Corners need more than one. */
 const MAX_PASSES = 3;
 const MAX_CONTACTS = 3;
@@ -59,125 +80,150 @@ const TOUCHING_EPSILON = 1e-9;
 /** Slack on a wall's ends for the went-through test, so a path through the joint of two walls is caught by both. */
 const JOINT_SLACK = 1e-9;
 
-function packWalls(walls: readonly Segment[]): Float64Array {
-  const packed = new Float64Array(walls.length * 4);
-  walls.forEach((w, i) => packed.set([w.ax, w.az, w.bx, w.bz], i * 4));
-  return packed;
+function cellKey(col: number, row: number): number {
+  return ((col & CELL_MASK) << CELL_BITS) | (row & CELL_MASK);
 }
 
-function packProps(props: readonly Prop[]): Float64Array {
-  const packed = new Float64Array(props.length * 3);
-  props.forEach((p, i) => packed.set([p.x, p.z, p.radius], i * 3));
-  return packed;
+function grown(array: Float64Array, length: number): Float64Array {
+  if (array.length >= length) return array;
+  const bigger = new Float64Array(Math.max(length, array.length * 2, 64));
+  bigger.set(array);
+  return bigger;
 }
 
-function cellIndex(coordinate: number, origin: number, invCell: number, count: number): number {
-  const index = Math.floor((coordinate - origin) * invCell);
-  return index < 0 ? 0 : index >= count ? count - 1 : index;
-}
-
-/** Appends (cell, item) for every cell the box touches, skipping cells that already hold the item. */
-function addBox(
-  grid: Grid,
-  pairs: number[],
-  lastItem: Int32Array,
-  item: number,
-  x0: number,
-  z0: number,
-  x1: number,
-  z1: number,
-): void {
-  const colFrom = cellIndex(Math.min(x0, x1), grid.minX, grid.invCell, grid.cols);
-  const colTo = cellIndex(Math.max(x0, x1), grid.minX, grid.invCell, grid.cols);
-  const rowFrom = cellIndex(Math.min(z0, z1), grid.minZ, grid.invCell, grid.rows);
-  const rowTo = cellIndex(Math.max(z0, z1), grid.minZ, grid.invCell, grid.rows);
-  for (let row = rowFrom; row <= rowTo; row++) {
-    for (let col = colFrom; col <= colTo; col++) {
-      const cell = row * grid.cols + col;
-      if (lastItem[cell] === item) continue;
-      lastItem[cell] = item;
-      pairs.push(cell, item);
+/** Adds `item` to, or takes it out of, every cell the box touches. Cell lists keep their order. */
+function markBox(grid: Grid, item: number, add: boolean, x0: number, z0: number, x1: number, z1: number): void {
+  const colFrom = Math.floor(Math.min(x0, x1) * INV_CELL);
+  const rowFrom = Math.floor(Math.min(z0, z1) * INV_CELL);
+  const cols = Math.floor(Math.max(x0, x1) * INV_CELL) - colFrom;
+  const rows = Math.floor(Math.max(z0, z1) * INV_CELL) - rowFrom;
+  for (let r = 0; r <= rows; r++) {
+    for (let c = 0; c <= cols; c++) {
+      const key = cellKey(colFrom + c, rowFrom + r);
+      const list = grid.cells.get(key);
+      if (add) {
+        if (!list) grid.cells.set(key, [item]);
+        else if (list[list.length - 1] !== item && list.indexOf(item) < 0) list.push(item);
+      } else if (list) {
+        const at = list.indexOf(item);
+        if (at >= 0) list.splice(at, 1);
+        if (list.length === 0) grid.cells.delete(key);
+      }
     }
   }
 }
 
-/** A long diagonal wall is added piece by piece so it only lands in the cells near it, not its whole bounding box. */
-function addWall(grid: Grid, pairs: number[], lastItem: Int32Array, wall: number): void {
-  const ax = grid.walls[wall * 4];
-  const az = grid.walls[wall * 4 + 1];
-  const dx = grid.walls[wall * 4 + 2] - ax;
-  const dz = grid.walls[wall * 4 + 3] - az;
-  const pieces = Math.max(1, Math.ceil(Math.sqrt(dx * dx + dz * dz) * grid.invCell));
+/** A long diagonal wall is marked piece by piece so it only lands in the cells near it, not its whole bounding box. */
+function markWall(grid: Grid, slot: number, add: boolean): void {
+  const ax = grid.walls[slot * 4];
+  const az = grid.walls[slot * 4 + 1];
+  const dx = grid.walls[slot * 4 + 2] - ax;
+  const dz = grid.walls[slot * 4 + 3] - az;
+  const length = Math.sqrt(dx * dx + dz * dz);
+  // A wall with a coordinate that is not a number, or of absurd length, is left out: it could never be hit anyway.
+  if (!(length < 1e7)) return;
+  const pieces = Math.max(1, Math.ceil(length * INV_CELL));
   for (let i = 0; i < pieces; i++) {
     const from = i / pieces;
     const to = (i + 1) / pieces;
-    addBox(grid, pairs, lastItem, wall, ax + dx * from, az + dz * from, ax + dx * to, az + dz * to);
+    markBox(grid, slot, add, ax + dx * from, az + dz * from, ax + dx * to, az + dz * to);
   }
 }
 
-function fillCells(grid: Grid, pairs: readonly number[]): void {
-  const cellStart = new Int32Array(grid.cols * grid.rows + 1);
-  for (let i = 0; i < pairs.length; i += 2) cellStart[pairs[i] + 1]++;
-  for (let cell = 0; cell < cellStart.length - 1; cell++) cellStart[cell + 1] += cellStart[cell];
-  const items = new Int32Array(pairs.length / 2);
-  const next = cellStart.slice(0, -1);
-  for (let i = 0; i < pairs.length; i += 2) items[next[pairs[i]]++] = pairs[i + 1];
-  grid.cellStart = cellStart;
-  grid.items = items;
+function markProp(grid: Grid, slot: number, add: boolean): void {
+  const x = grid.props[slot * 3];
+  const z = grid.props[slot * 3 + 1];
+  const radius = grid.props[slot * 3 + 2];
+  if (!(radius >= 0 && radius < 500 && Math.abs(x) < Infinity && Math.abs(z) < Infinity)) return;
+  markBox(grid, -1 - slot, add, x - radius, z - radius, x + radius, z + radius);
 }
 
-/** Bounds of everything solid, falling back to the level's own bounds when there is nothing to hit. */
-function solidBounds(level: Level, walls: Float64Array, props: Float64Array): Level['bounds'] {
-  let minX = Infinity;
-  let minZ = Infinity;
-  let maxX = -Infinity;
-  let maxZ = -Infinity;
-  const include = (x: number, z: number, pad: number): void => {
-    minX = Math.min(minX, x - pad);
-    minZ = Math.min(minZ, z - pad);
-    maxX = Math.max(maxX, x + pad);
-    maxZ = Math.max(maxZ, z + pad);
-  };
-  for (let i = 0; i < walls.length; i += 2) include(walls[i], walls[i + 1], 0);
-  for (let i = 0; i < props.length; i += 3) include(props[i], props[i + 1], props[i + 2]);
-  return minX <= maxX && minZ <= maxZ ? { minX, minZ, maxX, maxZ } : level.bounds;
-}
-
-/** Builds the lookup grid over `level.walls` and `level.props`. */
-export function buildCollider(level: Level): Collider {
-  const walls = packWalls(level.walls);
-  const props = packProps(level.props);
-  const bounds = solidBounds(level, walls, props);
-  const width = Math.max(bounds.maxX - bounds.minX, MIN_CELL_SIZE);
-  const depth = Math.max(bounds.maxZ - bounds.minZ, MIN_CELL_SIZE);
-  const cell = Math.max(MIN_CELL_SIZE, Math.sqrt((width * depth) / MAX_CELLS));
+/** An empty collider, to be filled with `addSolids`. */
+export function createCollider(): Collider {
   const grid: Grid = {
-    minX: bounds.minX,
-    minZ: bounds.minZ,
-    invCell: 1 / cell,
-    cols: Math.max(1, Math.ceil(width / cell)),
-    rows: Math.max(1, Math.ceil(depth / cell)),
-    cellStart: new Int32Array(0),
-    items: new Int32Array(0),
-    walls,
-    wallCount: level.walls.length,
-    props,
+    cells: new Map(),
+    walls: new Float64Array(0),
+    wallSlots: 0,
+    freeWalls: [],
+    props: new Float64Array(0),
+    propSlots: 0,
+    freeProps: [],
+    owners: new Map(),
     nx: 0,
     nz: 0,
     depth: 0,
     touched: false,
     event: { x: 0, z: 0, nx: 0, nz: 0, impact: 0 },
   };
-
-  const pairs: number[] = [];
-  const lastItem = new Int32Array(grid.cols * grid.rows).fill(-1);
-  for (let wall = 0; wall < grid.wallCount; wall++) addWall(grid, pairs, lastItem, wall);
-  for (let i = 0; i < level.props.length; i++) {
-    const p = level.props[i];
-    addBox(grid, pairs, lastItem, grid.wallCount + i, p.x - p.radius, p.z - p.radius, p.x + p.radius, p.z + p.radius);
-  }
-  fillCells(grid, pairs);
   return grid as unknown as Collider;
+}
+
+/**
+ * Adds walls and props under an owner id (for endless road, the chunk index). An owner may be added to more than
+ * once; `removeSolids` takes out everything it ever added. Costs time in proportion to what is added.
+ */
+export function addSolids(collider: Collider, owner: number, walls: readonly Segment[], props: readonly Prop[]): void {
+  const grid = collider as unknown as Grid;
+  let owned = grid.owners.get(owner);
+  if (!owned) {
+    owned = { walls: [], props: [] };
+    grid.owners.set(owner, owned);
+  }
+  for (let i = 0; i < walls.length; i++) {
+    const wall = walls[i];
+    const slot = grid.freeWalls.length > 0 ? (grid.freeWalls.pop() as number) : grid.wallSlots++;
+    grid.walls = grown(grid.walls, grid.wallSlots * 4);
+    grid.walls[slot * 4] = wall.ax;
+    grid.walls[slot * 4 + 1] = wall.az;
+    grid.walls[slot * 4 + 2] = wall.bx;
+    grid.walls[slot * 4 + 3] = wall.bz;
+    owned.walls.push(slot);
+    markWall(grid, slot, true);
+  }
+  for (let i = 0; i < props.length; i++) {
+    const prop = props[i];
+    const slot = grid.freeProps.length > 0 ? (grid.freeProps.pop() as number) : grid.propSlots++;
+    grid.props = grown(grid.props, grid.propSlots * 3);
+    grid.props[slot * 3] = prop.x;
+    grid.props[slot * 3 + 1] = prop.z;
+    grid.props[slot * 3 + 2] = prop.radius;
+    owned.props.push(slot);
+    markProp(grid, slot, true);
+  }
+}
+
+/** Removes everything `owner` added. Unknown owners are ignored. Costs time in proportion to what is removed. */
+export function removeSolids(collider: Collider, owner: number): void {
+  const grid = collider as unknown as Grid;
+  const owned = grid.owners.get(owner);
+  if (!owned) return;
+  for (let i = 0; i < owned.walls.length; i++) {
+    markWall(grid, owned.walls[i], false);
+    grid.freeWalls.push(owned.walls[i]);
+  }
+  for (let i = 0; i < owned.props.length; i++) {
+    markProp(grid, owned.props[i], false);
+    grid.freeProps.push(owned.props[i]);
+  }
+  grid.owners.delete(owner);
+}
+
+/** How many walls and props are in the collider, and how many grid cells they occupy. For tests and diagnostics. */
+export function colliderStats(collider: Collider): { walls: number; props: number; cells: number; owners: number } {
+  const grid = collider as unknown as Grid;
+  return {
+    walls: grid.wallSlots - grid.freeWalls.length,
+    props: grid.propSlots - grid.freeProps.length,
+    cells: grid.cells.size,
+    owners: grid.owners.size,
+  };
+}
+
+/** A collider holding `level.walls` and `level.props`, for a fixed level. */
+export function buildCollider(level: Level): Collider {
+  const collider = createCollider();
+  addSolids(collider, 0, level.walls, level.props);
+  return collider;
 }
 
 /**
@@ -309,27 +355,38 @@ function respond(
  * than the end of its neighbour, and once it is resolved the neighbour's end no longer touches, so the car slides
  * over the joint instead of snagging on it.
  */
-function deepestHit(grid: Grid, cx: number, cz: number, prevX: number, prevZ: number, radius: number): boolean {
-  const colFrom = cellIndex(Math.min(cx, prevX) - radius, grid.minX, grid.invCell, grid.cols);
-  const colTo = cellIndex(Math.max(cx, prevX) + radius, grid.minX, grid.invCell, grid.cols);
-  const rowFrom = cellIndex(Math.min(cz, prevZ) - radius, grid.minZ, grid.invCell, grid.rows);
-  const rowTo = cellIndex(Math.max(cz, prevZ) + radius, grid.minZ, grid.invCell, grid.rows);
+function deepestHit(
+  grid: Grid,
+  cx: number,
+  cz: number,
+  prevX: number,
+  prevZ: number,
+  radius: number,
+  walls: boolean,
+): boolean {
+  const colFrom = Math.floor((Math.min(cx, prevX) - radius) * INV_CELL);
+  const rowFrom = Math.floor((Math.min(cz, prevZ) - radius) * INV_CELL);
+  const cols = Math.floor((Math.max(cx, prevX) + radius) * INV_CELL) - colFrom;
+  const rows = Math.floor((Math.max(cz, prevZ) + radius) * INV_CELL) - rowFrom;
   let depth = 0;
   let nx = 0;
   let nz = 0;
-  for (let row = rowFrom; row <= rowTo; row++) {
-    for (let col = colFrom; col <= colTo; col++) {
-      const cell = row * grid.cols + col;
-      for (let i = grid.cellStart[cell]; i < grid.cellStart[cell + 1]; i++) {
-        const item = grid.items[i];
-        const hit =
-          item < grid.wallCount
-            ? hitWall(grid, item, cx, cz, prevX, prevZ, radius)
-            : hitProp(grid, item - grid.wallCount, cx, cz, radius);
-        if (hit && grid.depth > depth) {
-          depth = grid.depth;
-          nx = grid.nx;
-          nz = grid.nz;
+  if (cols <= MAX_QUERY_SPAN && rows <= MAX_QUERY_SPAN) {
+    for (let r = 0; r <= rows; r++) {
+      for (let c = 0; c <= cols; c++) {
+        const list = grid.cells.get(cellKey(colFrom + c, rowFrom + r));
+        if (list === undefined) continue;
+        for (let i = 0; i < list.length; i++) {
+          const item = list[i];
+          const hit =
+            item >= 0
+              ? walls && hitWall(grid, item, cx, cz, prevX, prevZ, radius)
+              : hitProp(grid, -1 - item, cx, cz, radius);
+          if (hit && grid.depth > depth) {
+            depth = grid.depth;
+            nx = grid.nx;
+            nz = grid.nz;
+          }
         }
       }
     }
@@ -350,11 +407,12 @@ function resolveCircle(
   sinH: number,
   prevX: number,
   prevZ: number,
+  walls: boolean,
 ): boolean {
   const radius = params.collisionRadius;
   let touched = false;
   for (let contact = 0; contact < MAX_CONTACTS; contact++) {
-    if (!deepestHit(grid, car.x + offset * cosH, car.z + offset * sinH, prevX, prevZ, radius)) break;
+    if (!deepestHit(grid, car.x + offset * cosH, car.z + offset * sinH, prevX, prevZ, radius, walls)) break;
     respond(grid, car, params, offset, cosH, sinH, radius);
     touched = true;
   }
@@ -364,8 +422,23 @@ function resolveCircle(
 /**
  * Call once per tick, after `stepCar`. Returns the hardest contact of the tick, or null if the car touched nothing.
  * The returned object belongs to the collider and is overwritten by the next call: copy it to keep it.
+ *
+ * Pass `walls = false` while the car is flying higher than WALL_CLEAR_HEIGHT above the ground: it then passes over
+ * walls and only props stop it.
+ *
+ * Pass `regroup = true` on the first tick the walls are solid again after such a flight. While they were not, the
+ * car may have turned so that its nose and tail are on opposite sides of a wall, and each circle on its own would
+ * then be held on the side it happens to be on, pinning the car across the wall for good. On this one tick the
+ * front and rear circles are instead taken to have come from where the car's centre is, so whichever of them is
+ * across a wall from the centre is brought over to the centre's side: the car comes down whole, on one side.
  */
-export function resolveCollisions(car: CarState, params: CarParams, collider: Collider): CollisionEvent | null {
+export function resolveCollisions(
+  car: CarState,
+  params: CarParams,
+  collider: Collider,
+  walls = true,
+  regroup = false,
+): CollisionEvent | null {
   const grid = collider as unknown as Grid;
   // A body with no size, or a nonsense one from a half-typed tuning value, touches nothing.
   if (!(params.collisionRadius > 0 && params.collisionRadius < Infinity)) return null;
@@ -384,9 +457,10 @@ export function resolveCollisions(car: CarState, params: CarParams, collider: Co
     let touched = false;
     for (let circle = -1; circle <= 1; circle++) {
       const offset = circle * reach;
-      const fromX = prevX + offset * prevCos;
-      const fromZ = prevZ + offset * prevSin;
-      if (resolveCircle(grid, car, params, offset, cosH, sinH, fromX, fromZ)) touched = true;
+      const fromCentre = regroup && circle !== 0;
+      const fromX = fromCentre ? car.x : prevX + offset * prevCos;
+      const fromZ = fromCentre ? car.z : prevZ + offset * prevSin;
+      if (resolveCircle(grid, car, params, offset, cosH, sinH, fromX, fromZ, walls)) touched = true;
     }
     if (!touched) break;
   }

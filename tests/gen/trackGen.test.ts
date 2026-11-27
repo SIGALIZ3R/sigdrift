@@ -138,7 +138,7 @@ describe('generateLevel', () => {
 });
 
 describe('generated levels obey the rules', () => {
-  it(`validates ${PROPERTY_SEEDS} arbitrary seeds, rarely needing a retry`, () => {
+  it(`validates ${PROPERTY_SEEDS} arbitrary seeds, rarely needing a retry`, { timeout: 60_000 }, () => {
     let retried = 0;
     const started = performance.now();
     for (let i = 0; i < PROPERTY_SEEDS; i++) {

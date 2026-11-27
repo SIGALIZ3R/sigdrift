@@ -32,14 +32,20 @@ const TICK_LIMIT = 200 * SIM_HZ;
  * src/types.ts (saved times and replays are only comparable within one version) and then update the pins. If only
  * the bot or the rough driver changed, update the pins. If nothing was meant to change, this is a determinism
  * bug: find it.
+ *
+ * HISTORY
+ * - The handling retune that came with endless mode (punchier launch, less drag, less oversteer) moved every pin:
+ *   the clean run went from 7146 ticks (59.55 s) to 6919 (57.66 s). The bot did not change.
+ * - Still before release, braking stopped moving weight forward beyond BRAKE_TRANSFER_LIMIT (the brake pedal
+ *   with a steering key held threw the tail out). Every hash moved; the clean run still takes 6919 ticks.
  */
 const PINNED_GEN_VERSION = 1;
-const PINNED_PHYSICS_VERSION = 1;
-const PINNED_FINISH_TICKS = 7146;
-const PINNED_FINISH_HASH = '94e2d46922156c3e';
-const PINNED_ROLL_OUT_HASH = 'd1385782c2d8ec46';
-const PINNED_ROUGH_ASSISTED_HASH = 'd9ed9f890d095905';
-const PINNED_ROUGH_UNASSISTED_HASH = 'cd55ebc5ff9d66b0';
+const PINNED_PHYSICS_VERSION = 2;
+const PINNED_FINISH_TICKS = 6919;
+const PINNED_FINISH_HASH = '1dfe335110005800';
+const PINNED_ROLL_OUT_HASH = '2a2abe5965dd636b';
+const PINNED_ROUGH_ASSISTED_HASH = '7bc62e22bf8e3420';
+const PINNED_ROUGH_UNASSISTED_HASH = '6e6a530794e08c34';
 
 const ROLL_OUT_TICKS = 4 * SIM_HZ;
 const ROUGH_TICKS = 75 * SIM_HZ;

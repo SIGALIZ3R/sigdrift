@@ -20,8 +20,8 @@ const HALF_CELL = CELL / 2;
 const MIN_CELLS = 16;
 const MAX_CELLS = 24;
 /** Travel directions in clockwise order (east, south, west, north): adding 1 is a right turn. */
-const DIR_X = [1, 0, -1, 0];
-const DIR_Z = [0, 1, 0, -1];
+export const DIR_X = [1, 0, -1, 0];
+export const DIR_Z = [0, 1, 0, -1];
 const PATH_STEP = 3;
 const ARC_LENGTH = HALF_PI * HALF_CELL;
 const ARC_STEPS = 13;
@@ -82,7 +82,7 @@ const DECOR_LOW_RISE = 5;
 const MAX_RETRIES = 50;
 
 /** Snaps to a 1/1024 m lattice so a level serialises and hashes identically everywhere. Adding 0 clears -0. */
-function snap(v: number): number {
+export function snap(v: number): number {
   return Math.round(v * 1024) / 1024 + 0;
 }
 
@@ -214,9 +214,9 @@ function walkLayout(rng: Rng): Walk {
 // Cells and widths
 // ---------------------------------------------------------------------------------------------------------------
 
-type CellKind = 'straight' | 'corner' | 'plaza' | 'narrow';
+export type CellKind = 'straight' | 'corner' | 'plaza' | 'narrow';
 
-interface Cell {
+export interface Cell {
   cx: number;
   cz: number;
   /** Travel direction on entering and on leaving. They differ in a corner cell. */
@@ -348,7 +348,7 @@ function halfWidthAt(cells: readonly Cell[], plan: WidthPlan, index: number, s: 
 // Road geometry
 // ---------------------------------------------------------------------------------------------------------------
 
-interface Centreline {
+export interface Centreline {
   x: number[];
   z: number[];
   halfWidth: number[];
@@ -356,7 +356,7 @@ interface Centreline {
 }
 
 /** Appends the centreline point a fraction `t` of the way through the cell. */
-function pushCellPoint(line: Centreline, cell: Cell, t: number): void {
+export function pushCellPoint(line: Centreline, cell: Cell, t: number): void {
   const centreX = cell.cx * CELL;
   const centreZ = cell.cz * CELL;
   const inX = DIR_X[cell.inDir];
@@ -485,14 +485,14 @@ function placeCheckpoints(cells: readonly Cell[], road: Road, length: number): G
 // Props
 // ---------------------------------------------------------------------------------------------------------------
 
-interface PillarSpot {
+export interface PillarSpot {
   /** Metres from the cell centre along the road, and to the right of the centreline. */
   along: number;
   lateral: number;
   radius: number;
 }
 
-function centrePillar(rng: Rng): PillarSpot {
+export function centrePillar(rng: Rng): PillarSpot {
   return { along: rng.range(-PLAZA_PILLAR_REACH, PLAZA_PILLAR_REACH), lateral: 0, radius: rng.range(1.6, 2.4) };
 }
 
@@ -500,7 +500,7 @@ function centrePillar(rng: Rng): PillarSpot {
  * A pillar off to one side. It either hugs its wall, or stands far enough out that a car fits behind it: gaps in
  * between look passable and are not, so they are never used.
  */
-function sidePillar(rng: Rng, halfWidth: number, reach: number): PillarSpot {
+export function sidePillar(rng: Rng, halfWidth: number, reach: number): PillarSpot {
   const radius = rng.range(1.2, 2);
   const side = rng.chance(0.5) ? 1 : -1;
   const hugGap = rng.range(0.4, 0.9);
@@ -550,7 +550,7 @@ function placeProps(rng: Rng, cells: readonly Cell[]): Prop[] {
 // Decor
 // ---------------------------------------------------------------------------------------------------------------
 
-interface DecorSite {
+export interface DecorSite {
   cx: number;
   cz: number;
   /** Cells between this one and the nearest road cell, counting diagonals as one. 0 is a road cell. */
@@ -587,7 +587,7 @@ function decorSites(rng: Rng, cells: readonly Cell[]): DecorSite[] {
 }
 
 /** A random block somewhere in the cell. Its height is only a wish until the clearance rule has had its say. */
-function proposeBlock(rng: Rng, site: DecorSite): DecorBlock {
+export function proposeBlock(rng: Rng, site: DecorSite): DecorBlock {
   const [minSize, maxSize] = DECOR_SIZE_BY_RING[site.ring];
   const x = snap(site.cx * CELL + rng.range(-HALF_CELL, HALF_CELL));
   const z = snap(site.cz * CELL + rng.range(-HALF_CELL, HALF_CELL));

@@ -39,7 +39,11 @@ export interface FollowCamera {
   readonly right: Vector3;
   readonly up: Vector3;
   setAspect(aspect: number): void;
-  update(pose: Pose, car: CarState, dt: number): void;
+  /**
+   * Follows the car on the ground plane only: a jump moves the car on screen, never the camera. With `lookAhead`
+   * off the view settles on the car itself instead of leading it (used once a run is over).
+   */
+  update(pose: Pose, car: CarState, dt: number, lookAhead?: boolean): void;
   /** Adds screen shake; `amount` is in metres of view-plane travel. */
   addShake(amount: number): void;
   /** Makes the next update cut straight to the car. */
@@ -90,8 +94,8 @@ class LockedCamera implements FollowCamera {
     this.snapNext = true;
   }
 
-  update(pose: Pose, car: CarState, dt: number): void {
-    this.follow(pose, car, dt);
+  update(pose: Pose, car: CarState, dt: number, lookAhead = true): void {
+    this.follow(pose, car, dt, lookAhead);
     this.updateWiden(car.speed, dt);
 
     this.shakeTime += dt;
@@ -106,9 +110,9 @@ class LockedCamera implements FollowCamera {
   }
 
   /** Moves the focus point towards the car plus a smoothed, speed-based look-ahead. */
-  private follow(pose: Pose, car: CarState, dt: number): void {
-    let aheadX = car.vx * LOOK_AHEAD_S;
-    let aheadZ = car.vz * LOOK_AHEAD_S;
+  private follow(pose: Pose, car: CarState, dt: number, lookAhead: boolean): void {
+    let aheadX = lookAhead ? car.vx * LOOK_AHEAD_S : 0;
+    let aheadZ = lookAhead ? car.vz * LOOK_AHEAD_S : 0;
     const ahead = Math.sqrt(aheadX * aheadX + aheadZ * aheadZ);
     if (ahead > LOOK_AHEAD_MAX) {
       aheadX *= LOOK_AHEAD_MAX / ahead;

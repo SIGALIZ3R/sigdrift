@@ -22,7 +22,7 @@ export const SIM_HZ = 120;
 export const DT = 1 / SIM_HZ;
 
 /** Bump when physics behaviour changes: recorded times and replays are only comparable within one version. */
-export const PHYSICS_VERSION = 1;
+export const PHYSICS_VERSION = 2;
 /** Bump when the generator's output for a given week would change. Old versions stay frozen. */
 export const GEN_VERSION = 1;
 
@@ -67,6 +67,8 @@ export interface MetaInput {
   restart: boolean;
   toggleTuning: boolean;
   confirm: boolean;
+  /** M key: mute / unmute all sound. */
+  toggleMute: boolean;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -167,6 +169,14 @@ export interface CarState {
   throttle: number;
   brake: number;
   handbrake: boolean;
+
+  // ---- height (only ever non-zero on tracks with bumps, i.e. endless mode) ----
+  /** Height of the car's wheels above the flat ground plane (three.js Y), m. Equals the ground height while grounded. */
+  y: number;
+  /** Vertical speed, m/s, positive = up. */
+  vy: number;
+  /** True while the wheels are off the ground: no tyre forces, no steering, no braking; gravity and drag only. */
+  airborne: boolean;
 }
 
 export interface CollisionEvent {
@@ -179,9 +189,8 @@ export interface CollisionEvent {
   impact: number;
 }
 
-/** The deterministic simulation of one car in one level. Implemented in src/sim/world.ts. */
-export interface World {
-  readonly level: Level;
+/** What every simulation world offers, whatever track it runs on. */
+export interface SimBase {
   /** Mutable so the tuning panel can edit values live. */
   params: CarParams;
   readonly car: CarState;
@@ -195,6 +204,11 @@ export interface World {
   placeCar(pose: Pose): void;
   /** Flat list of numbers that fully describes dynamic state, for hashing in replay tests. */
   snapshot(): number[];
+}
+
+/** The deterministic simulation of one car in one fixed level. Implemented in src/sim/world.ts (createWorld). */
+export interface World extends SimBase {
+  readonly level: Level;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -263,6 +277,97 @@ export interface Level {
   length: number;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Endless track (infinite mode): the road arrives in chunks, and has bumps
+// ---------------------------------------------------------------------------------------------------------------
+
+export type Difficulty = 'easy' | 'medium' | 'hard';
+
+/**
+ * A raised ridge across the whole road. Ground height at a point p near the bump:
+ *   u = (p - centre) · dir            (metres along the road, relative to the crest)
+ *   h = height * 0.5 * (1 + cos(PI * u / halfLength))   for |u| < halfLength, else 0
+ * and only where |(p - centre) · right(dir)| <= halfWidth. Where bumps overlap the ground is the highest of them.
+ * Bumps never overlap in practice (the generator keeps them apart). Use fixedMath.cos.
+ */
+export interface Bump {
+  x: number;
+  z: number;
+  /** Unit vector along the road at the crest. */
+  dirX: number;
+  dirZ: number;
+  /** Half the bump's length along the road, m. */
+  halfLength: number;
+  /** Half its extent across the road, m (a little more than the road's halfWidth, so it spans wall to wall). */
+  halfWidth: number;
+  /** Crest height, m. */
+  height: number;
+}
+
+/**
+ * One generated stretch of endless road. Chunks are numbered 0, 1, 2 ... and join end to start:
+ * chunk[n].path[0] is the same point as chunk[n-1].path[last] (same position and halfWidth).
+ */
+export interface TrackChunk {
+  index: number;
+  /** Centreline, points 2–4 m apart; `dist` is the distance along the WHOLE endless road, continuing across chunks. */
+  path: PathPoint[];
+  /** Road edges, same indexing as `path`. */
+  left: Vec2[];
+  right: Vec2[];
+  /**
+   * Solid walls owned by this chunk: its left edge, its right edge, and for chunk 0 only a closed cap behind the
+   * start. The far end is open (the next chunk continues it).
+   */
+  walls: Segment[];
+  props: Prop[];
+  decor: DecorBlock[];
+  bumps: Bump[];
+  /** `dist` of the first and last path point. */
+  startDist: number;
+  endDist: number;
+  /** 0 (gentle) .. 1 (brutal): what the generator aimed for in this chunk. For the HUD and tests. */
+  intensity: number;
+  bounds: { minX: number; minZ: number; maxX: number; maxZ: number };
+}
+
+/** A deterministic, endless supply of chunks. Implemented in src/gen/endless.ts (createEndlessGenerator). */
+export interface EndlessGenerator {
+  readonly seed: string;
+  readonly difficulty: Difficulty;
+  /** Start pose for the car, on chunk 0. */
+  readonly start: Pose;
+  /** Generates and returns the next chunk (index 0 first). */
+  next(): TrackChunk;
+}
+
+/**
+ * The simulation on an endless track. Implemented in src/sim/endlessWorld.ts (createEndlessWorld).
+ * The owner appends chunks ahead of the car and drops old ones behind it.
+ */
+export interface EndlessWorld extends SimBase {
+  /** Live chunks, in index order with no gaps. */
+  readonly chunks: readonly TrackChunk[];
+  /** Append the next chunk (its index must be last.index + 1, or anything when no chunk is live). */
+  addChunk(chunk: TrackChunk): void;
+  /**
+   * Remove every live chunk with an index below `index`. The entry of the oldest remaining chunk is then closed
+   * by a solid cap wall so the car cannot reverse out of the world.
+   */
+  dropChunksBefore(index: number): void;
+  /** Distance along the road of the centreline point nearest to the car, m (the car's progress). */
+  readonly trackDist: number;
+  /** Index of the chunk the car is currently on. */
+  readonly chunkIndex: number;
+  /**
+   * True once the car is on the ground (not airborne) outside the road, i.e. it flew over a wall. Latched until
+   * placeCar. While true the world may stop simulating the car normally.
+   */
+  readonly offTrack: boolean;
+  /** Ground height at a point, from the live chunks' bumps. */
+  groundHeight(x: number, z: number): number;
+}
+
 export interface ValidationResult {
   ok: boolean;
   errors: string[];
@@ -302,6 +407,52 @@ export interface RunState {
   lastChainBreakTick: number;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Endless mode (infinite road, three crashes, flying off the road is fatal)
+// ---------------------------------------------------------------------------------------------------------------
+
+export type EndlessPhase = 'countdown' | 'running' | 'dead';
+/** 'offTrack' = landed outside the road after a jump; 'crashes' = used up every crash. */
+export type DeathCause = 'offTrack' | 'crashes';
+
+export interface EndlessState {
+  phase: EndlessPhase;
+  countdownTicks: number;
+  /** Ticks elapsed while running. */
+  ticks: number;
+  difficulty: Difficulty;
+  /** Furthest distance reached along the road, m. This is the score that matters. */
+  distance: number;
+  /** Crashes so far (wall or pillar hits hard enough to count). */
+  crashes: number;
+  /** The run ends when crashes reaches this (3). */
+  maxCrashes: number;
+  /** Tick of the most recent counted crash, or -1. For HUD flashes. */
+  lastCrashTick: number;
+  deathCause: DeathCause | null;
+  /** Intensity (0..1) of the chunk the car is on. */
+  intensity: number;
+  /** Tick on which the car last left the ground / last landed, or -1. For HUD and audio. */
+  lastTakeoffTick: number;
+  lastLandingTick: number;
+  // Drift scoring: same rules and meaning as RunState.
+  driftScore: number;
+  chainScore: number;
+  multiplier: number;
+  drifting: boolean;
+  lastChainBreakTick: number;
+}
+
+/** Implemented in src/modes/endless.ts (createEndlessMode). Pure and deterministic. Owns chunk streaming. */
+export interface EndlessMode {
+  readonly world: EndlessWorld;
+  readonly state: EndlessState;
+  /** Advance one tick: countdown, world step, chunk streaming, crash counting, death, drift scoring. */
+  step(input: InputState): void;
+  /** Same seed and difficulty again from the start. */
+  restart(): void;
+}
+
 /** Implemented in src/modes/run.ts. Pure and deterministic. */
 export interface RunMode {
   readonly world: World;
@@ -326,6 +477,8 @@ export interface Settings {
   assist: boolean;
   /** Tones down bloom pulses, screen shake and flashes. */
   reducedFlash: boolean;
+  /** All sound off (the volume setting is kept for when it is switched back on). */
+  muted: boolean;
 }
 
 export interface RenderFrame {
@@ -334,7 +487,12 @@ export interface RenderFrame {
   /** Latest simulated car state. */
   car: CarState;
   params: CarParams;
-  run: RunState;
+  /** Weekly run state, or null in endless mode. */
+  run: RunState | null;
+  /** Endless mode state, or null in a weekly run. */
+  endless: EndlessState | null;
+  /** Car height (CarState.y) interpolated like the pose, m. */
+  height: number;
   /** Real seconds since the previous rendered frame. */
   dt: number;
 }
@@ -342,7 +500,14 @@ export interface RenderFrame {
 /** Implemented in src/render/renderer.ts. Owns the canvas, scene, locked camera and effects. */
 export interface GameRenderer {
   readonly canvas: HTMLCanvasElement;
+  /** Show a fixed weekly level (removes any endless chunks). */
   setLevel(level: Level): void;
+  /** Switch to endless mode: remove the current level and all chunks, ready for addChunk. */
+  beginEndless(): void;
+  /** Build and show one chunk of endless road (road, walls, props, decor, bumps). */
+  addChunk(chunk: TrackChunk): void;
+  /** Remove a chunk and free its GPU resources. Unknown indices are ignored. */
+  removeChunk(index: number): void;
   /** Called once per simulation tick so skid marks are laid at sim rate. */
   onSimTick(car: CarState, params: CarParams, collision: CollisionEvent | null): void;
   /** Clear skid marks and smoke (on restart / respawn). */
@@ -356,6 +521,13 @@ export interface GameRenderer {
 export interface BestRecord {
   /** Best time in ticks. */
   ticks: number;
+  driftScore: number;
+  physicsVersion: number;
+}
+
+export interface EndlessBest {
+  /** Best distance, m. */
+  distance: number;
   driftScore: number;
   physicsVersion: number;
 }
