@@ -355,6 +355,7 @@ label.sd-setting { cursor: pointer; }
   box-shadow: 0 0 1.2em rgba(255, 43, 214, 0.55), inset 0 0 0.9em rgba(255, 43, 214, 0.3);
   animation: var(--sd-pop-in) 0.5s ease-out both;
 }
+.sd-badge-muted { border-color: var(--sd-amber); box-shadow: none; letter-spacing: 0.14em; }
 .sd-delta.is-faster { color: var(--sd-cyan); }
 .sd-delta.is-slower { color: var(--sd-amber); }
 .sd-stats { display: grid; margin: 0; }

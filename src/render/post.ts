@@ -3,14 +3,27 @@ import type { Camera, Scene, WebGLRenderer } from 'three';
 import { BloomEffect, EffectComposer, EffectPass, RenderPass, VignetteEffect } from 'postprocessing';
 import { BLOOM } from './palette';
 
-/** MSAA for the scene buffer when pixels are large; at a device pixel ratio near 2 the edges are fine without. */
-const MSAA_SAMPLES = 4;
-const MSAA_MAX_PIXEL_RATIO = 1.5;
+/**
+ * MSAA for the half-float scene buffer, chosen by how many pixels that buffer really has. Four samples of RGBA16F
+ * plus depth is the single most expensive thing in the frame, so it is only paid up to about 1080p. Larger
+ * buffers get two samples while their pixels are still big on screen, and none once the pixel ratio hides the
+ * edges anyway.
+ */
+const MSAA_FULL_SAMPLES = 4;
+const MSAA_FULL_MAX_PIXELS = 1920 * 1200;
+const MSAA_LIGHT_SAMPLES = 2;
+const MSAA_LIGHT_MAX_PIXEL_RATIO = 1.25;
+
+/** `lean` is set once the renderer has had to give up resolution for frame rate: no four-sample buffer then. */
+function msaaSamples(width: number, height: number, pixelRatio: number, lean: boolean): number {
+  if (!lean && width * height * pixelRatio * pixelRatio <= MSAA_FULL_MAX_PIXELS) return MSAA_FULL_SAMPLES;
+  return pixelRatio <= MSAA_LIGHT_MAX_PIXEL_RATIO ? MSAA_LIGHT_SAMPLES : 0;
+}
 
 export interface PostFx {
   render(dt: number): void;
-  /** Call after the renderer's own size and pixel ratio have been set. */
-  setSize(width: number, height: number): void;
+  /** Call after the renderer's own size and pixel ratio have been set. `lean` asks for the cheaper buffers. */
+  setSize(width: number, height: number, lean?: boolean): void;
   setReducedFlash(reduced: boolean): void;
   dispose(): void;
 }
@@ -33,8 +46,8 @@ export function createPost(renderer: WebGLRenderer, scene: Scene, camera: Camera
     render(dt) {
       composer.render(dt);
     },
-    setSize(width, height) {
-      composer.multisampling = renderer.getPixelRatio() > MSAA_MAX_PIXEL_RATIO ? 0 : MSAA_SAMPLES;
+    setSize(width, height, lean = false) {
+      composer.multisampling = msaaSamples(width, height, renderer.getPixelRatio(), lean);
       composer.setSize(width, height, false);
     },
     setReducedFlash(reduced) {

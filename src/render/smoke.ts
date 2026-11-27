@@ -73,6 +73,11 @@ export interface Smoke {
   spawn(x: number, z: number, vx: number, vz: number, intensity: number): void;
   update(dt: number): void;
   setEnabled(enabled: boolean): void;
+  /**
+   * While on, the mesh is drawn even with no live puff (one invisible instance), so that its shader program and
+   * pipeline are built on a frame of our choosing instead of on the first drift. Call with false straight after.
+   */
+  setWarmUp(on: boolean): void;
   clear(): void;
   dispose(): void;
 }
@@ -135,6 +140,18 @@ class SmokePool implements Smoke {
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
     if (!enabled) this.clear();
+  }
+
+  setWarmUp(on: boolean): void {
+    if (this.alive > 0) return;
+    if (on) {
+      // Additive and black: the one instance that gets drawn adds nothing to the picture. A count of zero would
+      // not do, because three skips the draw call (and with it the program) for an instanced mesh with none.
+      this.colors.array.fill(0, 0, 3);
+      this.colors.needsUpdate = true;
+    }
+    this.mesh.count = on ? 1 : 0;
+    this.mesh.visible = on;
   }
 
   clear(): void {
@@ -228,6 +245,8 @@ export interface Sparks {
   /** Throws `count` sparks off a wall hit at (x, z); (nx, nz) is the normal pointing back at the car. */
   burst(x: number, z: number, nx: number, nz: number, impact: number, count: number): void;
   update(dt: number): void;
+  /** While on, the points are drawn even with no live spark (all black), to build their program ahead of time. */
+  setWarmUp(on: boolean): void;
   clear(): void;
   dispose(): void;
 }
@@ -315,6 +334,11 @@ class SparkPool implements Sparks {
     this.positions.needsUpdate = true;
     this.colors.needsUpdate = true;
     this.points.visible = this.live > 0;
+  }
+
+  setWarmUp(on: boolean): void {
+    // Dead sparks are black and the points are additive, so drawing them all shows nothing.
+    if (this.live === 0) this.points.visible = on;
   }
 
   clear(): void {

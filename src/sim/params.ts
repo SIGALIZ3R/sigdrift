@@ -38,6 +38,16 @@ export const DEFAULT_CAR_PARAMS: CarParams = Object.freeze({
   wallFriction: 0.35,
 });
 
+/**
+ * `steerAssist` the game applies while the player's steering-assist setting is on (it is 0 while the setting is off).
+ *
+ * Full strength on purpose. The assist works by pointing the front wheels along their direction of travel; a
+ * partial blend leaves them at a slip angle of (1 - assist) x travel angle, which for anything from 0.3 to 0.9
+ * parks the front tyres on their grip peak and feeds a spin harder than no assist at all. Only 1 takes the front
+ * slip to zero, which is what lets a slide be caught with on/off keys.
+ */
+export const ASSIST_STRENGTH = 1;
+
 /** A mutable copy, e.g. for the tuning panel. */
 export function cloneParams(p: CarParams): CarParams {
   return { ...p };

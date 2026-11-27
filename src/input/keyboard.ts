@@ -39,12 +39,38 @@ const BLOCKED_DEFAULTS: ReadonlySet<string> = new Set([
   'Backspace',
 ]);
 
-const EDITABLE_TAGS: ReadonlySet<string> = new Set(['INPUT', 'SELECT', 'TEXTAREA']);
+/** Input types that are not text entry. They use a few keys themselves (arrows, Space) and nothing else. */
+const CONTROL_INPUT_TYPES: ReadonlySet<string> = new Set([
+  'range',
+  'checkbox',
+  'radio',
+  'button',
+  'submit',
+  'reset',
+  'color',
+  'file',
+  'image',
+]);
 
-function isEditing(target: EventTarget | null): boolean {
-  const element = target as Partial<HTMLElement> | null;
-  if (!element || typeof element.tagName !== 'string') return false;
-  return EDITABLE_TAGS.has(element.tagName.toUpperCase()) || element.isContentEditable === true;
+/**
+ * What the key event's target does with keys of its own:
+ * - `text`: typing goes into it, so the game takes nothing but Escape.
+ * - `control`: a slider or switch. It needs the arrows and Space; menu keys (Enter, P, Backspace) still work, so
+ *   a menu stays usable after its volume slider or assist switch has been clicked and kept focus.
+ * - `button`: Space is its activation key and must reach it untouched.
+ */
+type TargetKind = 'none' | 'text' | 'control' | 'button';
+
+function targetKind(target: EventTarget | null): TargetKind {
+  const element = target as Partial<HTMLInputElement> | null;
+  if (!element || typeof element.tagName !== 'string') return 'none';
+  if (element.isContentEditable === true) return 'text';
+  const tag = element.tagName.toUpperCase();
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return 'text';
+  if (tag === 'BUTTON') return 'button';
+  if (tag !== 'INPUT') return 'none';
+  const type = typeof element.type === 'string' ? element.type.toLowerCase() : 'text';
+  return CONTROL_INPUT_TYPES.has(type) ? 'control' : 'text';
 }
 
 /** `onActivity` fires for every fresh press of a key the game uses. */
@@ -65,34 +91,45 @@ export function createKeyboard(target: Window, onActivity: () => void): Keyboard
     held.reset = down.has('KeyR');
   }
 
+  function releaseAll(): void {
+    down.clear();
+    refreshHeld();
+  }
+
   function onKeyDown(event: KeyboardEvent): void {
     // Browser shortcuts (Cmd+R, Alt+Left, ...) belong to the browser.
     if (event.ctrlKey || event.metaKey || event.altKey) return;
     const code = event.code;
-    // Escape still works from a form field: a menu's slider or switch keeps focus once clicked, and the
-    // pause menu must stay closable from the keyboard.
-    if (code !== 'Escape' && isEditing(event.target)) return;
+    const kind = targetKind(event.target);
+    // Escape still works from a form field: the pause menu must stay closable from the keyboard.
+    if (kind === 'text' && code !== 'Escape') return;
     const metaFlag = META_CODES.get(code);
-    const drives = DRIVE_CODES.has(code);
+    // A slider or switch keeps the driving keys for itself, and a focused button keeps Space: cancelling that
+    // keydown would stop the browser from clicking the button on release.
+    const drives = DRIVE_CODES.has(code) && kind !== 'control' && !(kind === 'button' && code === 'Space');
     if (!drives && metaFlag === undefined) return;
     if (BLOCKED_DEFAULTS.has(code)) event.preventDefault();
-    if (event.repeat) return;
-    if (drives) {
+    // Auto-repeat counts for held keys: a key that is still physically down after its state was dropped (window
+    // blur, the Command key on macOS) comes back with its next repeat instead of staying dead until re-pressed.
+    if (drives && !down.has(code)) {
       down.add(code);
       refreshHeld();
     }
+    if (event.repeat) return;
     if (metaFlag !== undefined) pressed[metaFlag] = true;
     onActivity();
   }
 
   // Releases are always honoured, even while a form field has focus, so a key can never stick.
   function onKeyUp(event: KeyboardEvent): void {
-    if (down.delete(event.code)) refreshHeld();
+    // macOS never delivers the keyup of a key released while Command is down, which would leave it stuck on.
+    // When Command itself comes up, drop everything; keys that are really still held return by auto-repeat.
+    if (event.key === 'Meta' || event.code === 'MetaLeft' || event.code === 'MetaRight') releaseAll();
+    else if (down.delete(event.code)) refreshHeld();
   }
 
   function onBlur(): void {
-    down.clear();
-    refreshHeld();
+    releaseAll();
   }
 
   target.addEventListener('keydown', onKeyDown);

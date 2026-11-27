@@ -9,7 +9,8 @@ import {
   segmentsTouch,
   validateLevel,
 } from '../../src/gen/validate';
-import type { Level, Segment } from '../../src/types';
+import { RULES } from '../../src/gen/validate';
+import type { Level, Segment, Vec2 } from '../../src/types';
 
 const base = generateLevel('2026-W48');
 
@@ -53,6 +54,63 @@ function seg(ax: number, az: number, bx: number, bz: number): Segment {
   return { ax, az, bx, bz };
 }
 
+/** Moves every wall end that sits at `from`, so the loop stays closed. The road edge arrays are left alone. */
+function moveWallVertex(level: Level, from: Vec2, to: Vec2): void {
+  let moved = 0;
+  for (const w of level.walls) {
+    if (w.ax === from.x && w.az === from.z) {
+      w.ax = to.x;
+      w.az = to.z;
+      moved++;
+    }
+    if (w.bx === from.x && w.bz === from.z) {
+      w.bx = to.x;
+      w.bz = to.z;
+      moved++;
+    }
+  }
+  expect(moved).toBe(2);
+}
+
+/** Metres past the goal line, measured the way the road is travelling. */
+function pastGoal(level: Level, x: number, z: number): number {
+  const { respawn } = level.goal;
+  return (x - respawn.x) * Math.cos(respawn.heading) + (z - respawn.z) * Math.sin(respawn.heading);
+}
+
+/**
+ * The two far corners of the cap beyond the goal: where the walls that leave the last left and right edge points,
+ * other than the road edges themselves, end up.
+ */
+function goalCapCorners(level: Level): [Vec2, Vec2] {
+  const last = level.path.length - 1;
+  const farEnd = (edge: Vec2[]): Vec2 => {
+    const at = edge[last];
+    const before = edge[last - 1];
+    for (const w of level.walls) {
+      const a = { x: w.ax, z: w.az };
+      const b = { x: w.bx, z: w.bz };
+      for (const [near, far] of [
+        [a, b],
+        [b, a],
+      ]) {
+        if (near.x === at.x && near.z === at.z && !(far.x === before.x && far.z === before.z)) return far;
+      }
+    }
+    throw new Error('no cap wall found');
+  };
+  return [farEnd(level.left), farEnd(level.right)];
+}
+
+/** Pulls the wall that closes the road beyond the goal in to `distance` metres past the line. */
+function setRunOff(level: Level, distance: number): void {
+  const { heading } = level.goal.respawn;
+  for (const corner of goalCapCorners(level)) {
+    const shift = distance - pastGoal(level, corner.x, corner.z);
+    moveWallVertex(level, corner, { x: corner.x + Math.cos(heading) * shift, z: corner.z + Math.sin(heading) * shift });
+  }
+}
+
 describe('validateLevel', () => {
   it('accepts a generated level', () => {
     expect(validateLevel(base)).toEqual({ ok: true, errors: [] });
@@ -81,6 +139,73 @@ describe('validateLevel', () => {
       level.walls.push(seg(x, z, x + 5, z), seg(x + 5, z, x, z + 5), seg(x, z + 5, x, z));
     });
     expect(errors.some((e) => e.startsWith('walls form more than one loop'))).toBe(true);
+  });
+
+  it('rejects a wall dragged across the road, even when it stops short of the far wall', () => {
+    // The road is physically shut 0.2 m from the right wall, yet the loop is still closed and still simple.
+    const errors = broken((level) => {
+      const i = straightIndex(level);
+      const n = leftNormal(level, i);
+      const r = level.right[i];
+      moveWallVertex(level, level.left[i], { x: r.x + n.x * 0.2, z: r.z + n.z * 0.2 });
+    });
+    expect(errors.some((e) => e.startsWith('road edge has no wall'))).toBe(true);
+    expect(errors.some((e) => e.startsWith('walls intersect'))).toBe(false);
+  });
+
+  it('rejects a wall loop that crosses itself', () => {
+    const errors = broken((level) => {
+      const i = straightIndex(level);
+      const p = level.path[i];
+      const r = level.right[i];
+      // The left wall is pulled clean through the right wall.
+      moveWallVertex(level, level.left[i], { x: 2 * r.x - p.x, z: 2 * r.z - p.z });
+    });
+    expect(errors.some((e) => e.startsWith('walls intersect'))).toBe(true);
+  });
+
+  it('rejects a wall loop that crosses itself where no road edge is involved', () => {
+    // Stretching the cap beyond the goal until it reaches back across another part of the level is how a longer
+    // run-off would go wrong: here the far corners are simply swapped, which twists the cap into a bow tie.
+    const errors = broken((level) => {
+      const [a, b] = goalCapCorners(level);
+      const parked = { x: level.bounds.maxX + 1000, z: level.bounds.maxZ + 1000 };
+      moveWallVertex(level, a, parked);
+      moveWallVertex(level, b, a);
+      moveWallVertex(level, parked, b);
+    });
+    expect(errors.some((e) => e.startsWith('walls intersect'))).toBe(true);
+    expect(errors.some((e) => e.startsWith('road edge has no wall'))).toBe(false);
+  });
+
+  it('gives a generated level its full run-off beyond the goal', () => {
+    for (const corner of goalCapCorners(base)) {
+      expect(pastGoal(base, corner.x, corner.z)).toBeGreaterThanOrEqual(RULES.goalRunOff);
+    }
+  });
+
+  it('rejects a run-off that is too short for a car to stop in', () => {
+    const errors = broken((level) => setRunOff(level, 16));
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/^run-off beyond the goal is too short: a wall 16 m past the line/);
+    const barely = broken((level) => setRunOff(level, RULES.goalRunOff - 0.5));
+    expect(barely.some((e) => e.startsWith('run-off beyond the goal is too short'))).toBe(true);
+  });
+
+  it('accepts a run-off of exactly the required length', () => {
+    const level = structuredClone(base);
+    setRunOff(level, RULES.goalRunOff);
+    expect(validateLevel(level).errors.filter((e) => e.startsWith('run-off'))).toEqual([]);
+  });
+
+  it('rejects a pillar standing in the run-off', () => {
+    const errors = broken((level) => {
+      const { respawn } = level.goal;
+      const x = respawn.x + Math.cos(respawn.heading) * 30;
+      const z = respawn.z + Math.sin(respawn.heading) * 30;
+      level.props.push({ kind: 'pillar', x, z, radius: 1.5, height: 5, hue: 0 });
+    });
+    expect(errors.some((e) => e.startsWith('run-off beyond the goal is blocked'))).toBe(true);
   });
 
   it('rejects a prop that blocks the road', () => {

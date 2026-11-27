@@ -12,6 +12,10 @@ export const COUNTDOWN_TICKS = 3 * SIM_HZ;
 
 const DRIFT_MIN_SPEED = 7;
 const DRIFT_MIN_ANGLE = 0.2;
+/**
+ * Past ninety degrees the car is travelling tail first, and a slide that deep still scores up to this angle.
+ * Plain reversing reads as an angle near pi, far outside it.
+ */
 const DRIFT_MAX_ANGLE = 1.9;
 const DRIFT_POINTS_RATE = 10;
 /** A chain survives this long without drifting, so that linked drifts count as one. */
@@ -21,7 +25,7 @@ const MAX_MULTIPLIER = 8;
 const CRASH_IMPACT = 3;
 const SPIN_ANGLE = 2.2;
 const SPIN_MIN_SPEED = 5;
-/** Below this the roll-out swaps the brake for the handbrake, because a held brake turns into reverse. */
+/** Below this the roll-out swaps the brake for the handbrake, because a held brake selects reverse at a standstill. */
 const ROLL_OUT_BRAKE_SPEED = 1;
 
 /** A gate as a line with a normal that points the way the road travels. */
@@ -159,7 +163,10 @@ class Run implements RunMode {
 
   /** After the finish the car brakes itself to a stop, whatever the player does. */
   private rollOut(): void {
-    const braking = this.world.car.forwardSpeed > ROLL_OUT_BRAKE_SPEED;
+    // The brake works in either direction of travel, so a car that crossed the line backwards is stopped too.
+    // In reverse gear the pedal is the accelerator, so a car that backed over the line gets the handbrake alone.
+    const car = this.world.car;
+    const braking = !car.reversing && Math.abs(car.forwardSpeed) > ROLL_OUT_BRAKE_SPEED;
     this.rollOutInput.brake = braking ? 1 : 0;
     this.rollOutInput.handbrake = !braking;
     this.world.step(this.rollOutInput);
@@ -195,8 +202,9 @@ class Run implements RunMode {
       this.loseChain();
       return;
     }
-    const drifting =
-      car.forwardSpeed > 0 && car.speed > DRIFT_MIN_SPEED && angle > DRIFT_MIN_ANGLE && angle < DRIFT_MAX_ANGLE;
+    // No "nose first" condition: driftAngle is atan2(lateral, forward), so that would cap the angle at pi / 2 and
+    // turn the deepest part of a big slide into dead time.
+    const drifting = car.speed > DRIFT_MIN_SPEED && angle > DRIFT_MIN_ANGLE && angle < DRIFT_MAX_ANGLE;
     state.drifting = drifting;
     if (drifting) {
       state.chainScore += car.speed * angle * DT * DRIFT_POINTS_RATE;

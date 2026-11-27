@@ -1,4 +1,5 @@
 import {
+  AdditiveBlending,
   BoxGeometry,
   BufferGeometry,
   Color,
@@ -19,6 +20,8 @@ import { ACCENTS, GATE, HUE, SURFACE, accentFor } from './palette';
 const Y_GROUND = -0.06;
 const Y_GRID = -0.04;
 const Y_ROAD = 0.01;
+/** Soft additive light on the road (pillar bases); under the paint so lines stay crisp. */
+const Y_GLOW = 0.02;
 const Y_PAINT = 0.03;
 const Y_GATE = 0.06;
 
@@ -240,12 +243,71 @@ const DASH_HALF_WIDTH = 0.09;
 const EDGE_INSET = 0.45;
 const EDGE_WIDTH = 0.26;
 
-function addRoad(b: GeometryBuilder, level: Level): void {
+const CAP_MATCH = 1e-6;
+
+function samePoint(ax: number, az: number, b: Vec2): boolean {
+  return Math.abs(ax - b.x) <= CAP_MATCH && Math.abs(az - b.z) <= CAP_MATCH;
+}
+
+/**
+ * Where the closed end of the road is: the far end of the wall that leaves the edge point `at` without following
+ * the road edge on to `next`. Null for a level whose end is not closed that way.
+ */
+function capCorner(level: Level, at: Vec2, next: Vec2): Vec2 | null {
+  for (const w of level.walls) {
+    if (samePoint(w.ax, w.az, at) && !samePoint(w.bx, w.bz, next)) return { x: w.bx, z: w.bz };
+    if (samePoint(w.bx, w.bz, at) && !samePoint(w.ax, w.az, next)) return { x: w.ax, z: w.az };
+  }
+  return null;
+}
+
+/** Everything that is tarmac: the road from start pose to goal line, plus the walled ends beyond both. */
+interface RoadOutline {
+  left: Vec2[];
+  right: Vec2[];
+  /** A point between each left / right pair, towards which the edge strips are inset. */
+  centre: Vec2[];
+}
+
+/**
+ * `level.left` and `level.right` stop at the start pose and at the goal line, but the walls close the road some
+ * way behind the start and a long way beyond the goal (the run-off). Those ends are found from the walls and
+ * added here, so the surface and its edge strips reach every wall the car can.
+ */
+function roadOutline(level: Level): RoadOutline {
+  const outline: RoadOutline = {
+    left: level.left.slice(),
+    right: level.right.slice(),
+    centre: level.path.map((p) => ({ x: p.x, z: p.z })),
+  };
   const n = level.path.length;
+  if (n < 2) return outline;
+  const extend = (index: number, neighbour: number, atStart: boolean): void => {
+    const l = capCorner(level, level.left[index], level.left[neighbour]);
+    const r = capCorner(level, level.right[index], level.right[neighbour]);
+    if (!l || !r) return;
+    const c = { x: (l.x + r.x) / 2, z: (l.z + r.z) / 2 };
+    if (atStart) {
+      outline.left.unshift(l);
+      outline.right.unshift(r);
+      outline.centre.unshift(c);
+    } else {
+      outline.left.push(l);
+      outline.right.push(r);
+      outline.centre.push(c);
+    }
+  };
+  extend(0, 1, true);
+  extend(n - 1, n - 2, false);
+  return outline;
+}
+
+function addRoad(b: GeometryBuilder, road: RoadOutline): void {
+  const n = road.left.length;
   const first = b.vertexCount;
   for (let i = 0; i < n; i++) {
-    b.vertex(level.left[i].x, Y_ROAD, level.left[i].z, SURFACE.road);
-    b.vertex(level.right[i].x, Y_ROAD, level.right[i].z, SURFACE.road);
+    b.vertex(road.left[i].x, Y_ROAD, road.left[i].z, SURFACE.road);
+    b.vertex(road.right[i].x, Y_ROAD, road.right[i].z, SURFACE.road);
   }
   for (let i = 0; i < n - 1; i++) {
     const a = first + i * 2;
@@ -280,13 +342,13 @@ function addCentreLine(b: GeometryBuilder, level: Level): void {
 }
 
 /** Neon strip just inside one road edge, following the edge polyline. */
-function addEdgeStrip(b: GeometryBuilder, level: Level, edge: Vec2[], color: Color): void {
-  const n = level.path.length;
+function addEdgeStrip(b: GeometryBuilder, road: RoadOutline, edge: Vec2[], color: Color): void {
+  const n = edge.length;
   const first = b.vertexCount;
   for (let i = 0; i < n; i++) {
     const e = edge[i];
-    const dx = level.path[i].x - e.x;
-    const dz = level.path[i].z - e.z;
+    const dx = road.centre[i].x - e.x;
+    const dz = road.centre[i].z - e.z;
     const len = Math.sqrt(dx * dx + dz * dz) || 1;
     const ux = dx / len;
     const uz = dz / len;
@@ -359,10 +421,23 @@ function addWalls(b: GeometryBuilder, level: Level): void {
 // Pillars
 // ---------------------------------------------------------------------------------------------------------------
 
-const PILLAR_SIDES = 14;
-const RING_HEIGHT = 0.18;
+const PILLAR_SIDES = 20;
+const RING_HEIGHT = 0.22;
 const RING_GAP = 0.06;
+/** How strongly the body takes on its accent hue, and how much brighter it is lit at its foot than at its top. */
+const PILLAR_TINT = 0.1;
+const PILLAR_FOOT_LIGHT = 1.7;
+const PILLAR_TOP_LIGHT = 0.9;
+/** Width of the glowing band around the rim of the cap, as seen from above. */
+const CAP_RING_WIDTH = 0.34;
+const CAP_RING_BRIGHTNESS = 0.9;
+/** Pool of light on the road around the base: how far it reaches and how bright it is at the pillar. */
+const BASE_GLOW_REACH = 3.2;
+const BASE_GLOW_MID = 1.1;
+const BASE_GLOW_BRIGHTNESS = 0.5;
+const BLACK = new Color(0, 0, 0);
 
+/** Tube whose colour runs from `foot` at y0 to `top` at y1, shaded by the fake light. */
 function addTube(
   b: GeometryBuilder,
   cx: number,
@@ -370,7 +445,8 @@ function addTube(
   radius: number,
   y0: number,
   y1: number,
-  color: Color,
+  foot: Color,
+  top: Color,
   shaded: boolean,
 ): void {
   const step = (Math.PI * 2) / PILLAR_SIDES;
@@ -379,40 +455,98 @@ function addTube(
     const a1 = a0 + step;
     const mid = a0 + step / 2;
     const shade = shaded ? sideShade(Math.cos(mid), Math.sin(mid)) : 1;
-    b.upright(
-      cx + Math.cos(a0) * radius,
-      cz + Math.sin(a0) * radius,
-      cx + Math.cos(a1) * radius,
-      cz + Math.sin(a1) * radius,
-      y0,
-      y1,
-      color,
-      shade,
-    );
+    const x0 = cx + Math.cos(a0) * radius;
+    const z0 = cz + Math.sin(a0) * radius;
+    const x1 = cx + Math.cos(a1) * radius;
+    const z1 = cz + Math.sin(a1) * radius;
+    const v0 = b.vertex(x0, y0, z0, foot, shade);
+    const v1 = b.vertex(x1, y0, z1, foot, shade);
+    const v2 = b.vertex(x1, y1, z1, top, shade);
+    const v3 = b.vertex(x0, y1, z0, top, shade);
+    b.quad(v0, v1, v2, v3);
   }
 }
 
-function addDisc(b: GeometryBuilder, cx: number, cz: number, radius: number, y: number, color: Color): void {
+/** Flat ring on the plane `y` from radius r0 to r1, coloured `inner` to `outer`. r0 = 0 gives a disc. */
+function addRing(
+  b: GeometryBuilder,
+  cx: number,
+  cz: number,
+  r0: number,
+  r1: number,
+  y: number,
+  inner: Color,
+  outer: Color,
+): void {
   const step = (Math.PI * 2) / PILLAR_SIDES;
-  const centre = b.vertex(cx, y, cz, color);
   const first = b.vertexCount;
   for (let k = 0; k < PILLAR_SIDES; k++) {
-    b.vertex(cx + Math.cos(k * step) * radius, y, cz + Math.sin(k * step) * radius, color);
+    const cos = Math.cos(k * step);
+    const sin = Math.sin(k * step);
+    b.vertex(cx + cos * r0, y, cz + sin * r0, inner);
+    b.vertex(cx + cos * r1, y, cz + sin * r1, outer);
   }
   for (let k = 0; k < PILLAR_SIDES; k++) {
-    b.triangle(centre, first + k, first + ((k + 1) % PILLAR_SIDES));
+    const a = first + k * 2;
+    const next = first + ((k + 1) % PILLAR_SIDES) * 2;
+    b.quad(a, a + 1, next + 1, next);
   }
 }
 
+/**
+ * A pillar is the one thing on the road that ends a run, so it is built to be seen: a body lit in its accent
+ * colour from the foot up, a glowing band round the rim of its cap, and two rings round the shaft.
+ */
 function addPillar(b: GeometryBuilder, prop: Prop): void {
-  const glow = accentFor(prop.hue).glow;
-  addTube(b, prop.x, prop.z, prop.radius, 0, prop.height, SURFACE.pillar, true);
-  addDisc(b, prop.x, prop.z, prop.radius, prop.height, SURFACE.pillar);
-  const ringRadius = prop.radius + RING_GAP;
-  const low = Math.max(0.1, prop.height * 0.3);
-  const high = Math.max(low + RING_HEIGHT + 0.1, prop.height - 0.3 - RING_HEIGHT);
-  addTube(b, prop.x, prop.z, ringRadius, low, low + RING_HEIGHT, glow, false);
-  addTube(b, prop.x, prop.z, ringRadius, high, high + RING_HEIGHT, glow, false);
+  const accent = accentFor(prop.hue);
+  const { x, z, radius, height } = prop;
+  const body = SURFACE.pillar.clone().lerp(accent.base, PILLAR_TINT);
+  const foot = body.clone().multiplyScalar(PILLAR_FOOT_LIGHT);
+  const top = body.clone().multiplyScalar(PILLAR_TOP_LIGHT);
+  addTube(b, x, z, radius, 0, height, foot, top, true);
+
+  const cap = SURFACE.pillarCap.clone().lerp(accent.base, PILLAR_TINT);
+  const rim = accent.glow.clone().multiplyScalar(CAP_RING_BRIGHTNESS);
+  const capInner = Math.max(0, radius - CAP_RING_WIDTH);
+  addRing(b, x, z, 0, capInner, height, cap, cap);
+  addRing(b, x, z, capInner, radius + RING_GAP, height, rim, rim);
+
+  const ringRadius = radius + RING_GAP;
+  const low = Math.max(0.1, height * 0.3);
+  const high = Math.max(low + RING_HEIGHT + 0.1, height - RING_HEIGHT);
+  addTube(b, x, z, ringRadius, low, low + RING_HEIGHT, accent.glow, accent.glow, false);
+  addTube(b, x, z, ringRadius, high, high + RING_HEIGHT, accent.glow, accent.glow, false);
+}
+
+/** The pool of accent light a pillar throws on the road. Goes into the additive glow mesh: black adds nothing. */
+function addPillarGlow(b: GeometryBuilder, prop: Prop): void {
+  const base = accentFor(prop.hue).base;
+  const near = base.clone().multiplyScalar(BASE_GLOW_BRIGHTNESS);
+  // Two bands approximate a soft falloff: most of the light is lost in the first metre.
+  const mid = base.clone().multiplyScalar(BASE_GLOW_BRIGHTNESS * 0.3);
+  const r0 = prop.radius * 0.9;
+  const r1 = prop.radius + BASE_GLOW_MID;
+  const r2 = prop.radius + BASE_GLOW_REACH;
+  addRing(b, prop.x, prop.z, r0, r1, Y_GLOW, near, mid);
+  addRing(b, prop.x, prop.z, r1, r2, Y_GLOW, mid, BLACK);
+}
+
+function buildGlowGeometry(level: Level): BufferGeometry | null {
+  if (level.props.length === 0) return null;
+  const b = new GeometryBuilder();
+  for (const prop of level.props) addPillarGlow(b, prop);
+  return b.build();
+}
+
+/** Light laid over the surfaces below it. Additive and depth-tested, so walls and pillars still hide it. */
+function glowMaterial(): MeshBasicMaterial {
+  return new MeshBasicMaterial({
+    vertexColors: true,
+    side: DoubleSide,
+    transparent: true,
+    blending: AdditiveBlending,
+    depthWrite: false,
+  });
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -625,10 +759,11 @@ function buildStaticGeometry(level: Level): BufferGeometry {
   const b = new GeometryBuilder();
   addGround(b, level);
   addGrid(b, level);
-  addRoad(b, level);
+  const road = roadOutline(level);
+  addRoad(b, road);
   addCentreLine(b, level);
-  addEdgeStrip(b, level, level.left, ACCENTS[HUE.cyan].glow);
-  addEdgeStrip(b, level, level.right, ACCENTS[HUE.magenta].glow);
+  addEdgeStrip(b, road, road.left, ACCENTS[HUE.cyan].glow);
+  addEdgeStrip(b, road, road.right, ACCENTS[HUE.magenta].glow);
   addStartMarking(b, level.start);
   addWalls(b, level);
   for (const prop of level.props) addPillar(b, prop);
@@ -642,6 +777,7 @@ class LevelMeshes implements LevelVisual {
   readonly group = new Group();
   private readonly staticMesh: Mesh<BufferGeometry, MeshBasicMaterial>;
   private readonly gateMesh: Mesh<BufferGeometry, MeshBasicMaterial>;
+  private readonly glowMesh: Mesh<BufferGeometry, MeshBasicMaterial> | null = null;
   private readonly decor: InstancedMesh | null;
   private readonly gateParts: GatePart[];
   private readonly gateColors: BufferAttribute;
@@ -658,6 +794,13 @@ class LevelMeshes implements LevelVisual {
     this.gateMesh.frustumCulled = false;
     this.gateColors = this.gateMesh.geometry.getAttribute('color') as BufferAttribute;
     this.gateColors.setUsage(DynamicDrawUsage);
+
+    const glow = buildGlowGeometry(level);
+    if (glow) {
+      this.glowMesh = new Mesh(glow, glowMaterial());
+      this.glowMesh.frustumCulled = false;
+      this.group.add(this.glowMesh);
+    }
 
     this.decor = buildDecor(level);
     this.group.add(this.staticMesh, this.gateMesh);
@@ -685,7 +828,8 @@ class LevelMeshes implements LevelVisual {
 
   dispose(): void {
     this.group.removeFromParent();
-    for (const mesh of [this.staticMesh, this.gateMesh]) {
+    for (const mesh of [this.staticMesh, this.gateMesh, this.glowMesh]) {
+      if (!mesh) continue;
       mesh.geometry.dispose();
       mesh.material.dispose();
     }

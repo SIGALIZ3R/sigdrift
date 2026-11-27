@@ -18,8 +18,12 @@ export const MAX_YAW_RATE = 7;
 const REST_SPEED = 0.3;
 const REST_YAW_RATE = 0.3;
 
-/** The brake pedal turns into reverse below this forward speed. */
+/**
+ * The brake pedal selects reverse once the car is this slow along its nose and this slow overall. The second limit
+ * keeps a car that is sliding sideways (no forward speed, plenty of speed) on its brakes.
+ */
 const REVERSE_ENGAGE_SPEED = 0.5;
+const REVERSE_SELECT_SPEED = 1;
 const REVERSE_TOP_SPEED = 11;
 
 const DRIFT_ANGLE_MIN_SPEED = 1;
@@ -50,6 +54,7 @@ export function resetCarState(car: CarState, pose: Pose): void {
   car.vz = 0;
   car.yawRate = 0;
   car.steerAngle = 0;
+  car.reversing = false;
   car.speed = 0;
   car.forwardSpeed = 0;
   car.lateralSpeed = 0;
@@ -150,12 +155,24 @@ function wheelspin(params: CarParams, throttle: number, forward: number): number
   return throttle * clamp(1 - resistance / params.engineForce, 0, 1);
 }
 
+/**
+ * The reverse gear is a latch, not a function of the current speed: a car rolling backwards after a spin must be
+ * stopped by the brake pedal, not driven further back by it. Checked every tick, so braking to a stop with the
+ * pedal held flows straight on into reverse. Releasing the pedal keeps the gear, so reverse speed can be feathered.
+ */
+function selectReverse(car: CarState, throttle: number, brake: number, forward: number, speed: number): boolean {
+  if (throttle > 0 || forward > REVERSE_ENGAGE_SPEED) return false;
+  if (brake > 0 && forward >= -REVERSE_ENGAGE_SPEED && speed <= REVERSE_SELECT_SPEED) return true;
+  return car.reversing === true;
+}
+
 /** Engine, engine braking, brakes, reverse, rolling resistance and drag, along the car's nose. */
 function longitudinalForce(
   params: CarParams,
   throttle: number,
   brake: number,
   handbrake: boolean,
+  reversing: boolean,
   forward: number,
   dt: number,
 ): number {
@@ -164,8 +181,8 @@ function longitudinalForce(
   let braking = params.engineForce * ENGINE_BRAKING * (1 - throttle);
   if (handbrake) braking += params.handbrakeForce;
   if (brake > 0) {
-    if (forward > REVERSE_ENGAGE_SPEED) braking += params.brakeForce * brake;
-    else force -= params.reverseForce * brake * clamp(1 + forward / REVERSE_TOP_SPEED, 0, 1);
+    if (reversing) force -= params.reverseForce * brake * clamp(1 + forward / REVERSE_TOP_SPEED, 0, 1);
+    else braking += params.brakeForce * brake;
   }
   // Brakes can stop the wheels within the tick but never push the car the other way.
   const stopping = (params.mass * absForward) / dt;
@@ -238,6 +255,7 @@ export function stepCar(car: CarState, params: CarParams, input: InputState, dt:
   const lateral = car.vz * cosH - car.vx * sinH;
   const speed = Math.sqrt(car.vx * car.vx + car.vz * car.vz);
 
+  car.reversing = selectReverse(car, throttle, brake, forward, speed);
   updateSteering(car, params, steerInput(input.steer), forward, lateral, speed, dt);
   const steerAngle = car.steerAngle;
   const cosS = cos(steerAngle);
@@ -264,7 +282,7 @@ export function stepCar(car: CarState, params: CarParams, input: InputState, dt:
   const forceRear = axleForce(params, loadRear, slipRear, stiffRear, gripRear, lateralRear, toRear, dt);
 
   // The front tyres push at right angles to the steered wheels, so part of their force slows the car.
-  const forceLong = longitudinalForce(params, throttle, brake, handbrake, forward, dt) - forceFront * sinS;
+  const forceLong = longitudinalForce(params, throttle, brake, handbrake, car.reversing, forward, dt) - forceFront * sinS;
   const forceLat = forceFront * cosS + forceRear;
   const yawAccel = (toFront * forceFront * cosS - toRear * forceRear) / params.inertia;
   const dtOverMass = dt / params.mass;

@@ -14,12 +14,15 @@ export const BACKGROUND = 0x05060d;
 export const SURFACE = {
   ground: new Color(0x070910),
   grid: new Color(0x1b2140),
-  road: new Color(0x12141f),
-  laneDash: new Color(0x2c3150),
-  startMark: new Color(0x3d4568),
+  /** Clearly lighter than the ground and a shade towards violet, so the drivable area reads at a glance. */
+  road: new Color(0x1c1e33),
+  laneDash: new Color(0x363c62),
+  startMark: new Color(0x464e74),
   wall: new Color(0x161927),
   post: new Color(0x1c2031),
-  pillar: new Color(0x171a28),
+  /** Pillars are hazards standing on the road: their body has to stand out from it, not merge with it. */
+  pillar: new Color(0x3b4166),
+  pillarCap: new Color(0x4a5180),
   decor: new Color(0x10121d),
 } as const;
 

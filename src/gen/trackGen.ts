@@ -43,7 +43,12 @@ const PLAZA_BLEND = 20;
 
 /** Closed ends: how far the road continues behind the start and beyond the goal. */
 const START_CAP = 14;
-const GOAL_CAP = 16;
+/**
+ * The run-off: a car crossing the line flat out needs just under 60 m to brake to a stop. The goal sits in the
+ * middle of the last cell, so the cap runs through the rest of that cell and well into the next one, which the
+ * walk keeps free of road (see `extendWalk`). The extra few metres are for the nose of the car.
+ */
+const GOAL_CAP = RULES.goalRunOff + 4;
 const CHECKPOINT_EVERY = 3;
 
 const CENTRE_PILLAR_MIN_HALF_WIDTH = 17;
@@ -160,16 +165,23 @@ function moveOptions(walk: Walk): number[] {
   return order;
 }
 
-/** Depth-first: tries each way out of the newest cell and backs up when every way is blocked. */
+/**
+ * Depth-first: tries each way out of the newest cell and backs up when every way is blocked.
+ *
+ * The cell straight beyond the last one is reserved for the run-off past the goal: the walk never ends facing a
+ * cell it has already used, and since the last cell is the last one laid, nothing can be put there afterwards.
+ */
 function extendWalk(walk: Walk): boolean {
   const index = walk.cx.length - 1;
   if (index === walk.count - 1) return true;
   if (walk.budget-- <= 0) return false;
+  const placingLast = index + 1 === walk.count - 1;
   for (const dir of moveOptions(walk)) {
     const cx = walk.cx[index] + DIR_X[dir];
     const cz = walk.cz[index] + DIR_Z[dir];
     const key = cellKey(cx, cz);
     if (walk.used.has(key)) continue;
+    if (placingLast && walk.used.has(cellKey(cx + DIR_X[dir], cz + DIR_Z[dir]))) continue;
     walk.used.add(key);
     walk.cx.push(cx);
     walk.cz.push(cz);
@@ -262,6 +274,12 @@ interface WidthPlan {
   corner: number;
 }
 
+/** The cell straight beyond the last one. It holds the far end of the run-off past the goal and no road. */
+function runOffCell(cells: readonly Cell[]): { cx: number; cz: number } {
+  const last = cells[cells.length - 1];
+  return { cx: last.cx + DIR_X[last.inDir], cz: last.cz + DIR_Z[last.inDir] };
+}
+
 /** True when the cells to the left and right of a straight are free, so a wide plaza has nothing to crowd. */
 function hasOpenSides(cell: Cell, occupied: Set<number>): boolean {
   const sideX = -DIR_Z[cell.inDir];
@@ -280,6 +298,9 @@ function planWidths(rng: Rng, cells: Cell[]): WidthPlan {
   const base = rng.range(MIN_BASE_HALF_WIDTH, MAX_BASE_HALF_WIDTH);
   const plan: WidthPlan = { base, corner: Math.min(MAX_CORNER_HALF_WIDTH, base + rng.range(0.8, 2.2)) };
   const occupied = new Set(cells.map((cell) => cellKey(cell.cx, cell.cz)));
+  // A plaza must not crowd the run-off either.
+  const runOff = runOffCell(cells);
+  occupied.add(cellKey(runOff.cx, runOff.cz));
   const plazaSites: number[] = [];
   let plazas = 0;
   for (let i = 0; i < cells.length; i++) {
@@ -536,10 +557,15 @@ interface DecorSite {
   ring: number;
 }
 
-/** Every cell within DECOR_RINGS of the road, in a shuffled order so that a capped count stays evenly spread. */
+/**
+ * Every cell within DECOR_RINGS of the road, in a shuffled order so that a capped count stays evenly spread.
+ * The run-off cell counts as a road cell: the walled run-off reaches into it, so blocks proposed there need the
+ * same "not on the tarmac" test as blocks in any cell the road passes through.
+ */
 function decorSites(rng: Rng, cells: readonly Cell[]): DecorSite[] {
   const known = new Map<number, DecorSite>();
   let frontier: DecorSite[] = cells.map((cell) => ({ cx: cell.cx, cz: cell.cz, ring: 0 }));
+  frontier.push({ ...runOffCell(cells), ring: 0 });
   for (const site of frontier) known.set(cellKey(site.cx, site.cz), site);
   for (let ring = 1; ring <= DECOR_RINGS; ring++) {
     const next: DecorSite[] = [];

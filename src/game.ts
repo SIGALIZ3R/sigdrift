@@ -10,7 +10,7 @@ import { createInput } from './input/actions';
 import type { GameInput } from './input/actions';
 import { createRunMode } from './modes/run';
 import { createRenderer } from './render/renderer';
-import { DEFAULT_CAR_PARAMS, cloneParams } from './sim/params';
+import { ASSIST_STRENGTH, DEFAULT_CAR_PARAMS, cloneParams } from './sim/params';
 import { decodeInput, encodeInput } from './sim/replay';
 import { createWorld } from './sim/world';
 import { DT, PHYSICS_VERSION, SIM_HZ } from './types';
@@ -54,7 +54,6 @@ interface Session {
   best: BestRecord | null;
 }
 
-const ASSIST_STRENGTH = 0.6;
 const PAST_WEEKS = 8;
 /** Closing speed (m/s) below which a wall touch makes no sound. */
 const MIN_AUDIBLE_IMPACT = 2;
@@ -71,6 +70,12 @@ function openRenderer(app: HTMLElement, settings: Settings): GameRenderer {
   } catch (cause) {
     throw new Error(WEBGL_MESSAGE, { cause });
   }
+}
+
+/** True when every tuning value matches. Steering assist included: both sides follow the player's setting. */
+function sameParams(a: CarParams, b: CarParams): boolean {
+  for (const key of Object.keys(a) as (keyof CarParams)[]) if (a[key] !== b[key]) return false;
+  return true;
 }
 
 function copyPose(into: Pose, from: Pose): void {
@@ -128,6 +133,12 @@ export class Game {
   private countdownSecond = 0;
   private finish: FinishResult | null = null;
   private finishDelayTicks = 0;
+  /**
+   * True once the current run has been driven, even for a moment, with a car that is not the stock one. Such a
+   * run is not saved as a best: its time means nothing next to the stock car's. Set by any tuning-panel edit and
+   * by starting a run with edited values; a value changed and put back mid-run still counts.
+   */
+  private runTuned = false;
 
   constructor(opts: GameOptions) {
     this.app = opts.app;
@@ -147,7 +158,13 @@ export class Game {
         this.applySettings(settings);
       },
     });
-    this.tuning = createTuningPanel(opts.ui, { getParams: () => this.params, defaults: this.tuningDefaults });
+    this.tuning = createTuningPanel(opts.ui, {
+      getParams: () => this.params,
+      defaults: this.tuningDefaults,
+      onChange: () => {
+        this.runTuned = true;
+      },
+    });
     this.applySettings(this.settings);
 
     this.session = this.createSession(this.currentWeek);
@@ -231,6 +248,8 @@ export class Game {
     this.finish = null;
     this.finishDelayTicks = 0;
     this.countdownSecond = 0;
+    // A fresh run is clean only if it starts on the stock car ("Reset to defaults" followed by a restart).
+    this.runTuned = !sameParams(this.params, this.tuningDefaults);
     copyPose(this.prevPose, this.session.world.car);
     this.renderer.clearEffects();
     this.hud.setVisible(true);
@@ -347,8 +366,9 @@ export class Game {
     const state = this.session.run.state;
     const previous = this.session.best;
     const record: BestRecord = { ticks: state.ticks, driftScore: state.driftScore, physicsVersion: PHYSICS_VERSION };
-    const isNewBest = previous === null || record.ticks < previous.ticks;
-    saveBest(this.level.id, record);
+    const tuned = this.runTuned;
+    const isNewBest = !tuned && (previous === null || record.ticks < previous.ticks);
+    if (!tuned) saveBest(this.level.id, record);
     if (isNewBest) {
       this.session.best = record;
       this.hudInfo.best = record;
@@ -360,6 +380,7 @@ export class Game {
       resets: state.resets,
       best: previous,
       isNewBest,
+      tuned,
     };
     this.finishDelayTicks = FINISH_SCREEN_DELAY_TICKS;
     this.audio.blip('finish');
@@ -418,6 +439,18 @@ export class Game {
 
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) this.pause();
+    });
+    // Losing focus drops every held key (see keyboard.ts), so the clock must not keep running on a car nobody
+    // can steer: alt-tab to a window beside this one, a click on the address bar, a system dialog.
+    window.addEventListener('blur', () => this.pause());
+    // The same goes for the pad that was doing the driving being unplugged or running out of battery.
+    window.addEventListener('gamepaddisconnected', () => {
+      if (this.input.lastDevice === 'gamepad') this.pause();
+    });
+    // While driving nothing on the page can take focus, so Tab (right beside Q, W and A) would hand it to the
+    // browser's own controls. In menus Tab keeps its normal job.
+    window.addEventListener('keydown', (event) => {
+      if (event.code === 'Tab' && this.screen === 'driving') event.preventDefault();
     });
 
     // Menus can be confirmed from the frame loop (Enter, gamepad), which is not a user gesture as far as the

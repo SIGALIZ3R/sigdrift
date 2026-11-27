@@ -345,6 +345,32 @@ describe('finish', () => {
     expect(world.car.speed).toBe(0);
     expect(world.car.x).toBeGreaterThan(80);
   });
+
+  it('stops a car that backed over the line in reverse gear instead of driving it on backwards', () => {
+    const level = threeGateLevel();
+    level.checkpoints = [];
+    const { world, run } = start(level);
+    const car = world.car;
+    // Facing back down the road just short of the line, the driver holds the brake pedal: reverse, over the line.
+    world.placeCar({ x: GOAL_X - 5, z: 0, heading: PI });
+    for (let i = 0; i < 5 * SIM_HZ && run.state.phase !== 'finished'; i++) run.step({ ...IDLE, brake: 1 });
+    expect(run.state.phase).toBe('finished');
+    expect(car.reversing).toBe(true);
+    const crossingSpeed = car.speed;
+    expect(crossingSpeed).toBeGreaterThan(2);
+    let fastest = 0;
+    let touched = false;
+    for (let i = 0; i < 5 * SIM_HZ; i++) {
+      run.step(IDLE);
+      fastest = Math.max(fastest, car.speed);
+      if (world.lastCollision !== null) touched = true;
+    }
+    // The end wall is 6 m past the line: the car must slow from the first tick, not accelerate into it.
+    expect(fastest).toBeLessThanOrEqual(crossingSpeed);
+    expect(touched).toBe(false);
+    expect(car.speed).toBe(0);
+    expect(car.x).toBeLessThan(GOAL_X + 3);
+  });
 });
 
 describe('restart', () => {

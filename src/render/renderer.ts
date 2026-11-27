@@ -15,6 +15,7 @@ import type { LevelVisual } from './levelMesh';
 import { BACKGROUND } from './palette';
 import { createPost } from './post';
 import type { PostFx } from './post';
+import { ResolutionWatchdog, budgetPixelRatio } from './quality';
 import { createSkidMarks } from './skid';
 import { createSmoke, createSoftTexture, createSparks } from './smoke';
 
@@ -54,6 +55,9 @@ class NeonRenderer implements GameRenderer {
   private height = 1;
   private time = 0;
   private ticksSinceSparks = SPARK_COOLDOWN_TICKS_REDUCED;
+  private readonly watchdog = new ResolutionWatchdog();
+  /** Draw the smoke and spark meshes once, invisibly, on the next frame: see `warmUp`. */
+  private warmUpPending = true;
 
   constructor(container: HTMLElement, settings: Settings) {
     // Antialiasing is fixed at context creation; the low-quality path draws straight to the canvas and needs it.
@@ -79,6 +83,7 @@ class NeonRenderer implements GameRenderer {
     this.scene.add(this.level.group);
     this.clearEffects();
     this.follow.snap();
+    this.warmUpPending = true;
   }
 
   onSimTick(car: CarState, params: CarParams, collision: CollisionEvent | null): void {
@@ -103,21 +108,27 @@ class NeonRenderer implements GameRenderer {
     this.smoke.update(dt);
     this.sparks.update(dt);
     this.skid.flush();
+    const warm = this.warmUpPending;
+    if (warm) this.warmUp(true);
     if (this.post) this.post.render(dt);
     else this.gl.render(this.scene, this.follow.camera);
+    if (warm) this.warmUp(false);
+    if (this.watchdog.frame(dt)) this.applySize();
   }
 
   resize(width: number, height: number): void {
-    this.width = Math.max(1, Math.floor(width));
-    this.height = Math.max(1, Math.floor(height));
-    this.gl.setPixelRatio(this.high ? Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO) : 1);
-    this.gl.setSize(this.width, this.height, false);
-    this.post?.setSize(this.width, this.height);
-    this.follow.setAspect(this.width / this.height);
+    const w = Math.max(1, Math.floor(width));
+    const h = Math.max(1, Math.floor(height));
+    // A different window is a different load: give full resolution another chance.
+    if (w !== this.width || h !== this.height) this.watchdog.reset();
+    this.width = w;
+    this.height = h;
+    this.applySize();
   }
 
   applySettings(settings: Settings): void {
     this.reducedFlash = settings.reducedFlash;
+    const wasHigh = this.high;
     this.high = settings.quality === 'high';
     this.smoke.setEnabled(this.high);
     if (this.high && !this.post) {
@@ -127,7 +138,12 @@ class NeonRenderer implements GameRenderer {
       this.post = null;
     }
     this.post?.setReducedFlash(this.reducedFlash);
-    this.resize(this.width, this.height);
+    if (this.high !== wasHigh) {
+      this.watchdog.reset();
+      // Low and high quality compile different variants of every shader.
+      this.warmUpPending = true;
+    }
+    this.applySize();
   }
 
   dispose(): void {
@@ -144,6 +160,30 @@ class NeonRenderer implements GameRenderer {
     // Browsers cap the number of live WebGL contexts; give this one back now rather than at garbage collection.
     this.gl.forceContextLoss();
     this.canvas.remove();
+  }
+
+  /**
+   * Sizes the drawing buffer: the device pixel ratio (high quality only), limited by the pixel budget and by
+   * whatever the frame-time watchdog has taken off.
+   */
+  private applySize(): void {
+    const wanted = this.high ? Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO) : 1;
+    this.gl.setPixelRatio(budgetPixelRatio(this.width, this.height, wanted) * this.watchdog.scale);
+    this.gl.setSize(this.width, this.height, false);
+    this.post?.setSize(this.width, this.height, this.watchdog.scale < 1);
+    this.follow.setAspect(this.width / this.height);
+  }
+
+  /**
+   * Smoke and sparks are hidden until first used, and three only builds a program for what it draws: without
+   * this, both shaders are compiled in the middle of the player's first drift and first wall hit, a hitch of
+   * several dropped frames. Drawing them once through the normal path, black on additive, builds the programs
+   * (and the driver's pipeline state) for the render target actually in use.
+   */
+  private warmUp(on: boolean): void {
+    if (this.high) this.smoke.setWarmUp(on);
+    this.sparks.setWarmUp(on);
+    if (!on) this.warmUpPending = false;
   }
 
   /** The car is the only lit object; every other surface is unlit with baked shading. */

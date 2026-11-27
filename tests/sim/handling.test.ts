@@ -7,7 +7,7 @@ import type { CarParams, CarState, InputState, World } from '../../src/types';
 import { DT } from '../../src/types';
 import { clamp } from '../../src/core/fixedMath';
 import { Rng } from '../../src/core/rng';
-import { DEFAULT_CAR_PARAMS, cloneParams } from '../../src/sim/params';
+import { ASSIST_STRENGTH, DEFAULT_CAR_PARAMS, cloneParams } from '../../src/sim/params';
 import { createWorld } from '../../src/sim/world';
 import { makeOpenLevel } from '../helpers/handLevel';
 
@@ -187,10 +187,15 @@ function measureSpin() {
   return { maxDrift, maxYawRate, endSpeed: world.car.speed, endYawRate: Math.abs(world.car.yawRate) };
 }
 
-function measureAssist() {
+/** The car as the game sets it up while the steering-assist setting is on. */
+function assistedParams(): CarParams {
   const params = cloneParams(DEFAULT_CAR_PARAMS);
-  params.steerAssist = 1;
-  const world = rolling(22, params);
+  params.steerAssist = ASSIST_STRENGTH;
+  return params;
+}
+
+function measureAssist() {
+  const world = rolling(22, assistedParams());
   handbrakeEntry(world);
   let maxDrift = 0;
   let maxYawRate = 0;
@@ -216,6 +221,27 @@ function measureHeldPowerSlide(steerAssist: number) {
     maxDrift = Math.max(maxDrift, Math.abs(car.driftAngle));
   });
   return { maxDrift, speed: world.car.speed };
+}
+
+/**
+ * A keyboard: every control is fully on or fully off. `keys` returns what is held `time` seconds in. Reports the
+ * largest drift angle, the time spent in a usable drift (0.35 to 1.2 rad) and how the car ends up.
+ */
+function measureKeyboard(speed: number, seconds: number, keys: (time: number) => Partial<InputState>, assisted = true) {
+  const world = rolling(speed, assisted ? assistedParams() : cloneParams(DEFAULT_CAR_PARAMS));
+  let maxDrift = 0;
+  let drifting = 0;
+  drive(
+    world,
+    seconds,
+    (_car, time) => keys(time),
+    (car) => {
+      const angle = Math.abs(car.driftAngle);
+      maxDrift = Math.max(maxDrift, angle);
+      if (angle > 0.35 && angle < 1.2) drifting += DT;
+    },
+  );
+  return { maxDrift, drifting, endDrift: Math.abs(world.car.driftAngle), speed: world.car.speed };
 }
 
 /** Mistakes: flooring it in a slide with the wheel straight, and holding full opposite lock for too long. */
@@ -391,11 +417,75 @@ describe('drift', () => {
 
   it('is caught by the steering assist when full lock and full throttle are simply held', () => {
     const unaided = measureHeldPowerSlide(0);
-    const assisted = measureHeldPowerSlide(1);
+    const assisted = measureHeldPowerSlide(ASSIST_STRENGTH);
     expect(unaided.maxDrift).toBeGreaterThan(1.6);
     expect(assisted.maxDrift).toBeGreaterThan(0.3);
     expect(assisted.maxDrift).toBeLessThan(1.2);
     expect(assisted.speed).toBeGreaterThan(20);
+  });
+});
+
+/**
+ * The game ships with the steering assist on, and most players drive it with on/off keys. Everything here runs at
+ * ASSIST_STRENGTH, the value the game really applies, with digital inputs only.
+ */
+describe('keyboard driving with the assist setting on', () => {
+  const SPEEDS = [8, 12, 16, 20, 24, 28];
+
+  it('ships the assist at full strength', () => {
+    // Anything less leaves the front tyres on their grip peak in a slide: see ASSIST_STRENGTH in src/sim/params.ts.
+    expect(ASSIST_STRENGTH).toBe(1);
+  });
+
+  it.each(SPEEDS)('does not spin when throttle and full lock are simply held from %d m/s', (speed) => {
+    const m = measureKeyboard(speed, 8, () => ({ steer: 1, throttle: 1 }));
+    expect(m.maxDrift).toBeLessThan(1.2);
+    expect(m.speed).toBeGreaterThan(20);
+  });
+
+  it.each(SPEEDS)('straightens up after a corner taken with the throttle held from %d m/s', (speed) => {
+    // The novice corner: throttle down throughout, steer for a second and a half, then let go of the steering.
+    const m = measureKeyboard(speed, 6, (time) => ({ steer: time < 1.5 ? 1 : 0, throttle: 1 }));
+    expect(m.maxDrift).toBeLessThan(1.2);
+    expect(m.endDrift).toBeLessThan(0.05);
+    expect(m.speed).toBeGreaterThan(25);
+  });
+
+  it.each(SPEEDS)('catches a handbrake entry from %d m/s with nothing but the throttle', (speed) => {
+    const m = measureKeyboard(speed, 5, (time) => (time < 0.3 ? { steer: 1, handbrake: true } : { throttle: 1 }));
+    expect(m.maxDrift).toBeLessThan(1.2);
+    expect(m.endDrift).toBeLessThan(0.05);
+  });
+
+  it.each([12, 16, 20, 24])('holds a real drift after a handbrake entry from %d m/s with the keys held', (speed) => {
+    // Being catchable must not mean being dull: the same keys still give a long, deep slide.
+    const m = measureKeyboard(speed, 5, (time) =>
+      time < 0.3 ? { steer: 1, handbrake: true } : { steer: 1, throttle: 1 },
+    );
+    expect(m.maxDrift).toBeGreaterThan(0.6);
+    expect(m.maxDrift).toBeLessThan(1.2);
+    expect(m.drifting).toBeGreaterThan(1.5);
+  });
+
+  it.each([12, 16, 20, 24])('survives a late, clumsy stab of opposite lock from %d m/s', (speed) => {
+    const m = measureKeyboard(speed, 6, (time) =>
+      time < 1.5 ? { steer: 1, throttle: 1 } : time < 1.8 ? { steer: -1, throttle: 1 } : { throttle: 1 },
+    );
+    expect(m.maxDrift).toBeLessThan(1.2);
+    expect(m.endDrift).toBeLessThan(0.05);
+  });
+
+  it.each([12, 16, 20, 24])('still spins the same held corner from %d m/s with the assist off', (speed) => {
+    // The assist is what makes the keys forgiving. Without it the slide has to be caught by hand.
+    const m = measureKeyboard(speed, 6, (time) => ({ steer: time < 1.5 ? 1 : 0, throttle: 1 }), false);
+    expect(m.maxDrift).toBeGreaterThan(1.6);
+  });
+
+  it.each([12, 16, 20, 24])('can be saved from %d m/s with the assist off by lifting off in time', (speed) => {
+    const m = measureKeyboard(speed, 6, (time) => (time < 1.5 ? { steer: 1, throttle: 1 } : {}), false);
+    expect(m.maxDrift).toBeGreaterThan(0.35);
+    expect(m.maxDrift).toBeLessThan(1.2);
+    expect(m.endDrift).toBeLessThan(0.05);
   });
 });
 
@@ -461,6 +551,80 @@ describe('stability', () => {
     expect(world.car.forwardSpeed).toBeLessThan(-2);
     expect(world.car.forwardSpeed).toBeGreaterThan(-15);
     expect(Math.abs(world.car.heading)).toBeLessThan(1e-9);
+  });
+
+  it('brakes a car that is rolling backwards to a stop, and only then reverses', () => {
+    // The aftermath of a spin: rolling backwards with the nose pointing up the road.
+    const world = rolling(-12);
+    let stoppedAt = Infinity;
+    let fastestBackwards = 0;
+    drive(
+      world,
+      2.5,
+      () => ({ brake: 1 }),
+      (car, time) => {
+        fastestBackwards = Math.max(fastestBackwards, -car.forwardSpeed);
+        if (car.speed < 0.6 && time < stoppedAt) stoppedAt = time;
+      },
+    );
+    // The pedal never pushes the car further back than it was already going.
+    expect(fastestBackwards).toBeLessThanOrEqual(12);
+    expect(stoppedAt).toBeLessThan(2);
+    expect(world.car.x).toBeGreaterThan(-16);
+    drive(world, 3, () => ({ brake: 1 }));
+    expect(world.car.reversing).toBe(true);
+    expect(world.car.forwardSpeed).toBeLessThan(-2);
+  });
+
+  it('brakes just as hard backwards as forwards', () => {
+    const stoppingDistance = (speed: number): number => {
+      const world = rolling(speed);
+      drive(world, 4, (car) => (car.speed > 0.6 ? { brake: 1 } : { handbrake: true }));
+      expect(world.car.speed).toBe(0);
+      return Math.abs(world.car.x);
+    };
+    const forwards = stoppingDistance(12);
+    const backwards = stoppingDistance(-12);
+    expect(backwards).toBeGreaterThan(0.8 * forwards);
+    expect(backwards).toBeLessThan(1.25 * forwards);
+  });
+
+  it('does not select reverse while the car is still sliding sideways', () => {
+    const world = rolling(0);
+    world.car.vz = 15;
+    let reversedWhileSliding = false;
+    drive(
+      world,
+      6,
+      () => ({ brake: 1 }),
+      (car) => {
+        if (car.reversing && car.speed > 1.5 && car.forwardSpeed > -0.5) reversedWhileSliding = true;
+      },
+    );
+    expect(reversedWhileSliding).toBe(false);
+    // Once it has stopped, the held pedal backs it up as usual.
+    expect(world.car.reversing).toBe(true);
+    expect(world.car.forwardSpeed).toBeLessThan(-2);
+  });
+
+  it('keeps reverse selected while the pedal is feathered, and drops it for the throttle', () => {
+    const world = rolling(0);
+    drive(world, 2, () => ({ brake: 1 }));
+    const backing = world.car.forwardSpeed;
+    expect(backing).toBeLessThan(-3);
+    drive(world, 0.3, () => IDLE);
+    expect(world.car.reversing).toBe(true);
+    // Pressing again drives on backwards rather than slamming the brakes on.
+    drive(world, 0.5, () => ({ brake: 1 }));
+    expect(world.car.forwardSpeed).toBeLessThan(backing);
+    drive(world, 0.1, () => ({ throttle: 1 }));
+    expect(world.car.reversing).toBe(false);
+    // Out of reverse and still rolling back, the pedal is a brake again.
+    world.car.vx = -8;
+    world.car.vz = 0;
+    drive(world, 0.2, () => ({ brake: 1 }));
+    expect(world.car.forwardSpeed).toBeGreaterThan(-7);
+    expect(world.car.reversing).toBe(false);
   });
 
   it('steers the expected way in reverse', () => {

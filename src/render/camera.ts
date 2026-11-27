@@ -5,8 +5,11 @@ import type { CarState, Pose } from '../types';
 export const CAMERA_YAW = Math.PI / 4;
 /** Elevation of the camera above the horizon, radians. Fixed for the whole game. */
 export const CAMERA_PITCH = (52 * Math.PI) / 180;
-/** Height of the visible slice of world at standstill, metres (measured in the view plane). */
-export const VIEW_HEIGHT_M = 62;
+/**
+ * Height of the visible slice of world at standstill, metres (measured in the view plane). Tight enough that the
+ * 4 m car reads at a glance; the speed-based widening below opens the view up again when the road ahead matters.
+ */
+export const VIEW_HEIGHT_M = 52;
 
 const DISTANCE = 260;
 const NEAR = 1;

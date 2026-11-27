@@ -54,7 +54,7 @@ export interface InputState {
   steer: number;
   /** 0..1 */
   throttle: number;
-  /** 0..1. Brakes while moving forwards; reverses once (nearly) stopped. */
+  /** 0..1. Brakes whichever way the car is rolling; selects reverse once it is (nearly) stopped. */
   brake: number;
   handbrake: boolean;
   /** Held state of the "reset to checkpoint" control. The mode edge-detects it. */
@@ -140,6 +140,11 @@ export interface CarState {
   yawRate: number;
   /** Current front wheel angle, rad, positive = right. */
   steerAngle: number;
+  /**
+   * Reverse gear. Selected by the brake pedal once the car has (nearly) stopped; while it is set the pedal drives
+   * the car backwards instead of braking. Cleared by the throttle, by rolling forwards, or by a respawn.
+   */
+  reversing: boolean;
 
   // ---- derived every tick (do not integrate these; recompute them) ----
   /** |velocity|, m/s. */

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { hashString } from '../../src/core/hash';
 import { DEFAULT_STREAMS, buildLevel, generateLevel, generateLevelFromSeed } from '../../src/gen/trackGen';
-import { validateLevel } from '../../src/gen/validate';
+import { RULES, insideWalls, validateLevel } from '../../src/gen/validate';
 import { seedForWeek, shiftWeek } from '../../src/gen/weeklySeed';
 import type { Level } from '../../src/types';
 import { GEN_VERSION } from '../../src/types';
@@ -78,8 +78,9 @@ describe('generateLevel', () => {
   });
 
   it('matches the pinned level for 2026-W48', () => {
-    // If this changes on purpose, bump GEN_VERSION in src/types.ts: weeks already played must stay reproducible.
-    expect(hashString(JSON.stringify(level))).toBe('43c7b6d7');
+    // If this changes on purpose after a release, bump GEN_VERSION in src/types.ts: weeks already played must stay
+    // reproducible. (Re-pinned before the first release for the 64 m run-off beyond the goal.)
+    expect(hashString(JSON.stringify(level))).toBe('517fd5ea');
   });
 
   it('labels the level with its week, seed and generator version', () => {
@@ -162,6 +163,32 @@ describe('generated levels obey the rules', () => {
 
   it(`validates the next ${WEEKS} weeks`, () => {
     for (const level of weeks) expect(validateLevel(level).errors, level.id).toEqual([]);
+  });
+
+  it('leaves a walled, empty run-off beyond the goal that no other road reaches', () => {
+    for (const level of weeks) {
+      const { goal, path, walls } = level;
+      const dirX = Math.round(Math.cos(goal.respawn.heading));
+      const dirZ = Math.round(Math.sin(goal.respawn.heading));
+      const halfWidth = path[path.length - 1].halfWidth;
+      // Probe points across the whole width of the run-off, every 2 m for the full distance.
+      for (let ahead = 1; ahead <= RULES.goalRunOff; ahead += 2) {
+        for (const side of [-(halfWidth - 0.5), 0, halfWidth - 0.5]) {
+          const x = goal.respawn.x + dirX * ahead - dirZ * side;
+          const z = goal.respawn.z + dirZ * ahead + dirX * side;
+          expect(insideWalls(walls, x, z), `${level.id} ${ahead} m past the goal`).toBe(true);
+          for (const p of path) {
+            const clear = Math.hypot(p.x - x, p.z - z) > p.halfWidth || p.dist > level.length - 30;
+            if (!clear) expect.fail(`${level.id}: road at dist ${p.dist} reaches the run-off`);
+          }
+          for (const prop of level.props) expect(Math.hypot(prop.x - x, prop.z - z)).toBeGreaterThan(prop.radius);
+          for (const d of level.decor) {
+            const onBlock = Math.abs(d.x - x) <= d.w / 2 && Math.abs(d.z - z) <= d.d / 2;
+            if (onBlock) expect.fail(`${level.id}: decor stands in the run-off`);
+          }
+        }
+      }
+    }
   });
 
   it('keeps every half width inside 7.5..20 m and bends at 12.5 m or less', () => {

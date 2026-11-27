@@ -71,10 +71,10 @@ function hit(impact: number): CollisionEvent {
 }
 
 describe('what counts as drifting', () => {
-  const isDrifting = (speed: number, angle: number, forwardSpeed?: number): boolean => {
+  /** Every state here is one the car can really be in: `slide` keeps forwardSpeed = speed x cos(angle). */
+  const isDrifting = (speed: number, angle: number): boolean => {
     const { world, run } = start();
     slide(world, speed, angle);
-    if (forwardSpeed !== undefined) world.car.forwardSpeed = forwardSpeed;
     run.step(IDLE);
     return run.state.drifting;
   };
@@ -89,14 +89,41 @@ describe('what counts as drifting', () => {
     expect(isDrifting(20, 0.21)).toBe(true);
     expect(isDrifting(20, -0.21)).toBe(true);
     expect(isDrifting(20, -1.5)).toBe(true);
-    expect(isDrifting(20, 1.89, 1)).toBe(true);
-    expect(isDrifting(20, 1.9, 1)).toBe(false);
+    expect(isDrifting(20, 1.89)).toBe(true);
+    expect(isDrifting(20, -1.89)).toBe(true);
+    expect(isDrifting(20, 1.9)).toBe(false);
     expect(isDrifting(20, 0)).toBe(false);
   });
 
-  it('needs the car to be travelling nose first', () => {
-    expect(isDrifting(20, 0.5, 0)).toBe(false);
-    expect(isDrifting(20, 0.5, -3)).toBe(false);
+  it('keeps scoring a slide that has gone past ninety degrees', () => {
+    // Beyond pi / 2 the car is moving tail first (forwardSpeed < 0). That is still a drift up to 1.9 rad.
+    expect(isDrifting(20, 1.58)).toBe(true);
+    expect(isDrifting(20, -1.75)).toBe(true);
+  });
+
+  it('does not count reversing', () => {
+    expect(isDrifting(10, Math.PI)).toBe(false);
+    expect(isDrifting(10, 2.8)).toBe(false);
+    expect(isDrifting(10, -2.0)).toBe(false);
+  });
+
+  it('scores every tick of a real slide between 0.2 and 1.9 rad, including the part past ninety degrees', () => {
+    const world = createWorld(makeOpenLevel(4000));
+    const run = createRunMode(world);
+    for (let i = 0; i < COUNTDOWN_TICKS; i++) run.step(IDLE);
+    world.car.vx = 26;
+    let pastNinety = 0;
+    for (let i = 0; i < 3 * SIM_HZ; i++) {
+      run.step({ ...IDLE, steer: 1, handbrake: i < 1.2 * SIM_HZ });
+      const car = world.car;
+      const angle = Math.abs(car.driftAngle);
+      if (angle > 2.2) break;
+      const inBand = car.speed > 7 && angle > 0.2 && angle < 1.9;
+      expect(run.state.drifting, `tick ${i} at ${angle} rad`).toBe(inBand);
+      if (inBand && car.forwardSpeed < 0) pastNinety++;
+    }
+    // The manoeuvre must really visit the band this test is about.
+    expect(pastNinety).toBeGreaterThan(5);
   });
 
   it('is never true during the countdown or after the finish', () => {

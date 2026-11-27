@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { InputState, Level, RunMode, World } from '../../src/types';
 import { DT, SIM_HZ } from '../../src/types';
+import { cos, sin } from '../../src/core/fixedMath';
 import { createBot } from '../../src/modes/bot';
 import { COUNTDOWN_TICKS, createRunMode } from '../../src/modes/run';
 import { generateLevel } from '../../src/gen/trackGen';
 import { shiftWeek } from '../../src/gen/weeklySeed';
+import { ASSIST_STRENGTH, DEFAULT_CAR_PARAMS, cloneParams } from '../../src/sim/params';
 import { quantizeInput } from '../../src/sim/replay';
 import { createWorld } from '../../src/sim/world';
 import { makeStraightLevel } from '../helpers/handLevel';
@@ -14,6 +16,27 @@ const WEEKS = Array.from({ length: 12 }, (_, i) => shiftWeek(FIRST_WEEK, i));
 const TIME_LIMIT_S = 150;
 const MAX_RESETS = 3;
 const STUCK_TICKS = 4 * SIM_HZ;
+const ROLL_OUT_TICKS = 8 * SIM_HZ;
+/** A little more than the car's top speed, so the run-off is tested with a margin. */
+const FLAT_OUT = 43;
+const NEUTRAL: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
+
+/** Steps a finished run while the car brakes itself, and counts the ticks on which it touched anything. */
+function rollOutContacts(run: RunMode): number {
+  let contacts = 0;
+  for (let i = 0; i < ROLL_OUT_TICKS; i++) {
+    run.step(NEUTRAL);
+    if (run.world.lastCollision !== null) contacts++;
+  }
+  return contacts;
+}
+
+/** Metres the car has travelled beyond the goal line. */
+function pastGoal(run: RunMode): number {
+  const { respawn } = run.world.level.goal;
+  const car = run.world.car;
+  return (car.x - respawn.x) * cos(respawn.heading) + (car.z - respawn.z) * sin(respawn.heading);
+}
 
 interface Drive {
   world: World;
@@ -177,5 +200,118 @@ describe('driveability of the weekly levels', () => {
     expect(run.state.resets).toBeLessThanOrEqual(MAX_RESETS);
     expect(run.state.nextCheckpoint).toBe(run.state.checkpointCount);
     expect(run.state.splits).toHaveLength(run.state.checkpointCount);
+    // The run does not end at the line: the car then brakes itself, and must have the room to do it.
+    expect(rollOutContacts(run)).toBe(0);
+    expect(run.world.car.speed).toBe(0);
+  });
+
+  it.each(WEEKS)('%s: a car crossing the line flat out stops in the run-off without touching anything', (id) => {
+    const level = generateLevel(id);
+    const world = createWorld(level);
+    const run = createRunMode(world);
+    for (let i = 0; i < COUNTDOWN_TICKS; i++) run.step(NEUTRAL);
+    // Straight to the last few metres, with only the goal left to cross.
+    run.state.nextCheckpoint = run.state.checkpointCount;
+    const { x, z, heading } = level.goal.respawn;
+    world.placeCar({ x: x - 6 * cos(heading), z: z - 6 * sin(heading), heading });
+    world.car.vx = FLAT_OUT * cos(heading);
+    world.car.vz = FLAT_OUT * sin(heading);
+    for (let i = 0; i < SIM_HZ && run.state.phase !== 'finished'; i++) run.step({ ...NEUTRAL, throttle: 1 });
+    expect(run.state.phase).toBe('finished');
+    expect(world.car.speed).toBeGreaterThan(40);
+    expect(rollOutContacts(run)).toBe(0);
+    expect(world.car.speed).toBe(0);
+    expect(pastGoal(run)).toBeGreaterThan(40);
+  });
+});
+
+/**
+ * The bot steers and feathers the pedals like a gamepad. A keyboard cannot: every key is fully on or off, and a
+ * human presses it late. `keys` describes one such pair of hands.
+ */
+interface KeyboardStyle {
+  /** Stick deflection beyond which the steering key goes down. */
+  steerDeadzone: number;
+  /** Pedal travel beyond which the pedal key goes down (fully). */
+  pedalThreshold: number;
+  /** Reaction time, in ticks, between the bot wanting something and the keys doing it. */
+  lagTicks: number;
+}
+
+const STEADY_HANDS: KeyboardStyle = { steerDeadzone: 0.3, pedalThreshold: 0.15, lagTicks: Math.round(0.15 * SIM_HZ) };
+/** Steers late and hard, and treats the throttle as a switch. */
+const TWITCHY_HANDS: KeyboardStyle = { steerDeadzone: 0.5, pedalThreshold: 0.01, lagTicks: Math.round(0.15 * SIM_HZ) };
+
+interface KeyboardDrive {
+  finished: boolean;
+  seconds: number;
+  resets: number;
+  /** Times the car went past 1.6 rad of drift at speed: a spin. */
+  spins: number;
+}
+
+function keyboardDrive(level: Level, steerAssist: number, keys: KeyboardStyle): KeyboardDrive {
+  const params = cloneParams(DEFAULT_CAR_PARAMS);
+  params.steerAssist = steerAssist;
+  const world = createWorld(level, params);
+  const run = createRunMode(world);
+  const bot = createBot(level);
+  const pending: InputState[] = [];
+  let spins = 0;
+  let spinning = false;
+  const limit = COUNTDOWN_TICKS + TIME_LIMIT_S * SIM_HZ;
+  for (let i = 0; i < limit && run.state.phase !== 'finished'; i++) {
+    const wanted = bot(world, run.state);
+    pending.push({
+      steer: Math.abs(wanted.steer) > keys.steerDeadzone ? Math.sign(wanted.steer) : 0,
+      throttle: wanted.throttle > keys.pedalThreshold ? 1 : 0,
+      brake: wanted.brake > keys.pedalThreshold ? 1 : 0,
+      handbrake: false,
+      reset: wanted.reset,
+    });
+    run.step(pending.length > keys.lagTicks ? (pending.shift() as InputState) : NEUTRAL);
+    const spun = Math.abs(world.car.driftAngle) > 1.6 && world.car.speed > 5;
+    if (spun && !spinning) spins++;
+    spinning = spun;
+  }
+  return {
+    finished: run.state.phase === 'finished',
+    seconds: run.state.ticks * DT,
+    resets: run.state.resets,
+    spins,
+  };
+}
+
+/**
+ * The keyboard gate. The game ships with the steering assist on and most players use keys, so the weekly levels
+ * must be finishable that way: digital steering and pedals, 150 ms late, at the assist strength the game applies.
+ */
+describe('driveability of the weekly levels on a keyboard, assist on', () => {
+  it.each(WEEKS)('%s: on/off keys with a 150 ms reaction finish without spinning', (id) => {
+    const drive = keyboardDrive(generateLevel(id), ASSIST_STRENGTH, STEADY_HANDS);
+    expect(drive.finished).toBe(true);
+    expect(drive.spins).toBe(0);
+    expect(drive.resets).toBeLessThanOrEqual(1);
+    expect(drive.seconds).toBeLessThan(90);
+  });
+
+  it('copes with twitchy hands on every level, where the same hands without the assist mostly spin', () => {
+    let assistedSpins = 0;
+    let unaidedSpins = 0;
+    let unaidedFinishes = 0;
+    for (const id of WEEKS) {
+      const level = generateLevel(id);
+      const assisted = keyboardDrive(level, ASSIST_STRENGTH, TWITCHY_HANDS);
+      expect(assisted.finished, id).toBe(true);
+      expect(assisted.resets, id).toBeLessThanOrEqual(MAX_RESETS);
+      assistedSpins += assisted.spins;
+      const unaided = keyboardDrive(level, 0, TWITCHY_HANDS);
+      unaidedSpins += unaided.spins;
+      if (unaided.finished) unaidedFinishes++;
+    }
+    expect(assistedSpins).toBeLessThanOrEqual(WEEKS.length / 2);
+    // With the assist off the car is as loose as it was built to be: these hands are not good enough for it.
+    expect(unaidedSpins).toBeGreaterThan(30);
+    expect(unaidedFinishes).toBeLessThan(WEEKS.length);
   });
 });

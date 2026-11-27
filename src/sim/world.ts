@@ -34,11 +34,11 @@ class SimWorld implements World {
 
   /**
    * The tick plus everything the next step reads. The other derived fields follow from these; `rearSlide` is here
-   * because the steering assist feeds on last tick's value.
+   * because the steering assist feeds on last tick's value, and `reversing` because the gear is a latch.
    */
   snapshot(): number[] {
-    const { x, z, heading, vx, vz, yawRate, steerAngle, accelLong, rearSlide } = this.car;
-    return [this.tick, x, z, heading, vx, vz, yawRate, steerAngle, accelLong, rearSlide];
+    const { x, z, heading, vx, vz, yawRate, steerAngle, accelLong, rearSlide, reversing } = this.car;
+    return [this.tick, x, z, heading, vx, vz, yawRate, steerAngle, accelLong, rearSlide, reversing ? 1 : 0];
   }
 }
 

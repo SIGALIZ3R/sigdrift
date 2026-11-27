@@ -26,6 +26,8 @@ export interface FinishResult {
   /** The record to compare against: the best time before this run. */
   best: BestRecord | null;
   isNewBest: boolean;
+  /** The run was driven with tuning-panel edits, so its time was not saved. */
+  tuned?: boolean;
 }
 
 export interface Menu {
@@ -276,7 +278,8 @@ function finishStats(result: FinishResult): HTMLElement {
 function finishScreen(result: FinishResult, callbacks: Pick<MenuCallbacks, 'onRestart' | 'onQuit'>): Screen {
   const head = el('div', 'sd-finish-head');
   head.append(el('h1', 'sd-label', `Run complete — ${result.levelId}`));
-  if (result.isNewBest) head.append(el('span', 'sd-badge', 'NEW BEST'));
+  if (result.tuned) head.append(el('span', 'sd-badge sd-badge-muted', 'TUNED CAR — TIME NOT SAVED'));
+  else if (result.isNewBest) head.append(el('span', 'sd-badge', 'NEW BEST'));
   const retry = button('Retry', callbacks.onRestart, 'sd-btn-primary');
   const actions = el('div', 'sd-actions');
   actions.append(retry, button('Menu', callbacks.onQuit));

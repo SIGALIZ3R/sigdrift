@@ -3,6 +3,7 @@
  * level alone, without knowing how it was built. Also holds the small geometry toolkit both sides share.
  */
 
+import { cos, sin } from '../core/fixedMath';
 import type { DecorBlock, Gate, Level, Pose, Prop, Segment, ValidationResult, Vec2 } from '../types';
 
 /** The promises a level makes to the car, the camera and the player. The generator aims inside these limits. */
@@ -17,6 +18,11 @@ export const RULES = {
   /** ... by the sum of their half widths plus this margin. */
   overlapMargin: 3,
   startWallClearance: 6,
+  /**
+   * Clear road straight on beyond the goal line. A car crossing the line at top speed (about 42 m/s) brakes to a
+   * stop in just under 59 m, nose included.
+   */
+  goalRunOff: 60,
   checkpointEndClearance: 60,
   /** Free width required on at least one side of every pillar. */
   propCorridor: 7.5,
@@ -44,6 +50,8 @@ const MAX_COORDINATE = 100_000;
 const EDGE_BUCKET = 16;
 const WALL_BUCKET = 24;
 const BLOCK_BUCKET = 24;
+/** The outer run-off rays run this far inside the road edges, about where the side of a car can get to. */
+const RUN_OFF_EDGE_INSET = 1;
 /** Path points this far either side of a pillar must be in line for the pillar to count as on a straight. */
 const STRAIGHT_PROBE = 3;
 const STRAIGHT_TOLERANCE = 0.02;
@@ -504,6 +512,118 @@ function checkWallLoop(level: Level, report: Report): boolean {
   return true;
 }
 
+function sharesEndpoint(p: Segment, q: Segment): boolean {
+  const same = (ax: number, az: number, bx: number, bz: number): boolean =>
+    Math.abs(ax - bx) <= WALL_JOIN_TOLERANCE && Math.abs(az - bz) <= WALL_JOIN_TOLERANCE;
+  return (
+    same(p.ax, p.az, q.ax, q.az) ||
+    same(p.ax, p.az, q.bx, q.bz) ||
+    same(p.bx, p.bz, q.ax, q.az) ||
+    same(p.bx, p.bz, q.bx, q.bz)
+  );
+}
+
+/**
+ * A closed loop that crosses or touches itself is not a boundary: it cuts the road in two, and it flips the
+ * even-odd inside test for everything beyond the crossing. Neighbours meeting at a shared endpoint are the only
+ * contact allowed. Returns true when the loop is simple.
+ */
+function checkWallCrossings(level: Level, report: Report): boolean {
+  const walls = level.walls;
+  const hash = new SpatialHash(WALL_BUCKET);
+  insertSegments(hash, walls);
+  const near: number[] = [];
+  const reported = new Set<number>();
+  for (let s = 0; s < walls.length; s++) {
+    const a = walls[s];
+    hash.collect(Math.min(a.ax, a.bx), Math.min(a.az, a.bz), Math.max(a.ax, a.bx), Math.max(a.az, a.bz), near);
+    for (let k = 0; k < near.length; k++) {
+      const t = near[k];
+      if (t <= s || reported.has(s * walls.length + t)) continue;
+      if (sharesEndpoint(a, walls[t]) || !segmentsTouch(a, walls[t])) continue;
+      reported.add(s * walls.length + t);
+      report.add('walls intersect', `walls[${s}] and walls[${t}]`);
+    }
+  }
+  return reported.size === 0;
+}
+
+/**
+ * Ties the solid boundary to the drawn road: every stretch of both road edges must be a wall. Together with a
+ * single, simple closed loop this is the route check. The edges run unbroken from start to goal, the walls follow
+ * them exactly, and nothing else of the loop can reach in between.
+ */
+function checkWallsFollowEdges(level: Level, report: Report): void {
+  const walls = level.walls;
+  const hash = new SpatialHash(WALL_BUCKET);
+  insertSegments(hash, walls);
+  const near: number[] = [];
+  const close = (ax: number, az: number, bx: number, bz: number): boolean =>
+    Math.abs(ax - bx) <= WALL_JOIN_TOLERANCE && Math.abs(az - bz) <= WALL_JOIN_TOLERANCE;
+  const check = (edge: readonly Vec2[], name: string): void => {
+    for (let i = 0; i + 1 < edge.length; i++) {
+      const a = edge[i];
+      const b = edge[i + 1];
+      hash.collect(Math.min(a.x, b.x), Math.min(a.z, b.z), Math.max(a.x, b.x), Math.max(a.z, b.z), near);
+      let found = false;
+      for (let k = 0; k < near.length && !found; k++) {
+        const w = walls[near[k]];
+        found =
+          (close(w.ax, w.az, a.x, a.z) && close(w.bx, w.bz, b.x, b.z)) ||
+          (close(w.ax, w.az, b.x, b.z) && close(w.bx, w.bz, a.x, a.z));
+      }
+      if (!found) report.add('road edge has no wall', `${name}[${i}] to ${name}[${i + 1}]`);
+    }
+  };
+  check(level.left, 'left');
+  check(level.right, 'right');
+}
+
+/** Distance along the ray from (ox, oz) in the unit direction (dx, dz) to a segment, or Infinity when it misses. */
+function rayToSegment(ox: number, oz: number, dx: number, dz: number, s: Segment): number {
+  const ex = s.bx - s.ax;
+  const ez = s.bz - s.az;
+  const denom = dx * ez - dz * ex;
+  if (denom === 0) return Infinity;
+  const t = ((s.ax - ox) * ez - (s.az - oz) * ex) / denom;
+  const u = ((s.ax - ox) * dz - (s.az - oz) * dx) / denom;
+  return t >= 0 && u >= 0 && u <= 1 ? t : Infinity;
+}
+
+/**
+ * The car brakes itself after the finish and must not meet anything while it does. Three rays leave the goal line
+ * the way the road is travelling, down the middle and just inside each edge, and all three must be clear of walls
+ * and pillars for the whole run-off distance.
+ */
+function checkGoalRunOff(level: Level, report: Report): void {
+  const goal = level.goal;
+  const acrossX = goal.bx - goal.ax;
+  const acrossZ = goal.bz - goal.az;
+  const width = Math.sqrt(acrossX * acrossX + acrossZ * acrossZ);
+  if (width === 0) return;
+  const dirX = cos(goal.respawn.heading);
+  const dirZ = sin(goal.respawn.heading);
+  const reach = RULES.goalRunOff;
+  const inset = Math.min(RUN_OFF_EDGE_INSET, width / 2) / width;
+  for (const share of [0.5, inset, 1 - inset]) {
+    const ox = goal.ax + acrossX * share;
+    const oz = goal.az + acrossZ * share;
+    let clear = Infinity;
+    for (let i = 0; i < level.walls.length; i++) {
+      const t = rayToSegment(ox, oz, dirX, dirZ, level.walls[i]);
+      if (t < clear) clear = t;
+    }
+    if (clear < reach) {
+      report.add('run-off beyond the goal is too short', `a wall ${fmt(clear)} m past the line, need ${reach}`);
+    }
+    for (let i = 0; i < level.props.length; i++) {
+      const prop = level.props[i];
+      const d = distPointSegment(prop.x, prop.z, ox, oz, ox + dirX * reach, oz + dirZ * reach);
+      if (d < prop.radius) report.add('run-off beyond the goal is blocked', `props[${i}]`);
+    }
+  }
+}
+
 function nearestWall(walls: readonly Segment[], x: number, z: number): number {
   let best = Infinity;
   for (let i = 0; i < walls.length; i++) {
@@ -699,13 +819,15 @@ export function validateLevel(level: Level): ValidationResult {
   checkEdgeOffsets(level, report);
   checkEdgeCrossings(level, report);
   checkRoadOverlap(level, report);
-  // Inside/outside tests are meaningless against an open boundary.
-  if (checkWallLoop(level, report)) {
+  checkWallsFollowEdges(level, report);
+  // Inside/outside tests are meaningless against a boundary that is open or crosses itself.
+  if (checkWallLoop(level, report) && checkWallCrossings(level, report)) {
     checkStart(level, report);
     checkGates(level, report);
     checkProps(level, report);
     checkDecor(level, report);
   }
+  checkGoalRunOff(level, report);
   checkBounds(level, report);
   return report.result();
 }
