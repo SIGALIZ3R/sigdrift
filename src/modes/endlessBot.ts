@@ -5,15 +5,15 @@
  *
  * What it adds is care over bumps. A bump throws the car into the air when the crest falls away faster than the
  * car can follow it, which depends on the car's speed and the bump's shape alone. The bot works out that speed
- * for every bump ahead and brakes to a margin below it, so its wheels never leave the ground.
+ * for every bump ahead (bumpSpeed, in driveLine.ts) and brakes to a margin below it, so its wheels never leave the
+ * ground. Hills, crests, crossings and open edges are the line's business (driveLine.ts), as for the weekly bot.
  */
-import { PI } from '../core/fixedMath';
-import { GRAVITY } from '../sim/car';
-import type { Bump, EndlessState, EndlessWorld, InputState, TrackChunk } from '../types';
+import type { EndlessState, EndlessWorld, InputState, TrackChunk } from '../types';
 import {
   LineFollower,
+  addBumpCare,
   addDodge,
-  appendPath,
+  appendPiece,
   beginPlan,
   capSpeed,
   clearLine,
@@ -21,19 +21,13 @@ import {
   holdSpeedEverywhere,
   layLine,
   planSpeeds,
-  stationOf,
 } from './driveLine';
 import type { DriveLine } from './driveLine';
 
+export { bumpSpeed } from './driveLine';
+
 /** Room for about six chunks of road; the line grows if a window ever holds more. */
 const LINE_CAPACITY = 1024;
-/**
- * Over a crest the bot lets the ground fall away from under it with at most this share of gravity, which leaves
- * a fifth of the car's weight on its tyres. The car takes off at about 1.15 (see LAUNCH_ACCEL in sim/car.ts).
- */
-const CREST_UNLOADING = 0.8;
-/** The bump speed is reached this far before the ridge begins, m. */
-const BUMP_LEAD = 3;
 
 export interface EndlessBotOptions {
   /** Slow down for bumps (default true). Without it the bot takes them at whatever speed the road allows. */
@@ -47,16 +41,6 @@ export interface EndlessBotOptions {
   constantSpeed?: number;
 }
 
-/**
- * Fastest a car can cross a bump with its wheels pressed to the ground by at least (1 - unloading) of its weight.
- * The ridge is a raised cosine, sharpest at the crest: there the ground falls away at
- * speed² x height x (PI / halfLength)² / 2.
- */
-export function bumpSpeed(bump: Bump, unloading: number = CREST_UNLOADING): number {
-  if (!(bump.height > 0)) return Infinity;
-  return (bump.halfLength / PI) * Math.sqrt((2 * unloading * GRAVITY) / bump.height);
-}
-
 function plan(
   line: DriveLine,
   chunks: readonly TrackChunk[],
@@ -66,17 +50,13 @@ function plan(
 ): void {
   clearLine(line);
   // Chunks join end to start: every chunk but the first repeats its neighbour's last point.
-  for (let c = 0; c < chunks.length; c++) appendPath(line, chunks[c].path, c === 0 ? 0 : 1);
+  for (let c = 0; c < chunks.length; c++) appendPiece(line, chunks[c], c === 0 ? 0 : 1);
   beginPlan(line);
   for (let c = 0; c < chunks.length; c++) {
     const { props, bumps } = chunks[c];
     for (let i = 0; i < props.length; i++) addDodge(line, props[i]);
     if (!bumpCare) continue;
-    for (let i = 0; i < bumps.length; i++) {
-      const bump = bumps[i];
-      const crest = stationOf(line, bump.x, bump.z);
-      capSpeed(line, crest - bump.halfLength - BUMP_LEAD, crest + bump.halfLength, bumpSpeed(bump));
-    }
+    for (let i = 0; i < bumps.length; i++) addBumpCare(line, bumps[i]);
   }
   if (speedCap < Infinity) capSpeed(line, -Infinity, Infinity, speedCap);
   layLine(line);

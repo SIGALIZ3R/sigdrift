@@ -1,5 +1,6 @@
 /**
- * Ground height on tracks with bumps (endless mode). A flat track has no bumps and its ground is 0 everywhere.
+ * Bump shape helpers. The road surface itself (heights, slopes, which bump belongs to which road) lives in
+ * surface.ts; these give the raised-cosine profile of a bump alone, relative to the road it sits on.
  */
 import type { Bump } from '../types';
 import { PI, cos } from '../core/fixedMath';
@@ -20,8 +21,8 @@ export function bumpHeight(b: Bump, x: number, z: number): number {
 }
 
 /**
- * Ground height at (x, z) given every bump that could be there: the highest of those that cover the point, or 0
- * where none does.
+ * Height above the road at (x, z) given every bump that could be there: the highest of those that cover the point,
+ * or 0 where none does. Ignores `Bump.y` (which road the bump belongs to): see surface.ts for that.
  */
 export function groundHeightOf(bumps: readonly Bump[], x: number, z: number): number {
   let height = 0;

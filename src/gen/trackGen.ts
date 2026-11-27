@@ -1,24 +1,52 @@
 /**
- * Weekly level generator.
+ * Fixed-level generator: the weekly run and the five hand-picked levels.
  *
- * The road is laid on a grid of large cells by a self-avoiding walk, so a route from start to goal exists by
- * construction. Each cell holds either a straight or a quarter-circle bend, and the road never leaves the cells it
- * walks through: two stretches of road can only meet where the walk says they do.
+ * The road is laid on a grid of large cells by a walk, so a route from start to goal exists by construction. Each
+ * cell holds either a straight or a quarter-circle bend, and the road never leaves the cells it walks through: two
+ * stretches of road can only meet where the walk says they do. The walk may enter a cell it already used only to
+ * CROSS it: both uses are straights at right angles, and the height plan puts one of them at least
+ * CROSSING_CLEARANCE above the other through the whole cell (an overpass, held level).
  *
- * Layout, widths, props and decor each draw from their own random stream, so tuning scenery never moves the road.
+ * Heights come from a smooth grade-limited profile (see road3d.ts): level at the start, the goal and every crossing,
+ * random climbs, drops and crests in between. Raised stretches stand on supports and some of their edges are left
+ * open: no barrier, a real drop to the city floor.
+ *
+ * Layout, widths, heights, open edges, props, bumps, supports and decor each draw from their own random stream, so
+ * tuning one part never moves another that comes before it.
  */
 
 import { HALF_PI, atan2, cos, lerp, sin, smoothstep } from '../core/fixedMath';
 import { Rng } from '../core/rng';
-import type { DecorBlock, Gate, Level, PathPoint, Prop, Segment, Vec2 } from '../types';
+import type { Bump, DecorBlock, Gate, Level, PathPoint, Prop, Segment, Support, TrackOptions, Vec2, Wall } from '../types';
 import { GEN_VERSION } from '../types';
-import { RULES, SpatialHash, WallIndex, insideWalls, validateLevel } from './validate';
+import { WEEKLY_OPTIONS } from './levels';
+import {
+  BEND_GRADE,
+  HeightProfile,
+  MAX_RISE,
+  PLAN_CLEARANCE,
+  RoadIndex,
+  bumpsAlong,
+  chooseOpenEdges,
+  edgeOverOtherRoad,
+  emitEdgeWalls,
+  maxClimb,
+  pieceBounds,
+  placeSupports,
+  profileLimits,
+  raisedSegments,
+  snap,
+  wallBetween,
+  wander,
+} from './road3d';
+import type { BumpAlong, GradeLimit, RoadHit } from './road3d';
+import { RULES, SpatialHash, WallIndex, insideQuad, validateLevel } from './validate';
 import { seedForWeek } from './weeklySeed';
+
+export { snap } from './road3d';
 
 export const CELL = 48;
 const HALF_CELL = CELL / 2;
-const MIN_CELLS = 16;
-const MAX_CELLS = 24;
 /** Travel directions in clockwise order (east, south, west, north): adding 1 is a right turn. */
 export const DIR_X = [1, 0, -1, 0];
 export const DIR_Z = [0, 1, 0, -1];
@@ -30,26 +58,48 @@ const WALK_BUDGET = 5000;
 /** Once this many cells in a row are straight, carrying straight on becomes unlikely. */
 const MAX_EASY_STRAIGHT = 3;
 
-const MIN_BASE_HALF_WIDTH = 9;
-const MAX_BASE_HALF_WIDTH = 11;
 const MAX_CORNER_HALF_WIDTH = 12.5;
 const MIN_PLAZA_HALF_WIDTH = 15;
 const MAX_PLAZA_HALF_WIDTH = 20;
-const PLAZA_CHANCE = 0.3;
 const NARROW_CHANCE = 0.14;
 /** Distance over which the road changes width. A plaza tapers more gently because it changes by more. */
 const BLEND = 16;
 const PLAZA_BLEND = 20;
 
 /** Closed ends: how far the road continues behind the start and beyond the goal. */
-const START_CAP = 14;
+const START_CAP = RULES.startCap;
 /**
  * The run-off: a car crossing the line flat out needs just under 60 m to brake to a stop. The goal sits in the
  * middle of the last cell, so the cap runs through the rest of that cell and well into the next one, which the
  * walk keeps free of road (see `extendWalk`). The extra few metres are for the nose of the car.
  */
-const GOAL_CAP = RULES.goalRunOff + 4;
-const CHECKPOINT_EVERY = 3;
+const GOAL_CAP = RULES.goalCap;
+/**
+ * Cells between checkpoints. No edge is open within 40 m of a checkpoint, so levels with a lot of open edge space
+ * their checkpoints out more (a fall then costs more road, which suits a hard level).
+ */
+function checkpointEvery(options: TrackOptions): number {
+  return options.openEdges >= 0.4 ? 5 : options.openEdges >= 0.15 ? 4 : 3;
+}
+
+// ---- heights ----
+/** Level road at the start and before the goal, m of centreline. */
+const LEVEL_END = 24;
+/** Gentler grades this close to the start and the goal. */
+const GENTLE_END = 60;
+/** A crossing is held level this far either side of the middle of its cell, on both roads. */
+const CROSSING_HOLD = 32;
+/**
+ * Barriers stay closed this close (centreline) to the middle of a crossing cell: the heart of the crossing reaches
+ * about 13 m either way, plus the validator's 30 m.
+ */
+const CROSSING_EDGE_KEEP = 46;
+/** No open edge this close (centreline) to the start, the goal or a checkpoint. */
+const GATE_EDGE_KEEP = 40;
+/** From this open-edge share up, the outside of a bend may be open too. */
+const OUTSIDE_OPEN_FROM = 0.15;
+/** A ground hit further than this along the centreline is another stretch of road. */
+const OTHER_ROAD_GAP = RULES.overlapPathGap;
 
 const CENTRE_PILLAR_MIN_HALF_WIDTH = 17;
 /** How far a pillar may sit from the middle of its cell, which keeps it off gates and out of width changes. */
@@ -58,6 +108,28 @@ const STRAIGHT_PILLAR_REACH = 7;
 /** The validator measures spacing between path samples, which can read up to a step short. */
 const PROP_SPACING = RULES.propSpacing + 4;
 const PROP_HUES = 6;
+/** Pillars per km the classic rates below were tuned for. */
+const PILLAR_RATE_REFERENCE = 2.5;
+/** From the middle of a crossing cell: the heart of the crossing reaches about 13 m either way, plus 30 m. */
+const PROP_CROSSING_CLEARANCE = 46;
+
+// ---- bumps ----
+const BUMP_END_CLEARANCE = 64;
+const BUMP_GATE_CLEARANCE = 42;
+const BUMP_CROSSING_CLEARANCE = 64;
+const BUMP_PROP_CLEARANCE = 42;
+const BUMP_BEND_CLEARANCE = 42;
+/** A bumpy level lets a crest sit this close to the bend that follows. */
+const BUMP_BEND_CLEARANCE_DARING = 19;
+const BUMP_GATE_CLEARANCE_DARING = 32;
+const BUMP_SPACING = 64;
+/** The road is held level this far beyond each end of a bump. */
+const BUMP_LEVEL_MARGIN = 13;
+const BUMP_WIDTH_PROBE = 3.5;
+/** No open edge this close to a bump on a gentle level, and on a bumpy one. */
+const BUMP_OPEN_CLEARANCE = 40;
+const BUMP_OPEN_CLEARANCE_DARING = 20;
+const BUMP_MAX_ROAD_HALF_WIDTH = 13;
 
 const DECOR_RINGS = 3;
 const OUTER_RING_CHANCE = 0.5;
@@ -81,18 +153,19 @@ const DECOR_LOW_RISE = 5;
 
 const MAX_RETRIES = 50;
 
-/** Snaps to a 1/1024 m lattice so a level serialises and hashes identically everywhere. Adding 0 clears -0. */
-export function snap(v: number): number {
-  return Math.round(v * 1024) / 1024 + 0;
-}
-
 function cellKey(cx: number, cz: number): number {
   return (cx + 512) * 1024 + (cz + 512);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Layout: a self-avoiding walk over grid cells
+// Layout: a walk over grid cells that may cross itself at right angles
 // ---------------------------------------------------------------------------------------------------------------
+
+/** A cell the road passes through twice: first along one axis, later across it. Walk indices. */
+export interface CrossingPlan {
+  first: number;
+  second: number;
+}
 
 interface Walk {
   count: number;
@@ -102,7 +175,17 @@ interface Walk {
   cz: number[];
   /** moves[i] is the travel direction from cell i to cell i + 1. */
   moves: number[];
-  used: Set<number>;
+  /** Cell key -> walk index of its first use. */
+  used: Map<number, number>;
+  crossings: CrossingPlan[];
+  /** Keys of cells used twice. */
+  crossed: Set<number>;
+  /** Crossings the walk tries to make. */
+  wantCrossings: number;
+  twist: number;
+  /** Rough grade limits for the climb-budget estimate. */
+  straightGrade: number;
+  bendGrade: number;
   budget: number;
   rng: Rng;
 }
@@ -133,15 +216,100 @@ function moveWeight(walk: Walk, dir: number): number {
   const previous = moves[moves.length - 1];
   const turn = turnBetween(previous, dir);
   const bends = bendRun(moves);
+  const twisty = 0.4 + 1.2 * walk.twist;
   let weight: number;
-  if (turn === 0) weight = straightRun(moves) > MAX_EASY_STRAIGHT ? 0.35 : 1.4;
+  if (turn === 0) weight = straightRun(moves) > MAX_EASY_STRAIGHT ? 0.35 : 1.4 * (1.6 - 1.2 * walk.twist);
   else if (bends === 0) weight = 0.85;
   // A second bend the same way makes a hairpin; the other way makes an S-bend.
-  else if (bends === 1) weight = turn === turnBetween(moves[moves.length - 2], previous) ? 1 : 0.8;
+  else if (bends === 1) weight = (turn === turnBetween(moves[moves.length - 2], previous) ? 1 : 0.8) * twisty;
   // Longer chains of bends are allowed but rare, so the road breathes between them.
-  else weight = 0.25;
+  else weight = 0.25 * twisty * twisty;
+  // A walk that still wants to cross itself has no favourite direction: it must be free to come back.
+  if (walk.crossings.length < walk.wantCrossings) return weight;
   const heading = (dir - walk.general + 4) & 3;
   return weight * (heading === 0 ? 1.3 : heading === 2 ? 0.5 : 1);
+}
+
+/** True when cell `index` of the walk (already followed by a move) is a straight. */
+function walkCellStraight(walk: Walk, index: number, nextMove: number): boolean {
+  const out = index < walk.moves.length ? walk.moves[index] : nextMove;
+  return index > 0 && walk.moves[index - 1] === out;
+}
+
+/** True when no crossing cell is among the eight neighbours of (cx, cz). */
+function clearOfCrossings(walk: Walk, cx: number, cz: number): boolean {
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dz = -1; dz <= 1; dz++) if (walk.crossed.has(cellKey(cx + dx, cz + dz))) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether moving from the newest cell in direction `dir` into an already used cell is a legal crossing: the earlier
+ * use is a straight at right angles, far enough from both ends, the cell beyond is free, no other crossing is next
+ * door, and the road in between is long enough to climb or drop the clearance.
+ */
+function crossingAllowed(walk: Walk, dir: number): boolean {
+  const newest = walk.cx.length - 1;
+  const index = newest + 1;
+  const cx = walk.cx[newest] + DIR_X[dir];
+  const cz = walk.cz[newest] + DIR_Z[dir];
+  const key = cellKey(cx, cz);
+  const first = walk.used.get(key);
+  if (first === undefined || walk.crossings.length >= walk.wantCrossings || walk.crossed.has(key)) return false;
+  if (first < 3 || index > walk.count - 4) return false;
+  if (!walkCellStraight(walk, first, dir) || ((walk.moves[first] - dir) & 1) === 0) return false;
+  if (walk.used.has(cellKey(cx + DIR_X[dir], cz + DIR_Z[dir])) || !clearOfCrossings(walk, cx, cz)) return false;
+  // Climb budget between the two level holds, roughly: the cells strictly between the two uses.
+  let budget = 0;
+  for (let m = first + 1; m <= newest; m++) {
+    budget += walkCellStraight(walk, m, dir) ? walk.straightGrade * CELL : walk.bendGrade * ARC_LENGTH;
+  }
+  budget = 0.92 * (budget - 2 * (CROSSING_HOLD - HALF_CELL) * walk.straightGrade) - 1;
+  return budget >= PLAN_CLEARANCE + 0.3;
+}
+
+/**
+ * Manhattan distance from (cx, cz) to the nearest free cell from which a crossing could be entered, counting only
+ * straights laid long enough ago that the road since could already climb most of the clearance.
+ */
+function distanceToCrossingEntry(walk: Walk, cx: number, cz: number): number {
+  let best = Infinity;
+  const newest = walk.cx.length - 1;
+  let climb = 0;
+  for (let i = newest - 1; i >= 3; i--) {
+    climb += walk.moves[i] === walk.moves[i - 1] ? walk.straightGrade * CELL : walk.bendGrade * ARC_LENGTH;
+    if (walk.moves[i - 1] !== walk.moves[i] || climb < PLAN_CLEARANCE) continue;
+    const key = cellKey(walk.cx[i], walk.cz[i]);
+    if (walk.crossed.has(key)) continue;
+    const sideX = -DIR_Z[walk.moves[i]];
+    const sideZ = DIR_X[walk.moves[i]];
+    for (const side of [-1, 1]) {
+      const ex = walk.cx[i] + sideX * side;
+      const ez = walk.cz[i] + sideZ * side;
+      const free = !walk.used.has(cellKey(ex, ez)) || (ex === walk.cx[newest] && ez === walk.cz[newest]);
+      if (free) best = Math.min(best, Math.abs(ex - cx) + Math.abs(ez - cz));
+    }
+  }
+  return best;
+}
+
+/** Steers a walk that still wants crossings back towards road it has already laid. */
+function crossingPull(walk: Walk, dir: number): number {
+  const newest = walk.cx.length - 1;
+  if (walk.crossings.length >= walk.wantCrossings || newest < 4 || newest > walk.count - 6) return 1;
+  const cx = walk.cx[newest] + DIR_X[dir];
+  const cz = walk.cz[newest] + DIR_Z[dir];
+  if (walk.used.has(cellKey(cx, cz))) return crossingAllowed(walk, dir) ? 10 : 1;
+  const before = distanceToCrossingEntry(walk, walk.cx[newest], walk.cz[newest]);
+  const after = distanceToCrossingEntry(walk, cx, cz);
+  return after < before ? 4 : after > before ? 0.35 : 1;
+}
+
+/** True when the newest cell is the second use of a crossing: it must be left straight on. */
+function newestIsCrossing(walk: Walk): boolean {
+  const n = walk.crossings.length;
+  return n > 0 && walk.crossings[n - 1].second === walk.cx.length - 1;
 }
 
 /** The three ways out of the newest cell, in a weighted random order. */
@@ -149,10 +317,10 @@ function moveOptions(walk: Walk): number[] {
   const step = walk.moves.length;
   if (step === 0) return [walk.general];
   const previous = walk.moves[step - 1];
-  // The second cell and the second-to-last cell must be straight.
-  if (step === 1 || step === walk.count - 2) return [previous];
+  // The second cell, the second-to-last cell and a crossing cell must be straight.
+  if (step === 1 || step === walk.count - 2 || newestIsCrossing(walk)) return [previous];
   const pool = [previous, (previous + 1) & 3, (previous + 3) & 3];
-  const weights = pool.map((dir) => moveWeight(walk, dir));
+  const weights = pool.map((dir) => moveWeight(walk, dir) * crossingPull(walk, dir));
   const order: number[] = [];
   while (pool.length > 0) {
     let pick = 0;
@@ -180,14 +348,23 @@ function extendWalk(walk: Walk): boolean {
     const cx = walk.cx[index] + DIR_X[dir];
     const cz = walk.cz[index] + DIR_Z[dir];
     const key = cellKey(cx, cz);
-    if (walk.used.has(key)) continue;
+    const prior = walk.used.get(key);
+    if (prior !== undefined && !crossingAllowed(walk, dir)) continue;
     if (placingLast && walk.used.has(cellKey(cx + DIR_X[dir], cz + DIR_Z[dir]))) continue;
-    walk.used.add(key);
+    if (prior === undefined) walk.used.set(key, index + 1);
+    else {
+      walk.crossings.push({ first: prior, second: index + 1 });
+      walk.crossed.add(key);
+    }
     walk.cx.push(cx);
     walk.cz.push(cz);
     walk.moves.push(dir);
     if (extendWalk(walk)) return true;
-    walk.used.delete(key);
+    if (prior === undefined) walk.used.delete(key);
+    else {
+      walk.crossings.pop();
+      walk.crossed.delete(key);
+    }
     walk.cx.pop();
     walk.cz.pop();
     walk.moves.pop();
@@ -195,19 +372,45 @@ function extendWalk(walk: Walk): boolean {
   return false;
 }
 
-function walkLayout(rng: Rng): Walk {
-  const walk: Walk = {
-    count: MIN_CELLS + rng.int(MAX_CELLS - MIN_CELLS + 1),
-    general: rng.int(4),
-    cx: [0],
-    cz: [0],
-    moves: [],
-    used: new Set([cellKey(0, 0)]),
-    budget: WALK_BUDGET,
-    rng,
-  };
-  if (!extendWalk(walk)) throw new Error('layout walk found no route');
-  return walk;
+/** Walks tried per level when the first one does not cross itself as often as wanted. */
+const WALK_CANDIDATES = 48;
+
+/**
+ * Lays out the road. Crossings need the walk to come back to itself at a right angle, which no single walk can be
+ * forced to do, so several walks are tried and the first that makes the wanted number of crossings wins (else the
+ * one with the most). Every candidate draws from its own fork, so the choice is deterministic.
+ */
+function walkLayout(rng: Rng, options: TrackOptions): Walk {
+  const [minCells, maxCells] = options.cells;
+  const limits = profileLimits(options.elevation);
+  const wanted = Math.max(0, Math.min(4, options.crossings));
+  const whole = Math.floor(wanted);
+  const wantCrossings = whole + (rng.chance(wanted - whole) ? 1 : 0);
+  let best: Walk | null = null;
+  for (let candidate = 0; candidate < WALK_CANDIDATES; candidate++) {
+    const stream = candidate === 0 ? rng : rng.fork(`walk${candidate}`);
+    const walk: Walk = {
+      count: minCells + stream.int(maxCells - minCells + 1),
+      general: stream.int(4),
+      cx: [0],
+      cz: [0],
+      moves: [],
+      used: new Map([[cellKey(0, 0), 0]]),
+      crossings: [],
+      crossed: new Set(),
+      wantCrossings,
+      twist: Math.max(0, Math.min(1, options.twist)),
+      straightGrade: limits.maxGrade,
+      bendGrade: limits.bendGrade,
+      budget: WALK_BUDGET,
+      rng: stream,
+    };
+    if (!extendWalk(walk)) continue;
+    if (!best || walk.crossings.length > best.crossings.length) best = walk;
+    if (walk.crossings.length >= wantCrossings) break;
+  }
+  if (!best) throw new Error('layout walk found no route');
+  return best;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -294,13 +497,14 @@ function makePlaza(cell: Cell, size: number): void {
   cell.midWidth = lerp(MIN_PLAZA_HALF_WIDTH, MAX_PLAZA_HALF_WIDTH, size);
 }
 
-function planWidths(rng: Rng, cells: Cell[]): WidthPlan {
-  const base = rng.range(MIN_BASE_HALF_WIDTH, MAX_BASE_HALF_WIDTH);
+function planWidths(rng: Rng, cells: Cell[], options: TrackOptions, nearCrossing: Set<number>): WidthPlan {
+  const base = rng.range(options.halfWidth[0], options.halfWidth[1]);
   const plan: WidthPlan = { base, corner: Math.min(MAX_CORNER_HALF_WIDTH, base + rng.range(0.8, 2.2)) };
   const occupied = new Set(cells.map((cell) => cellKey(cell.cx, cell.cz)));
   // A plaza must not crowd the run-off either.
   const runOff = runOffCell(cells);
   occupied.add(cellKey(runOff.cx, runOff.cz));
+  const plazaChance = Math.max(0, Math.min(1, options.plazas)) * 0.6;
   const plazaSites: number[] = [];
   let plazas = 0;
   for (let i = 0; i < cells.length; i++) {
@@ -311,10 +515,11 @@ function planWidths(rng: Rng, cells: Cell[]): WidthPlan {
     const roll = rng.next();
     const size = rng.next();
     // Two plazas in a row are wider than they are far apart, which the overlap rule reads as a road folded
-    // onto itself.
-    const canBePlaza = hasOpenSides(cell, occupied) && cells[i - 1].kind !== 'plaza';
+    // onto itself. Nor does a plaza sit next to a crossing.
+    const canBePlaza =
+      hasOpenSides(cell, occupied) && cells[i - 1].kind !== 'plaza' && !nearCrossing.has(cellKey(cell.cx, cell.cz));
     if (canBePlaza) plazaSites.push(i);
-    if (canBePlaza && roll < PLAZA_CHANCE) {
+    if (canBePlaza && roll < plazaChance) {
       makePlaza(cell, size);
       plazas++;
     } else if (roll > 1 - NARROW_CHANCE) {
@@ -322,7 +527,7 @@ function planWidths(rng: Rng, cells: Cell[]): WidthPlan {
       cell.midWidth = Math.max(RULES.minHalfWidth, base - lerp(1.5, 3, size));
     }
   }
-  if (plazas === 0 && plazaSites.length > 0) makePlaza(cells[rng.pick(plazaSites)], rng.next());
+  if (plazas === 0 && plazaChance > 0 && plazaSites.length > 0) makePlaza(cells[rng.pick(plazaSites)], rng.next());
   return plan;
 }
 
@@ -342,6 +547,157 @@ function halfWidthAt(cells: readonly Cell[], plan: WidthPlan, index: number, s: 
     return lerp(joinWidth(cells, plan, index, index + 1), cell.midWidth, smoothstep(0, blend, remaining));
   }
   return cell.midWidth;
+}
+
+/** Index of the cell whose centreline contains distance `d`. */
+function cellAtDist(cells: readonly Cell[], d: number): number {
+  let lo = 0;
+  let hi = cells.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (cells[mid].startDist <= d) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Heights
+// ---------------------------------------------------------------------------------------------------------------
+
+interface Anchor {
+  from: number;
+  to: number;
+  height: number;
+  /** Index of the anchor on the other road of the same crossing, or -1. */
+  partner: number;
+}
+
+/** Share of the steepest climb the height assignment may plan with. */
+const ANCHOR_SAFETY = 0.95;
+
+function gradeLimitFor(cells: readonly Cell[], length: number, options: TrackOptions): GradeLimit {
+  const limits = profileLimits(options.elevation);
+  return (d: number): number => {
+    let g = cells[cellAtDist(cells, d)].kind === 'corner' ? limits.bendGrade : limits.maxGrade;
+    if (d < GENTLE_END || d > length - GENTLE_END) g = Math.min(g, BEND_GRADE);
+    if (d < LEVEL_END || d > length - LEVEL_END) g = 0;
+    return g;
+  };
+}
+
+/** Picks a height for every level hold so consecutive holds can be joined and every crossing has its clearance. */
+function assignAnchorHeights(rng: Rng, anchors: Anchor[], budgets: readonly number[], maxHeight: number): boolean {
+  for (let attempt = 0; attempt < 60; attempt++) {
+    let ok = true;
+    for (let k = 1; k < anchors.length && ok; k++) {
+      const previous = anchors[k - 1].height;
+      const lo = Math.max(0, previous - budgets[k]);
+      const hi = Math.min(maxHeight, previous + budgets[k]);
+      const partner = anchors[k].partner;
+      const u = rng.next();
+      const side = rng.next();
+      let height: number;
+      if (partner >= 0 && partner < k) {
+        const other = anchors[partner].height;
+        const below: [number, number] = [lo, Math.min(hi, other - PLAN_CLEARANCE)];
+        const above: [number, number] = [Math.max(lo, other + PLAN_CLEARANCE), hi];
+        const options = [below, above].filter(([a, b]) => b >= a);
+        if (options.length === 0) {
+          ok = false;
+          break;
+        }
+        const [a, b] = options[side < 0.5 || options.length === 1 ? 0 : 1];
+        // Hug the near side of the gap a little: big height changes eat the climb budget for what follows.
+        height = options.length === 1 && a === below[0] ? b - (b - a) * u * 0.5 : a + (b - a) * u * 0.5;
+      } else if (partner > k) {
+        // First road of a crossing: low or high, so the other road can pass over or under.
+        height = side < 0.5 ? lo + (hi - lo) * u * 0.3 : hi - (hi - lo) * u * 0.3;
+      } else {
+        height = lo + (hi - lo) * u;
+      }
+      anchors[k].height = snap(Math.max(0, height));
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+/** Crossing cells, for every part of the generator that must keep clear of them. */
+interface CrossingInfo {
+  plans: CrossingPlan[];
+  /** Walk indices of both uses of every crossing cell. */
+  cells: Set<number>;
+  /** Centreline distance of the middle of every crossing cell, both uses. */
+  dists: number[];
+}
+
+function crossingInfo(cells: readonly Cell[], plans: readonly CrossingPlan[]): CrossingInfo {
+  const info: CrossingInfo = { plans: [...plans], cells: new Set(), dists: [] };
+  for (const plan of plans) {
+    for (const index of [plan.first, plan.second]) {
+      info.cells.add(index);
+      info.dists.push(cells[index].startDist + HALF_CELL);
+    }
+  }
+  return info;
+}
+
+function planHeights(
+  rng: Rng,
+  cells: readonly Cell[],
+  crossings: CrossingInfo,
+  bumps: BumpPlan,
+  options: TrackOptions,
+): HeightProfile {
+  const length = cells[cells.length - 1].startDist + cells[cells.length - 1].length;
+  const limits = profileLimits(options.elevation);
+  const limit = gradeLimitFor(cells, length, options);
+  const profile = new HeightProfile(0, 0, limit, limits.gradeChange);
+  let maxHeight = MAX_RISE * Math.max(0, Math.min(1, options.elevation));
+  if (crossings.plans.length > 0) maxHeight = Math.max(maxHeight, PLAN_CLEARANCE + 4);
+
+  const anchors: Anchor[] = [{ from: 0, to: LEVEL_END, height: 0, partner: -1 }];
+  const holds: { from: number; to: number; key: number }[] = [];
+  crossings.plans.forEach((plan, k) => {
+    for (const index of [plan.first, plan.second]) {
+      const middle = cells[index].startDist + HALF_CELL;
+      holds.push({ from: Math.round(middle - CROSSING_HOLD), to: Math.round(middle + CROSSING_HOLD), key: k });
+    }
+  });
+  // Level road under every bump, at whatever height suits.
+  bumps.dists.forEach((d, k) => {
+    const reach = bumps.halfLengths[k] + BUMP_LEVEL_MARGIN;
+    holds.push({ from: Math.round(d - reach), to: Math.round(d + reach), key: -1 - k });
+  });
+  holds.sort((a, b) => a.from - b.from);
+  for (const hold of holds) anchors.push({ from: hold.from, to: hold.to, height: 0, partner: -1 });
+  for (let a = 1; a < anchors.length; a++) {
+    for (let b = a + 1; b < anchors.length; b++) {
+      if (holds[a - 1].key >= 0 && holds[a - 1].key === holds[b - 1].key) {
+        anchors[a].partner = b;
+        anchors[b].partner = a;
+      }
+    }
+  }
+  anchors.push({ from: Math.floor(length - LEVEL_END), to: Math.ceil(length) + 2, height: 0, partner: -1 });
+  const budgets = anchors.map((anchor, k) =>
+    k === 0 ? 0 : maxClimb(anchors[k - 1].to, anchor.from, limit, limits.gradeChange) * ANCHOR_SAFETY,
+  );
+  if (!assignAnchorHeights(rng, anchors, budgets, maxHeight)) throw new Error('no height plan fits the crossings');
+
+  const style = {
+    maxHeight,
+    ramp: [40, 150] as [number, number],
+    hold: [0, 45] as [number, number],
+    drama: 0.35 + 0.5 * Math.max(0, Math.min(1, options.elevation)),
+  };
+  profile.holdTo(anchors[0].to);
+  for (let k = 1; k < anchors.length; k++) {
+    if (!wander(profile, rng, anchors[k].from, anchors[k].height, style)) throw new Error('height plan unreachable');
+    profile.holdTo(anchors[k].to);
+  }
+  return profile;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -398,7 +754,7 @@ interface Road {
 }
 
 /** Offsets the centreline to both sides along a central-difference normal and snaps everything to the lattice. */
-function buildRoad(line: Centreline): Road {
+function buildRoad(line: Centreline, profile: HeightProfile): Road {
   const road: Road = { path: [], left: [], right: [] };
   const last = line.x.length - 1;
   for (let i = 0; i <= last; i++) {
@@ -413,6 +769,7 @@ function buildRoad(line: Centreline): Road {
     road.path.push({
       x: snap(line.x[i]),
       z: snap(line.z[i]),
+      y: snap(Math.max(0, profile.heightAt(line.dist[i]))),
       halfWidth: snap(line.halfWidth[i]),
       dist: snap(line.dist[i]),
     });
@@ -420,22 +777,49 @@ function buildRoad(line: Centreline): Road {
   return road;
 }
 
+/** Road height at a centreline distance, interpolated between path points exactly as the surface is. */
+export function pathHeightAt(path: readonly PathPoint[], dist: number): number {
+  let lo = 0;
+  let hi = path.length - 1;
+  if (dist <= path[0].dist) return path[0].y;
+  if (dist >= path[hi].dist) return path[hi].y;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (path[mid].dist <= dist) lo = mid;
+    else hi = mid;
+  }
+  const a = path[lo];
+  const b = path[hi];
+  return a.y + ((b.y - a.y) * (dist - a.dist)) / (b.dist - a.dist);
+}
+
 function shifted(p: Vec2, dir: number, distance: number): Vec2 {
   return { x: p.x + DIR_X[dir] * distance, z: p.z + DIR_Z[dir] * distance };
 }
 
-/** One closed loop: up the left edge, around the cap beyond the goal, back down the right edge, around the start. */
-function buildWalls(road: Road, startDir: number, goalDir: number): Segment[] {
-  const { left, right } = road;
-  const last = left.length - 1;
-  const loop: Vec2[] = [shifted(right[0], startDir, -START_CAP), shifted(left[0], startDir, -START_CAP)];
-  for (let i = 0; i <= last; i++) loop.push(left[i]);
-  loop.push(shifted(left[last], goalDir, GOAL_CAP), shifted(right[last], goalDir, GOAL_CAP));
-  for (let i = last; i >= 0; i--) loop.push(right[i]);
-  return loop.map((a, i) => {
-    const b = loop[(i + 1) % loop.length];
-    return { ax: a.x, az: a.z, bx: b.x, bz: b.z };
-  });
+/** The closed end behind the start, at the start's height. Runs from the right edge round to the left edge. */
+function startCapWalls(road: Road, startDir: number): Wall[] {
+  const y = road.path[0].y;
+  const backLeft = shifted(road.left[0], startDir, -START_CAP);
+  const backRight = shifted(road.right[0], startDir, -START_CAP);
+  return [
+    wallBetween(road.right[0], backRight, y, y),
+    wallBetween(backRight, backLeft, y, y),
+    wallBetween(backLeft, road.left[0], y, y),
+  ];
+}
+
+/** The walled run-off beyond the goal, level at the goal's height. Runs from the left edge round to the right. */
+function goalCapWalls(road: Road, goalDir: number): Wall[] {
+  const last = road.path.length - 1;
+  const y = road.path[last].y;
+  const farLeft = shifted(road.left[last], goalDir, GOAL_CAP);
+  const farRight = shifted(road.right[last], goalDir, GOAL_CAP);
+  return [
+    wallBetween(road.left[last], farLeft, y, y),
+    wallBetween(farLeft, farRight, y, y),
+    wallBetween(farRight, road.right[last], y, y),
+  ];
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -450,17 +834,33 @@ function gateAt(road: Road, pathIndex: number, dir: number): Gate {
   const p = road.path[pathIndex];
   const a = road.left[pathIndex];
   const b = road.right[pathIndex];
-  return { ax: a.x, az: a.z, bx: b.x, bz: b.z, pathIndex, respawn: { x: p.x, z: p.z, heading: headingOf(dir) } };
+  return {
+    ax: a.x,
+    az: a.z,
+    bx: b.x,
+    bz: b.z,
+    pathIndex,
+    y: p.y,
+    respawn: { x: p.x, z: p.z, heading: headingOf(dir), y: p.y },
+  };
 }
 
 /**
  * Picks the line between cell b - 1 and cell b for a checkpoint near `target`, preferring one with straight road
- * on both sides. Returns -1 when nothing nearby is far enough from the previous gate and from both ends.
+ * on both sides. Never a line that touches a crossing cell. Returns -1 when nothing nearby is far enough from the
+ * previous gate and from both ends.
  */
-function pickCheckpointLine(cells: readonly Cell[], target: number, previous: number, length: number): number {
+function pickCheckpointLine(
+  cells: readonly Cell[],
+  crossings: CrossingInfo,
+  target: number,
+  previous: number,
+  length: number,
+): number {
   let fallback = -1;
   for (const b of [target, target + 1, target - 1]) {
     if (b < previous + 2 || b > cells.length - 2) continue;
+    if (crossings.cells.has(b) || crossings.cells.has(b - 1)) continue;
     const dist = cells[b].startDist;
     if (dist < RULES.checkpointEndClearance || length - dist < RULES.checkpointEndClearance) continue;
     if (cells[b - 1].kind !== 'corner' && cells[b].kind !== 'corner') return b;
@@ -469,16 +869,89 @@ function pickCheckpointLine(cells: readonly Cell[], target: number, previous: nu
   return fallback;
 }
 
-function placeCheckpoints(cells: readonly Cell[], road: Road, length: number): Gate[] {
-  const gates: Gate[] = [];
+/** The cell lines checkpoints sit on: checkpoint k is where cell lines[k] begins. */
+function checkpointLines(cells: readonly Cell[], crossings: CrossingInfo, length: number, every: number): number[] {
+  const lines: number[] = [];
   let previous = 0;
-  for (let target = CHECKPOINT_EVERY; target <= cells.length - 2; target += CHECKPOINT_EVERY) {
-    const line = pickCheckpointLine(cells, target, previous, length);
+  for (let target = every; target <= cells.length - 2; target += every) {
+    const line = pickCheckpointLine(cells, crossings, target, previous, length);
     if (line < 0) continue;
-    gates.push(gateAt(road, cells[line].firstIndex, cells[line].inDir));
+    lines.push(line);
     previous = line;
   }
-  return gates;
+  return lines;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Open edges
+// ---------------------------------------------------------------------------------------------------------------
+
+interface EdgePlan {
+  leftOpen: boolean[];
+  rightOpen: boolean[];
+  /** Centreline distances where an open stretch begins or ends. */
+  stretchEnds: number[];
+}
+
+function planEdges(
+  rng: Rng,
+  cells: readonly Cell[],
+  road: Road,
+  index: RoadIndex,
+  crossings: CrossingInfo,
+  gateDists: readonly number[],
+  bumpDists: readonly number[],
+  bumpsOnRoad: readonly BumpAlong[],
+  options: TrackOptions,
+): EdgePlan {
+  const path = road.path;
+  const n = path.length;
+  const length = path[n - 1].dist;
+  const raised = raisedSegments(path);
+  const bend: boolean[] = new Array<boolean>(n).fill(false);
+  const allowLeft: boolean[] = new Array<boolean>(n).fill(false);
+  const allowRight: boolean[] = new Array<boolean>(n).fill(false);
+  // Gentle settings never leave the outside of a bend open (every bend here is tight: radius 24 m).
+  const outsideOk = options.openEdges >= OUTSIDE_OPEN_FROM;
+  const daring = Math.max(0, Math.min(1, (options.bumpsPerKm - 1.5) / 2.5));
+  const bumpKeep = lerp(BUMP_OPEN_CLEARANCE, BUMP_OPEN_CLEARANCE_DARING, daring);
+  const hits: RoadHit[] = [];
+  for (const cell of cells) {
+    const turn = turnBetween(cell.inDir, cell.outDir);
+    for (let i = cell.firstIndex; i < cell.firstIndex + cell.steps && i + 1 < n; i++) {
+      bend[i] = turn !== 0;
+      if (!raised[i] || options.openEdges <= 0) continue;
+      const d0 = path[i].dist;
+      const d1 = path[i + 1].dist;
+      let keep = d0 < GATE_EDGE_KEEP || d1 > length - GATE_EDGE_KEEP;
+      for (const g of gateDists) keep = keep || (d1 > g - GATE_EDGE_KEEP && d0 < g + GATE_EDGE_KEEP);
+      for (const c of crossings.dists) keep = keep || (d1 > c - CROSSING_EDGE_KEEP && d0 < c + CROSSING_EDGE_KEEP);
+      for (const b of bumpDists) keep = keep || (d1 > b - bumpKeep && d0 < b + bumpKeep);
+      if (keep) continue;
+      // The outside of a right turn is the left edge.
+      allowLeft[i] =
+        (outsideOk || turn <= 0) && !edgeOverOtherRoad(index, 0, path, road.left, i, OTHER_ROAD_GAP, hits, bumpsOnRoad);
+      allowRight[i] =
+        (outsideOk || turn >= 0) && !edgeOverOtherRoad(index, 0, path, road.right, i, OTHER_ROAD_GAP, hits, bumpsOnRoad);
+    }
+  }
+  const plan = chooseOpenEdges(rng, { path, raised, allowLeft, allowRight, bend, share: options.openEdges });
+  const stretchEnds: number[] = [];
+  for (const open of [plan.leftOpen, plan.rightOpen]) {
+    for (let i = 0; i + 1 < n; i++) {
+      if (open[i] && (i === 0 || !open[i - 1])) stretchEnds.push(path[i].dist);
+      if (open[i] && !open[i + 1]) stretchEnds.push(path[i + 1].dist);
+    }
+  }
+  return { leftOpen: plan.leftOpen, rightOpen: plan.rightOpen, stretchEnds };
+}
+
+/** True when any edge segment from `from` to `to` (path indices) is open. */
+function anyOpen(edges: EdgePlan, from: number, to: number): boolean {
+  for (let i = Math.max(0, from); i < Math.min(to, edges.leftOpen.length); i++) {
+    if (edges.leftOpen[i] || edges.rightOpen[i]) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -512,38 +985,173 @@ export function sidePillar(rng: Rng, halfWidth: number, reach: number): PillarSp
   return { along: rng.range(-reach, reach), lateral: side * (halfWidth - radius - gap), radius };
 }
 
-function pillarSpot(rng: Rng, cell: Cell): PillarSpot | null {
+function pillarSpot(rng: Rng, cell: Cell, rate: number): PillarSpot | null {
   if (cell.kind === 'plaza') {
-    if (cell.midWidth >= CENTRE_PILLAR_MIN_HALF_WIDTH && rng.chance(0.75)) return centrePillar(rng);
-    return rng.chance(0.5) ? sidePillar(rng, cell.midWidth, PLAZA_PILLAR_REACH) : null;
+    if (cell.midWidth >= CENTRE_PILLAR_MIN_HALF_WIDTH && rng.chance(Math.min(1, 0.75 * rate))) return centrePillar(rng);
+    return rng.chance(Math.min(1, 0.5 * rate)) ? sidePillar(rng, cell.midWidth, PLAZA_PILLAR_REACH) : null;
   }
-  if (cell.kind !== 'straight' || !rng.chance(0.2)) return null;
+  if (cell.kind !== 'straight' || !rng.chance(Math.min(1, 0.2 * rate))) return null;
   return sidePillar(rng, cell.midWidth, STRAIGHT_PILLAR_REACH);
 }
 
-function placeProps(rng: Rng, cells: readonly Cell[]): Prop[] {
-  const props: Prop[] = [];
+interface PropPlan {
+  props: Prop[];
+  dists: number[];
+}
+
+function placeProps(
+  rng: Rng,
+  cells: readonly Cell[],
+  crossings: CrossingInfo,
+  edges: EdgePlan,
+  path: readonly PathPoint[],
+  bumpDists: readonly number[],
+  options: TrackOptions,
+): PropPlan {
+  const out: PropPlan = { props: [], dists: [] };
+  const rate = Math.max(0, options.pillarsPerKm) / PILLAR_RATE_REFERENCE;
   let lastDist = -PROP_SPACING;
   // Cells 0 and 1 are too close to the start, and the last two lead onto the goal line.
   for (let i = 2; i <= cells.length - 3; i++) {
     const cell = cells[i];
-    const spot = pillarSpot(rng, cell);
+    const spot = pillarSpot(rng, cell, rate);
     if (!spot) continue;
+    // Not under or over a crossing, and not beside an open drop.
+    if (crossings.cells.has(i) || anyOpen(edges, cell.firstIndex - 8, cell.firstIndex + cell.steps + 8)) continue;
+    // Not on the outside of the line out of the bend just before: a car drifts wide there. (lateral > 0 is the
+    // road's right; the outside of a right turn, turn > 0, is its left.)
+    const before = turnBetween(cells[i - 1].inDir, cells[i - 1].outDir);
+    if (before !== 0 && spot.lateral !== 0 && Math.sign(spot.lateral) === -Math.sign(before)) continue;
     const dist = cell.startDist + HALF_CELL + spot.along;
+    if (!farFrom(dist, crossings.dists, PROP_CROSSING_CLEARANCE)) continue;
+    if (!farFrom(dist, bumpDists, BUMP_PROP_CLEARANCE)) continue;
     if (dist - lastDist < PROP_SPACING) continue;
     lastDist = dist;
     const dirX = DIR_X[cell.inDir];
     const dirZ = DIR_Z[cell.inDir];
-    props.push({
+    out.dists.push(dist);
+    out.props.push({
       kind: 'pillar',
       x: snap(cell.cx * CELL + dirX * spot.along - dirZ * spot.lateral),
       z: snap(cell.cz * CELL + dirZ * spot.along + dirX * spot.lateral),
+      y: snap(pathHeightAt(path, dist)),
       radius: snap(spot.radius),
       height: snap(rng.range(3, 7)),
       hue: rng.int(PROP_HUES),
     });
   }
-  return props;
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Bumps
+// ---------------------------------------------------------------------------------------------------------------
+
+interface StraightRun {
+  from: number;
+  to: number;
+}
+
+/** Stretches of centreline that are geometrically straight (any cell but a bend), with their distance range. */
+function straightRuns(cells: readonly Cell[]): StraightRun[] {
+  const runs: StraightRun[] = [];
+  let from = -1;
+  for (let i = 0; i <= cells.length; i++) {
+    const straight = i < cells.length && cells[i].kind !== 'corner';
+    if (straight && from < 0) from = cells[i].startDist;
+    if (!straight && from >= 0) {
+      runs.push({ from, to: i < cells.length ? cells[i].startDist : cells[i - 1].startDist + cells[i - 1].length });
+      from = -1;
+    }
+  }
+  return runs;
+}
+
+function farFrom(d: number, dists: readonly number[], clearance: number): boolean {
+  for (const other of dists) if (Math.abs(d - other) < clearance) return false;
+  return true;
+}
+
+/** Where the bumps go, chosen from the layout alone so the height plan can hold the road level under them. */
+interface BumpPlan {
+  dists: number[];
+  halfLengths: number[];
+  heights: number[];
+  halfWidths: number[];
+}
+
+/**
+ * Picks crest positions on straight road away from bends, crossings, gates and the ends. A gentle level keeps 40 m
+ * of straight either side; a bumpy one lets a crest sit closer to the bend that follows. The heights are decided
+ * later: planHeights holds the road level through every bump.
+ */
+function planBumps(
+  rng: Rng,
+  cells: readonly Cell[],
+  plan: WidthPlan,
+  crossings: CrossingInfo,
+  gateDists: readonly number[],
+  options: TrackOptions,
+): BumpPlan {
+  const last = cells[cells.length - 1];
+  const length = last.startDist + last.length;
+  const rate = (Math.max(0, options.bumpsPerKm) * length) / 1000;
+  const wanted = Math.floor(rate) + (rng.chance(rate - Math.floor(rate)) ? 1 : 0);
+  const daring = Math.max(0, Math.min(1, (options.bumpsPerKm - 1.5) / 2.5));
+  const bendClearance = lerp(BUMP_BEND_CLEARANCE, BUMP_BEND_CLEARANCE_DARING, daring);
+  const gateClearance = lerp(BUMP_GATE_CLEARANCE, BUMP_GATE_CLEARANCE_DARING, daring);
+  const out: BumpPlan = { dists: [], halfLengths: [], heights: [], halfWidths: [] };
+  const runs = straightRuns(cells)
+    .map((run) => ({ from: run.from + bendClearance, to: run.to - bendClearance }))
+    .filter((run) => run.to > run.from);
+  let total = 0;
+  for (const run of runs) total += run.to - run.from;
+  for (let attempt = 0; attempt < 40 * wanted && out.dists.length < wanted && total > 0; attempt++) {
+    let roll = rng.next() * total;
+    let pick = 0;
+    while (pick < runs.length - 1 && roll >= runs[pick].to - runs[pick].from) {
+      roll -= runs[pick].to - runs[pick].from;
+      pick++;
+    }
+    const d = Math.min(runs[pick].to, runs[pick].from + roll);
+    const halfLength = rng.range(5, 7);
+    const height = rng.range(0.35, 0.65) + 0.15 * daring;
+    if (d < BUMP_END_CLEARANCE || d > length - BUMP_END_CLEARANCE) continue;
+    if (!farFrom(d, gateDists, gateClearance) || !farFrom(d, crossings.dists, BUMP_CROSSING_CLEARANCE)) continue;
+    if (!farFrom(d, out.dists, BUMP_SPACING)) continue;
+    // The validator measures the width at path samples, up to one step beyond the ridge.
+    let widest = 0;
+    for (let s = d - halfLength - BUMP_WIDTH_PROBE; s <= d + halfLength + BUMP_WIDTH_PROBE; s += 0.5) {
+      const k = cellAtDist(cells, s);
+      widest = Math.max(widest, halfWidthAt(cells, plan, k, s - cells[k].startDist));
+    }
+    if (widest > BUMP_MAX_ROAD_HALF_WIDTH) continue;
+    out.dists.push(d);
+    out.halfLengths.push(halfLength);
+    out.heights.push(height);
+    out.halfWidths.push(widest + 1);
+  }
+  return out;
+}
+
+function makeBumps(cells: readonly Cell[], path: readonly PathPoint[], plan: BumpPlan): Bump[] {
+  return plan.dists.map((d, k) => {
+    const cell = cells[cellAtDist(cells, d)];
+    const along = cell.entryOffset + (d - cell.startDist);
+    const dirX = DIR_X[cell.inDir];
+    const dirZ = DIR_Z[cell.inDir];
+    return {
+      x: snap(cell.cx * CELL + dirX * along),
+      z: snap(cell.cz * CELL + dirZ * along),
+      y: snap(pathHeightAt(path, d)),
+      // A straight runs along a grid axis, so its direction is an exact unit vector.
+      dirX,
+      dirZ,
+      halfLength: snap(plan.halfLengths[k]),
+      halfWidth: snap(plan.halfWidths[k]),
+      height: snap(plan.heights[k]),
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -567,6 +1175,7 @@ function decorSites(rng: Rng, cells: readonly Cell[]): DecorSite[] {
   let frontier: DecorSite[] = cells.map((cell) => ({ cx: cell.cx, cz: cell.cz, ring: 0 }));
   frontier.push({ ...runOffCell(cells), ring: 0 });
   for (const site of frontier) known.set(cellKey(site.cx, site.cz), site);
+  frontier = [...known.values()];
   for (let ring = 1; ring <= DECOR_RINGS; ring++) {
     const next: DecorSite[] = [];
     for (const site of frontier) {
@@ -602,14 +1211,15 @@ export function proposeBlock(rng: Rng, site: DecorSite): DecorBlock {
 /** The accepted blocks plus the lookups that keep them off the road and off each other. */
 class DecorField {
   readonly blocks: DecorBlock[] = [];
-  private readonly walls: readonly Segment[];
-  private readonly wallIndex: WallIndex;
+  private readonly outline: WallIndex;
+  private readonly onRoad: (x: number, z: number) => boolean;
   private readonly placed = new SpatialHash(DECOR_BUCKET);
   private readonly near: number[] = [];
 
-  constructor(walls: readonly Segment[]) {
-    this.walls = walls;
-    this.wallIndex = new WallIndex(walls);
+  /** `outline`: every road edge and closed end, open or not. `onRoad`: is a point on any road in plan? */
+  constructor(outline: readonly Segment[], onRoad: (x: number, z: number) => boolean) {
+    this.outline = new WallIndex(outline);
+    this.onRoad = onRoad;
   }
 
   private crowded(block: DecorBlock): boolean {
@@ -626,9 +1236,9 @@ class DecorField {
   }
 
   /**
-   * Adds the block if it is clear of the road and of other blocks, cutting its height down to what its distance
-   * from the road allows. `onRoadCell` marks blocks that could have landed on the tarmac itself, and blocks
-   * `maxClearance` or more from the road are turned away (pass Infinity to accept any distance).
+   * Adds the block if it is clear of every road (in plan, so never under a bridge) and of other blocks, cutting
+   * its height down to what its distance from the road allows. `onRoadCell` marks blocks that could have landed on
+   * the tarmac itself, and blocks `maxClearance` or more from the road are turned away (Infinity accepts any).
    */
   tryAdd(block: DecorBlock, onRoadCell: boolean, maxClearance: number): boolean {
     if (this.crowded(block)) return false;
@@ -638,9 +1248,9 @@ class DecorField {
     const maxZ = minZ + block.d;
     const wanted = Math.max(RULES.decorMinClearance, block.h / RULES.decorHeightPerClearance);
     const limit = maxClearance < Infinity ? Math.max(wanted, maxClearance) : wanted;
-    const clearance = this.wallIndex.clearance(minX, minZ, maxX, maxZ, limit);
+    const clearance = this.outline.clearance(minX, minZ, maxX, maxZ, limit);
     if (clearance < RULES.decorMinClearance || clearance >= maxClearance) return false;
-    if (onRoadCell && insideWalls(this.walls, block.x, block.z)) return false;
+    if (onRoadCell && this.onRoad(block.x, block.z)) return false;
     // Rounded down, never up: the height must stay inside the clearance rule after snapping.
     block.h = Math.floor(Math.min(block.h, clearance * RULES.decorHeightPerClearance) * 1024) / 1024;
     this.placed.insert(this.blocks.length, minX, minZ, maxX, maxZ);
@@ -666,10 +1276,9 @@ function fillDecor(
   }
 }
 
-function scatterDecor(rng: Rng, cells: readonly Cell[], walls: readonly Segment[]): DecorBlock[] {
+function scatterDecor(rng: Rng, cells: readonly Cell[], field: DecorField): DecorBlock[] {
   const sites = decorSites(rng, cells);
   const target = DECOR_TARGET_MIN + rng.int(DECOR_TARGET_MAX - DECOR_TARGET_MIN + 1);
-  const field = new DecorField(walls);
   // The street front first: the locked camera mostly sees what stands beside the road.
   const front = sites.filter((site) => site.ring <= 1);
   fillDecor(rng, field, front, Math.round(target * DECOR_FRONT_SHARE), DECOR_FRONT_PASSES, DECOR_FRONT_DEPTH);
@@ -682,74 +1291,121 @@ function scatterDecor(rng: Rng, cells: readonly Cell[], walls: readonly Segment[
 // Assembly
 // ---------------------------------------------------------------------------------------------------------------
 
-function boundsOf(walls: readonly Segment[], decor: readonly DecorBlock[]): Level['bounds'] {
-  const bounds = { minX: Infinity, minZ: Infinity, maxX: -Infinity, maxZ: -Infinity };
-  const include = (minX: number, minZ: number, maxX: number, maxZ: number): void => {
-    bounds.minX = Math.min(bounds.minX, minX);
-    bounds.minZ = Math.min(bounds.minZ, minZ);
-    bounds.maxX = Math.max(bounds.maxX, maxX);
-    bounds.maxZ = Math.max(bounds.maxZ, maxZ);
-  };
-  // The walls enclose the path and every prop.
-  for (const w of walls) include(w.ax, w.az, w.ax, w.az);
-  for (const b of decor) include(b.x - b.w / 2, b.z - b.d / 2, b.x + b.w / 2, b.z + b.d / 2);
-  // Half a block size can fall between lattice points: round outwards so the bounds still hold everything.
-  return {
-    minX: Math.floor(bounds.minX * 1024) / 1024 + 0,
-    minZ: Math.floor(bounds.minZ * 1024) / 1024 + 0,
-    maxX: Math.ceil(bounds.maxX * 1024) / 1024 + 0,
-    maxZ: Math.ceil(bounds.maxZ * 1024) / 1024 + 0,
-  };
-}
-
 /** Names of the random streams. Each part of a level draws only from its own. */
 export interface StreamLabels {
   layout: string;
   width: string;
+  elevation: string;
+  edges: string;
   props: string;
+  bumps: string;
+  supports: string;
   decor: string;
 }
 
-export const DEFAULT_STREAMS: StreamLabels = { layout: 'layout', width: 'width', props: 'props', decor: 'decor' };
+export const DEFAULT_STREAMS: StreamLabels = {
+  layout: 'layout',
+  width: 'width',
+  elevation: 'elevation',
+  edges: 'edges',
+  props: 'props',
+  bumps: 'bumps',
+  supports: 'supports',
+  decor: 'decor',
+};
 
 /**
  * One generation attempt, not validated. Exported so tests can show that the streams are independent; the game
- * should call generateLevel.
+ * should call generateTrack / generateLevel.
  */
-export function buildLevel(seed: string, id: string, streams: StreamLabels = DEFAULT_STREAMS): Level {
+export function buildLevel(
+  seed: string,
+  id: string,
+  options: TrackOptions = WEEKLY_OPTIONS,
+  streams: StreamLabels = DEFAULT_STREAMS,
+): Level {
   const rng = new Rng(seed);
-  const cells = cellsFromWalk(walkLayout(rng.fork(streams.layout)));
-  const plan = planWidths(rng.fork(streams.width), cells);
-  const road = buildRoad(sampleCentreline(cells, plan));
-  const lastIndex = road.path.length - 1;
+  const walk = walkLayout(rng.fork(streams.layout), options);
+  const cells = cellsFromWalk(walk);
+  const crossings = crossingInfo(cells, walk.crossings);
+  const nearCrossing = new Set<number>();
+  for (const index of crossings.cells) {
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) nearCrossing.add(cellKey(cells[index].cx + dx, cells[index].cz + dz));
+    }
+  }
+  const plan = planWidths(rng.fork(streams.width), cells, options, nearCrossing);
+  const lastCell = cells[cells.length - 1];
+  const lines = checkpointLines(cells, crossings, lastCell.startDist + lastCell.length, checkpointEvery(options));
+  const gateDists = lines.map((line) => cells[line].startDist);
+  const bumpPlan = planBumps(
+    rng.fork(streams.bumps),
+    cells,
+    plan,
+    crossings,
+    [0, ...gateDists, lastCell.startDist + lastCell.length],
+    options,
+  );
+  const profile = planHeights(rng.fork(streams.elevation), cells, crossings, bumpPlan, options);
+  const road = buildRoad(sampleCentreline(cells, plan), profile);
+  const path = road.path;
+  const lastIndex = path.length - 1;
+  const length = path[lastIndex].dist;
   const startDir = cells[0].outDir;
-  const goalDir = cells[cells.length - 1].inDir;
-  const walls = buildWalls(road, startDir, goalDir);
-  const length = road.path[lastIndex].dist;
-  const decor = scatterDecor(rng.fork(streams.decor), cells, walls);
+  const goalDir = lastCell.inDir;
+  const index = new RoadIndex();
+  index.add(path);
+
+  const checkpoints = lines.map((line) => gateAt(road, cells[line].firstIndex, cells[line].inDir));
+  const goal = gateAt(road, lastIndex, goalDir);
+  // The bumps are known before the edges: a car launched by one flies further off an open edge after it.
+  const bumps = makeBumps(cells, path, bumpPlan);
+  const edges = planEdges(rng.fork(streams.edges), cells, road, index, crossings, gateDists, bumpPlan.dists, bumpsAlong(path, bumps), options);
+
+  const startCap = startCapWalls(road, startDir);
+  const goalCap = goalCapWalls(road, goalDir);
+  const walls: Wall[] = [...startCap];
+  emitEdgeWalls(path, road.left, road.right, edges.leftOpen, edges.rightOpen, walls);
+  walls.push(...goalCap);
+
+  const props = placeProps(rng.fork(streams.props), cells, crossings, edges, path, bumpPlan.dists, options);
+  const supports: Support[] = [];
+  placeSupports(rng.fork(streams.supports), path, index, 0, { spacing: [18, 24] }, supports);
+
+  // Decor keeps clear of every road edge and closed end, open or not, and off every road and run-off in plan.
+  const outline: Segment[] = [...startCap, ...goalCap];
+  for (const edge of [road.left, road.right]) {
+    for (let i = 0; i < lastIndex; i++) outline.push({ ax: edge[i].x, az: edge[i].z, bx: edge[i + 1].x, bz: edge[i + 1].z });
+  }
+  const hits: RoadHit[] = [];
+  const corner = (wall: Wall, end: 'a' | 'b'): Vec2 => (end === 'a' ? { x: wall.ax, z: wall.az } : { x: wall.bx, z: wall.bz });
+  const onRoad = (x: number, z: number): boolean =>
+    index.query(x, z, 0, hits).length > 0 ||
+    insideQuad(road.right[0], corner(startCap[1], 'a'), corner(startCap[1], 'b'), road.left[0], x, z) ||
+    insideQuad(road.left[lastIndex], corner(goalCap[1], 'a'), corner(goalCap[1], 'b'), road.right[lastIndex], x, z);
+  const decor = scatterDecor(rng.fork(streams.decor), cells, new DecorField(outline, onRoad));
+
+  const piece = { path, left: road.left, right: road.right, walls, props: props.props, bumps, supports, decor };
   return {
     id,
     seed,
     genVersion: GEN_VERSION,
-    path: road.path,
-    left: road.left,
-    right: road.right,
-    walls,
-    props: placeProps(rng.fork(streams.props), cells),
-    decor,
-    start: { x: road.path[0].x, z: road.path[0].z, heading: headingOf(startDir) },
-    checkpoints: placeCheckpoints(cells, road, length),
-    goal: gateAt(road, lastIndex, goalDir),
-    bounds: boundsOf(walls, decor),
+    ...piece,
+    leftOpen: edges.leftOpen,
+    rightOpen: edges.rightOpen,
+    bounds: pieceBounds(piece),
+    start: { x: path[0].x, z: path[0].z, heading: headingOf(startDir), y: path[0].y },
+    checkpoints,
+    goal,
     length,
   };
 }
 
 /** Builds and validates one attempt. Returns the reasons it failed instead of the level when it is not usable. */
-function attemptLevel(seed: string, id: string): Level | string[] {
+function attemptLevel(seed: string, id: string, options: TrackOptions): Level | string[] {
   let level: Level;
   try {
-    level = buildLevel(seed, id);
+    level = buildLevel(seed, id, options);
   } catch (error) {
     return [error instanceof Error ? error.message : String(error)];
   }
@@ -758,20 +1414,25 @@ function attemptLevel(seed: string, id: string): Level | string[] {
 }
 
 /**
- * Generates the level for a seed. If an attempt fails validation the seed is extended and tried again, and
- * `Level.seed` records the seed that was actually used.
+ * Generates a level for a seed and a set of options. If an attempt fails validation the seed is extended and tried
+ * again, and `Level.seed` records the seed that was actually used.
  */
-export function generateLevelFromSeed(seed: string, id: string): Level {
+export function generateTrack(seed: string, id: string, options: TrackOptions): Level {
   let failure: string[] = [];
   for (let retry = 0; retry <= MAX_RETRIES; retry++) {
-    const outcome = attemptLevel(retry === 0 ? seed : `${seed}|retry${retry}`, id);
+    const outcome = attemptLevel(retry === 0 ? seed : `${seed}|retry${retry}`, id, options);
     if (!Array.isArray(outcome)) return outcome;
     failure = outcome;
   }
   throw new Error(`no valid level for seed "${seed}" after ${MAX_RETRIES} retries: ${failure.join('; ')}`);
 }
 
+/** A level with the weekly options for any seed. */
+export function generateLevelFromSeed(seed: string, id: string): Level {
+  return generateTrack(seed, id, WEEKLY_OPTIONS);
+}
+
 /** The level for a week id such as "2026-W48". */
 export function generateLevel(id: string): Level {
-  return generateLevelFromSeed(seedForWeek(id), id);
+  return generateTrack(seedForWeek(id), id, WEEKLY_OPTIONS);
 }

@@ -4,15 +4,26 @@
  * the road grows).
  *
  * A line is planned in four steps:
- *   1. `clearLine`, then `appendPath` for every stretch of centreline;
+ *   1. `clearLine`, then `appendPiece` (or `appendPath`) for every stretch of road;
  *   2. `beginPlan`, which works out the direction of travel at each point;
- *   3. any number of `addDodge` (a pillar to pass on its open side) and `capSpeed` (a stretch to take slowly);
+ *   3. any number of `addDodge` (a pillar to pass on its open side), `addBumpCare` (a bump to cross with the wheels
+ *      down) and `capSpeed` (a stretch to take slowly);
  *   4. `layLine` and `planSpeeds`.
  * Per tick a `LineFollower` only finds the car on that line, steers at a point further along it (pure pursuit) and
  * holds the planned speed. Nothing here allocates once the line has its arrays.
+ *
+ * Roads are 2.5D. The line keeps each point's road height, so that:
+ * - where the road passes over or under itself, the car is only ever found on the stretch at its own height;
+ * - the speeds respect the hills: crests are taken slowly enough that the wheels stay down (CREST_UNLOADING), and
+ *   the braking for a bend counts on less deceleration downhill and more uphill;
+ * - open edges (no barrier, a drop to the city floor) are given room: dodges never take the line within
+ *   OPEN_EDGE_CLEARANCE of one, bends near one are taken with less sideways grip in hand, and crests near one with
+ *   more weight on the tyres.
  */
-import { atan, clamp, cos, lerp, sin, smoothstep } from '../core/fixedMath';
-import type { CarParams, CarState, InputState, PathPoint, Prop } from '../types';
+import { PI, atan, clamp, cos, lerp, sin, smoothstep } from '../core/fixedMath';
+import { GRAVITY } from '../sim/car';
+import type { Bump, CarParams, CarState, InputState, PathPoint, Prop, RoadPiece } from '../types';
+import { CROSSING_CLEARANCE } from '../types';
 
 export const TOP_SPEED = 30;
 const MIN_SPEED = 6;
@@ -29,6 +40,27 @@ const CURVATURE_WINDOW = 2;
 /** Gap the driving line keeps between the car's centre and a pillar's surface, and to a wall. */
 const PILLAR_CLEARANCE = 3.5;
 const WALL_CLEARANCE = 2.5;
+/** Gap the driving line keeps between the car's centre and an open edge. */
+const OPEN_EDGE_CLEARANCE = 4.5;
+/** Bends within this many metres of an open edge are taken with this share of LATERAL_ACCEL. */
+const OPEN_EDGE_REACH = 25;
+const OPEN_EDGE_GRIP = 0.75;
+/**
+ * Over a crest the plan lets the ground fall away from under the car with at most this share of gravity, which
+ * leaves a fifth of the car's weight on its tyres (the car takes off at about 1.15 g). Near an open edge, less.
+ */
+export const CREST_UNLOADING = 0.8;
+const OPEN_EDGE_CREST_UNLOADING = 0.55;
+/** Vertical curvature is read over this many metres either side of a point (path points are 2-4 m apart). */
+const CREST_SPAN = 6;
+/** Least braking the plan counts on, however steep the descent, m/s². */
+const MIN_BRAKE_DECEL = 2;
+/** A bump's speed is reached this far before its ridge begins, m. */
+const BUMP_LEAD = 3;
+/** A line point is at the car's level when within this of the car's wheels, m. */
+const HEIGHT_MATCH = CROSSING_CLEARANCE / 2;
+/** Penalty (m²) for a line point not at the car's level, so that one which is always wins. */
+const OFF_LEVEL = 1e12;
 /** The line starts to move over this far before a pillar, holds its offset this far around it, and returns. */
 const DODGE_LEAD = 45;
 const DODGE_HOLD = 6;
@@ -66,7 +98,11 @@ export interface DriveLine {
   tz: Float64Array;
   /** Distance along the centreline. */
   dist: Float64Array;
+  /** Road surface height. */
+  y: Float64Array;
   halfWidth: Float64Array;
+  /** Open edges of the segment from this point to the next: bit 0 left, bit 1 right. */
+  open: Uint8Array;
   speed: Float64Array;
   /** Planning scratch: sideways offset of the line from the centreline, speed limit, curvature. */
   offset: Float64Array;
@@ -86,7 +122,11 @@ function allocate(line: DriveLine, capacity: number): void {
   line.tx = grow(line.tx);
   line.tz = grow(line.tz);
   line.dist = grow(line.dist);
+  line.y = grow(line.y);
   line.halfWidth = grow(line.halfWidth);
+  const open = new Uint8Array(capacity);
+  open.set(line.open.subarray(0, keep));
+  line.open = open;
   line.speed = grow(line.speed);
   line.offset = grow(line.offset);
   line.cap = grow(line.cap);
@@ -103,7 +143,9 @@ export function createDriveLine(capacity: number): DriveLine {
     tx: none,
     tz: none,
     dist: none,
+    y: none,
     halfWidth: none,
+    open: new Uint8Array(0),
     speed: none,
     offset: none,
     cap: none,
@@ -117,7 +159,10 @@ export function clearLine(line: DriveLine): void {
   line.count = 0;
 }
 
-/** Appends `path[from..]` to the centreline. Pass 1 for a chunk whose first point repeats the previous chunk's last. */
+/**
+ * Appends `path[from..]` to the centreline, with no open edges. Pass 1 for a chunk whose first point repeats the
+ * previous chunk's last.
+ */
 export function appendPath(line: DriveLine, path: readonly PathPoint[], from = 0): void {
   const needed = line.count + path.length - from;
   if (needed > line.x.length) allocate(line, Math.max(needed, 2 * line.x.length));
@@ -127,10 +172,24 @@ export function appendPath(line: DriveLine, path: readonly PathPoint[], from = 0
     line.x[at] = p.x;
     line.z[at] = p.z;
     line.dist[at] = p.dist;
+    line.y[at] = p.y ?? 0;
     line.halfWidth[at] = p.halfWidth;
+    line.open[at] = 0;
     at++;
   }
   line.count = at;
+}
+
+/** Appends a road piece's centreline from `from` on, with its open edges. */
+export function appendPiece(line: DriveLine, piece: RoadPiece, from = 0): void {
+  const start = line.count;
+  appendPath(line, piece.path, from);
+  const left = piece.leftOpen;
+  const right = piece.rightOpen;
+  if (left === undefined || right === undefined) return;
+  for (let i = from; i < piece.path.length; i++) {
+    line.open[start + i - from] = (left[i] === true ? 1 : 0) | (right[i] === true ? 2 : 0);
+  }
 }
 
 /** Works out the direction of travel at each centreline point, and forgets earlier dodges and speed caps. */
@@ -149,14 +208,19 @@ export function beginPlan(line: DriveLine): void {
   }
 }
 
-/** Index of the line point nearest to (x, z) among from..to. */
-function nearestOnLine(line: DriveLine, from: number, to: number, x: number, z: number): number {
+/**
+ * Index of the line point nearest to (x, z) among from..to, preferring points within HEIGHT_MATCH of `y` (pass NaN
+ * to ignore heights): where the road crosses itself, the stretch at the car's own level.
+ */
+function nearestOnLine(line: DriveLine, from: number, to: number, x: number, z: number, y: number): number {
   let best = from;
   let bestSq = Infinity;
+  const level = y === y;
   for (let i = from; i <= to; i++) {
     const dx = line.x[i] - x;
     const dz = line.z[i] - z;
-    const sq = dx * dx + dz * dz;
+    let sq = dx * dx + dz * dz;
+    if (level && !(Math.abs(line.y[i] - y) <= HEIGHT_MATCH)) sq += OFF_LEVEL;
     if (sq < bestSq) {
       bestSq = sq;
       best = i;
@@ -169,8 +233,8 @@ function nearestOnLine(line: DriveLine, from: number, to: number, x: number, z: 
  * Distance along the road of the point (x, z), measured at the nearest centreline point. Only meaningful between
  * `beginPlan` and `layLine`, while the line is still the centreline.
  */
-export function stationOf(line: DriveLine, x: number, z: number): number {
-  const at = nearestOnLine(line, 0, line.count - 1, x, z);
+export function stationOf(line: DriveLine, x: number, z: number, y = NaN): number {
+  const at = nearestOnLine(line, 0, line.count - 1, x, z, y);
   return line.dist[at] + (x - line.x[at]) * line.tx[at] + (z - line.z[at]) * line.tz[at];
 }
 
@@ -189,7 +253,7 @@ function dodgeOffset(lateral: number, radius: number, halfWidth: number): number
 
 /** Adds one pillar's sidestep to the per-point offsets: eased in before it, held past it, eased out after. */
 export function addDodge(line: DriveLine, prop: Prop): void {
-  const at = nearestOnLine(line, 0, line.count - 1, prop.x, prop.z);
+  const at = nearestOnLine(line, 0, line.count - 1, prop.x, prop.z, prop.y ?? NaN);
   const dx = prop.x - line.x[at];
   const dz = prop.z - line.z[at];
   const along = line.dist[at] + dx * line.tx[at] + dz * line.tz[at];
@@ -212,11 +276,41 @@ export function capSpeed(line: DriveLine, fromDist: number, toDist: number, spee
   }
 }
 
-/** Moves the line off the centreline by the dodges collected so far, never closer to a wall than it should be. */
+/**
+ * Fastest a car can cross a bump with its wheels pressed to the ground by at least (1 - unloading) of its weight.
+ * The ridge is a raised cosine, sharpest at the crest: there the ground falls away at
+ * speed² x height x (PI / halfLength)² / 2.
+ */
+export function bumpSpeed(bump: Bump, unloading: number = CREST_UNLOADING): number {
+  if (!(bump.height > 0)) return Infinity;
+  return (bump.halfLength / PI) * Math.sqrt((2 * unloading * GRAVITY) / bump.height);
+}
+
+/** The plan crosses `bump` no faster than bumpSpeed, reached BUMP_LEAD metres before its ridge begins. */
+export function addBumpCare(line: DriveLine, bump: Bump): void {
+  const crest = stationOf(line, bump.x, bump.z, bump.y ?? NaN);
+  capSpeed(line, crest - bump.halfLength - BUMP_LEAD, crest + bump.halfLength, bumpSpeed(bump));
+}
+
+/** Whether an open edge is within OPEN_EDGE_REACH metres along the road of point i. */
+function nearOpenEdge(line: DriveLine, i: number): boolean {
+  const d = line.dist[i];
+  for (let j = i; j >= 0 && line.dist[j] >= d - OPEN_EDGE_REACH; j--) if (line.open[j] !== 0) return true;
+  for (let j = i + 1; j < line.count && line.dist[j] <= d + OPEN_EDGE_REACH; j++) if (line.open[j] !== 0) return true;
+  return false;
+}
+
+/**
+ * Moves the line off the centreline by the dodges collected so far, never closer to a wall than it should be, nor
+ * to an open edge.
+ */
 export function layLine(line: DriveLine): void {
   for (let i = 0; i < line.count; i++) {
-    const reach = Math.max(0, line.halfWidth[i] - WALL_CLEARANCE);
-    const offset = clamp(line.offset[i], -reach, reach);
+    const open = line.open[i] | (i > 0 ? line.open[i - 1] : 0);
+    const half = line.halfWidth[i];
+    const leftReach = Math.max(0, half - ((open & 1) !== 0 ? OPEN_EDGE_CLEARANCE : WALL_CLEARANCE));
+    const rightReach = Math.max(0, half - ((open & 2) !== 0 ? OPEN_EDGE_CLEARANCE : WALL_CLEARANCE));
+    const offset = clamp(line.offset[i], -leftReach, rightReach);
     line.x[i] = line.x[i] - line.tz[i] * offset;
     line.z[i] = line.z[i] + line.tx[i] * offset;
   }
@@ -235,7 +329,42 @@ function curvatureAt(line: DriveLine, i: number): number {
   return product > 0 ? (2 * Math.abs(ax * bz - az * bx)) / product : 0;
 }
 
-/** The fastest each point may be taken, then a backwards sweep so the car is already slow when a bend arrives. */
+/** Index of the last point at least `span` metres before point i along the road (or 0). */
+function pointBefore(line: DriveLine, i: number, span: number): number {
+  const d = line.dist[i] - span;
+  let j = i;
+  while (j > 0 && line.dist[j] > d) j--;
+  return j;
+}
+
+/** Index of the first point at least `span` metres after point i along the road (or the last). */
+function pointAfter(line: DriveLine, i: number, span: number): number {
+  const d = line.dist[i] + span;
+  let j = i;
+  while (j < line.count - 1 && line.dist[j] < d) j++;
+  return j;
+}
+
+/**
+ * How sharply the road falls away over a crest at point i (1/m; 0 in a dip or on an even grade): the change of
+ * grade from the CREST_SPAN metres before it to the CREST_SPAN metres after it, per metre.
+ */
+function crestCurvature(line: DriveLine, i: number): number {
+  const a = pointBefore(line, i, CREST_SPAN);
+  const b = pointAfter(line, i, CREST_SPAN);
+  const runIn = line.dist[i] - line.dist[a];
+  const runOut = line.dist[b] - line.dist[i];
+  if (!(runIn > 0 && runOut > 0)) return 0;
+  const gradeIn = (line.y[i] - line.y[a]) / runIn;
+  const gradeOut = (line.y[b] - line.y[i]) / runOut;
+  const fall = gradeIn - gradeOut;
+  return fall > 0 ? fall / (0.5 * (runIn + runOut)) : 0;
+}
+
+/**
+ * The fastest each point may be taken (bends, width, crests, open edges, caps), then a backwards sweep so the car
+ * is already slow when a bend arrives, braking less hard downhill.
+ */
 export function planSpeeds(line: DriveLine): void {
   const last = line.count - 1;
   const curvature = line.curvature;
@@ -246,12 +375,23 @@ export function planSpeeds(line: DriveLine): void {
     const to = Math.min(i + CURVATURE_WINDOW, last);
     for (let j = from; j <= to; j++) sharpest = Math.max(sharpest, curvature[j]);
     const width = clamp(line.halfWidth[i] / FULL_SPEED_HALF_WIDTH, MIN_WIDTH_FACTOR, 1);
-    const cornering = sharpest > 0 ? Math.sqrt((LATERAL_ACCEL * width) / sharpest) : TOP_SPEED;
-    line.speed[i] = Math.min(clamp(cornering, MIN_SPEED, TOP_SPEED * width), line.cap[i]);
+    const exposed = nearOpenEdge(line, i);
+    const grip = LATERAL_ACCEL * width * (exposed ? OPEN_EDGE_GRIP : 1);
+    const cornering = sharpest > 0 ? Math.sqrt(grip / sharpest) : TOP_SPEED;
+    let speed = Math.min(clamp(cornering, MIN_SPEED, TOP_SPEED * width), line.cap[i]);
+    const crest = crestCurvature(line, i);
+    if (crest > 0) {
+      const unloading = exposed ? OPEN_EDGE_CREST_UNLOADING : CREST_UNLOADING;
+      speed = Math.min(speed, Math.max(MIN_SPEED, Math.sqrt((unloading * GRAVITY) / crest)));
+    }
+    line.speed[i] = speed;
   }
   for (let i = last - 1; i >= 0; i--) {
     const gap = line.dist[i + 1] - line.dist[i];
-    const entry = Math.sqrt(line.speed[i + 1] * line.speed[i + 1] + 2 * BRAKE_DECEL * gap);
+    // Uphill (rise > 0) gravity helps the brakes; downhill it works against them.
+    const grade = gap > 0 ? (line.y[i + 1] - line.y[i]) / gap : 0;
+    const decel = Math.max(MIN_BRAKE_DECEL, BRAKE_DECEL + GRAVITY * grade);
+    const entry = Math.sqrt(line.speed[i + 1] * line.speed[i + 1] + 2 * decel * gap);
     if (entry < line.speed[i]) line.speed[i] = entry;
   }
 }
@@ -291,7 +431,7 @@ export class LineFollower {
    */
   drive(car: CarState, params: CarParams, input: InputState): number {
     const line = this.line;
-    this.locate(car.x, car.z);
+    this.locate(car.x, car.z, car.y);
     const index = this.index;
     const along = (car.x - line.x[index]) * line.tx[index] + (car.z - line.z[index]) * line.tz[index];
     const progress = line.dist[index] + along;
@@ -307,14 +447,19 @@ export class LineFollower {
     return dx * dx + dz * dz;
   }
 
-  private locate(x: number, z: number): void {
+  /**
+   * Finds the car on the line near where it was; anywhere on the line, at the car's level, when it is not near
+   * there (it was moved). Heights keep it on its own stretch where the road crosses itself.
+   */
+  private locate(x: number, z: number, y: number): void {
     const line = this.line;
     const last = line.count - 1;
     const from = Math.max(Math.min(this.index, last) - SEARCH_BACK, 0);
     const to = Math.min(this.index + SEARCH_AHEAD, last);
-    this.index = nearestOnLine(line, from, to, x, z);
+    this.index = nearestOnLine(line, from, to, x, z, y);
     const reach = line.halfWidth[this.index] + LOST_MARGIN;
-    if (this.distanceSqTo(this.index, x, z) > reach * reach) this.index = nearestOnLine(line, 0, last, x, z);
+    const lost = this.distanceSqTo(this.index, x, z) > reach * reach || !(Math.abs(line.y[this.index] - y) <= HEIGHT_MATCH);
+    if (lost) this.index = nearestOnLine(line, 0, last, x, z, y);
   }
 
   /** Sets the aim point: the place `ahead` metres further along the line than `progress`. */

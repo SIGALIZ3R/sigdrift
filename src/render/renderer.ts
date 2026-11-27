@@ -1,12 +1,13 @@
 import { AmbientLight, Color, DirectionalLight, Scene, WebGLRenderer } from 'three';
+import { TERRAIN_Y } from '../types';
 import type {
   CarParams,
   CarState,
   CollisionEvent,
-  EndlessState,
   GameRenderer,
   Level,
   RenderFrame,
+  ScoreState,
   Settings,
   TrackChunk,
 } from '../types';
@@ -16,7 +17,7 @@ import { createEndlessVisual } from './endlessMesh';
 import { buildLevelVisual } from './levelMesh';
 import type { LevelVisual } from './levelMesh';
 import { createScreenOverlay } from './overlay';
-import { BACKGROUND } from './palette';
+import { BACKGROUND, proximityTint } from './palette';
 import { createPost } from './post';
 import type { PostFx } from './post';
 import { ResolutionWatchdog, budgetPixelRatio } from './quality';
@@ -73,6 +74,28 @@ const REVIVE_RATE = 9;
 /** Below this the flash and the dimming count as finished and cost nothing more. */
 const FEEDBACK_EPSILON = 0.004;
 
+// Going over an edge: a red flash, and streaks rushing up the screen while the car drops.
+const FALL_FLASH_DECAY = 2.2;
+/** The car counts as dropping once it is this far below the road it was last on, falling at least this fast. */
+const FALL_DEPTH = 1;
+const FALL_SPEED = 2;
+const FALL_STREAK_RISE = 10;
+const FALL_STREAK_DECAY = 2.5;
+/**
+ * The view follows the road the car is on, not the car: once the car drops off the road it sinks only this far
+ * after it, so the drop reads as a drop and the camera never dives into the city floor, m.
+ */
+const FALL_CAMERA_LAG = 2.5;
+
+// Drifting close to a wall: sparks streaming off the side of the car nearest the wall.
+/** Proximity (0..1) above which the sparks start. */
+const PROXIMITY_MIN = 0.5;
+/** Sparks per second at the threshold and when brushing the wall. */
+const PROXIMITY_RATE_MIN = 18;
+const PROXIMITY_RATE_MAX = 110;
+const PROXIMITY_RATE_REDUCED = 0.3;
+const PROXIMITY_MAX_PER_FRAME = 10;
+
 class NeonRenderer implements GameRenderer {
   readonly canvas: HTMLCanvasElement;
   private readonly gl: WebGLRenderer;
@@ -86,8 +109,10 @@ class NeonRenderer implements GameRenderer {
   private readonly overlay = createScreenOverlay();
   /** Materials shared by the weekly level and every chunk of endless road. */
   private readonly shared = createTrackShared();
-  /** The endless road. Empty and hidden while a weekly level is on show; also the height of the ground. */
+  /** The endless road. Empty and hidden while a fixed level is on show. */
   private readonly track = createEndlessVisual(this.shared);
+  /** Every road on show (level or chunks): how high the road is under any point. */
+  private readonly surface = this.shared.surface;
   private level: LevelVisual | null = null;
   private post: PostFx | null = null;
 
@@ -106,6 +131,18 @@ class NeonRenderer implements GameRenderer {
   private wasDead = false;
   /** 0..1, how far the picture has dimmed for a run that is over. */
   private dim = 0;
+  /** Red flash for going over an edge, 1 at the moment it is counted and fading to 0. */
+  private fallFlash = 0;
+  /** Strength of the falling streaks, eased. */
+  private fallStreaks = 0;
+  private seenFallTick = -1;
+  /** Height of the road the car was last on: what the camera follows. NaN until the first frame. */
+  private trackY = Number.NaN;
+  /** Height of the car on the last sim tick, for the effects laid at sim rate. */
+  private simCarY = 0;
+  /** Proximity sparks owed but not yet thrown (fractions carry over between frames). */
+  private proximityDue = 0;
+  private readonly proximityColor = new Color();
   private readonly watchdog = new ResolutionWatchdog();
   /** Draw the smoke and spark meshes once, invisibly, on the next frame: see `warmUp`. */
   private warmUpPending = true;
@@ -158,11 +195,12 @@ class NeonRenderer implements GameRenderer {
 
   onSimTick(car: CarState, params: CarParams, collision: CollisionEvent | null): void {
     const airborne = car.airborne === true;
+    this.simCarY = car.y || 0;
     if (airborne) this.airVy = car.vy || 0;
     else if (this.wasAirborne) this.onLanding(car, params);
     this.wasAirborne = airborne;
 
-    this.skid.lay(car, params, this.track);
+    this.skid.lay(car, params, this.surface);
     if (this.high && !airborne) this.emitSmoke(car, params);
     this.ticksSinceSparks++;
     if (collision) this.onCollision(collision);
@@ -174,6 +212,7 @@ class NeonRenderer implements GameRenderer {
     this.sparks.clear();
     this.wasAirborne = false;
     this.flash = 0;
+    this.proximityDue = 0;
   }
 
   render(frame: RenderFrame): void {
@@ -181,19 +220,31 @@ class NeonRenderer implements GameRenderer {
     this.time += dt;
     const endless = frame.endless ?? null;
     const dead = endless !== null && endless.phase === 'dead';
-    this.updateFeedback(endless, dead, dt);
+    const trackY = this.followTrack(frame);
+    this.updateFeedback(frame, dead, trackY, dt);
     const calm = this.reducedFlash;
-    const flash = this.flash * (calm ? CRASH_REDUCED : 1);
+    const flash = Math.max(this.flash, this.fallFlash) * (calm ? CRASH_REDUCED : 1);
+    const { pose } = frame;
+    const carY = frame.height || 0;
 
-    this.car.update(frame, this.track, flash);
+    this.car.update(frame, this.surface, this.flash * (calm ? CRASH_REDUCED : 1));
     if (frame.run) this.level?.update(frame.run, this.time, calm);
-    this.track.update(frame.pose.x, frame.pose.z);
-    // A car that flies off the road must not vanish behind the scenery, nor lie wrecked inside it unseen.
-    const offRoad = endless !== null && endless.deathCause === 'offTrack';
-    this.track.seeThrough(frame.pose.x, frame.height, frame.pose.z, frame.car.airborne === true || offRoad, dt);
-    // Ground plane only: a jump moves the car up the screen, never the camera. No look-ahead once the run is over.
-    this.follow.update(frame.pose, frame.car, dt, !dead);
-    this.overlay.update(this.follow.camera, flash * CRASH_VIGNETTE, this.dim * (calm ? DEAD_DIM_REDUCED : DEAD_DIM));
+    this.track.update(pose.x, pose.z);
+    // The car must never vanish behind a bridge, a raised stretch of road or a building.
+    this.shared.fader.update(pose.x, carY, pose.z, dt);
+    this.shared.sinker.update(pose.x, carY, pose.z, dt);
+    // The view follows the road the car is on: a jump or a drop moves the car on screen, not the camera.
+    this.follow.update(pose, frame.car, dt, !dead, trackY);
+    const score = frame.run ? frame.run.score : endless ? endless.score : null;
+    if (score) this.emitProximitySparks(frame, score, dt);
+    this.overlay.update(
+      this.follow.camera,
+      flash * CRASH_VIGNETTE,
+      this.dim * (calm ? DEAD_DIM_REDUCED : DEAD_DIM),
+      this.fallStreaks,
+      dt,
+      calm,
+    );
     this.post?.setSaturation(this.dim * (calm ? DEAD_SATURATION_REDUCED : DEAD_SATURATION));
     this.smoke.update(dt);
     this.sparks.update(dt);
@@ -286,26 +337,121 @@ class NeonRenderer implements GameRenderer {
     this.follow.snap();
     this.warmUpPending = true;
     this.seenCrashTick = -1;
+    this.seenFallTick = -1;
     this.wasDead = false;
     this.dim = 0;
+    this.fallFlash = 0;
+    this.fallStreaks = 0;
+    this.trackY = Number.NaN;
   }
 
-  /** Advances the crash flash and the end-of-run dimming from the endless state (null in a weekly run). */
-  private updateFeedback(endless: EndlessState | null, dead: boolean, dt: number): void {
+  /**
+   * Height the camera follows: the road the car is on. While the car is in the air above it (a jump) the view
+   * holds; once the car drops below it (off an edge) the view sinks only FALL_CAMERA_LAG after it.
+   */
+  private followTrack(frame: RenderFrame): number {
+    const h = frame.height || 0;
+    if (!Number.isFinite(this.trackY)) this.trackY = Math.max(h, 0);
+    const onRoad = frame.car.airborne !== true && h > TERRAIN_Y + 0.5;
+    if (onRoad) {
+      this.trackY = h;
+      return h;
+    }
+    return h >= this.trackY ? this.trackY : Math.max(h, this.trackY - FALL_CAMERA_LAG);
+  }
+
+  /** Advances the crash and fall flashes, the falling streaks and the end-of-run dimming. */
+  private updateFeedback(frame: RenderFrame, dead: boolean, trackY: number, dt: number): void {
+    const endless = frame.endless ?? null;
+    const run = frame.run ?? null;
     const crashTick = endless ? endless.lastCrashTick : -1;
     if (crashTick !== this.seenCrashTick) {
       // Going back to -1 is a restart, not a crash.
       if (crashTick >= 0) this.flash = 1;
       this.seenCrashTick = crashTick;
     }
-    if (dead && !this.wasDead) this.flash = Math.max(this.flash, DEATH_FLASH);
+    const fallTick = run ? run.lastFallTick : -1;
+    if (fallTick !== this.seenFallTick) {
+      if (fallTick >= 0) this.fallFlash = 1;
+      this.seenFallTick = fallTick;
+    }
+    if (dead && !this.wasDead) {
+      this.flash = Math.max(this.flash, DEATH_FLASH);
+      if (endless && endless.deathCause === 'offTrack') this.fallFlash = 1;
+    }
     this.wasDead = dead;
 
     this.flash *= Math.exp(-CRASH_FLASH_DECAY * dt);
     if (this.flash < FEEDBACK_EPSILON) this.flash = 0;
+    this.fallFlash *= Math.exp(-FALL_FLASH_DECAY * dt);
+    if (this.fallFlash < FEEDBACK_EPSILON) this.fallFlash = 0;
+
+    // Streaks while the car is visibly dropping below the road, and for a moment after a counted fall.
+    const car = frame.car;
+    const h = frame.height || 0;
+    const dropping =
+      (car.airborne === true && h < this.trackY - FALL_DEPTH && (car.vy || 0) < -FALL_SPEED) ||
+      (run !== null && run.respawnInTicks > 0 && h < trackY - FALL_DEPTH);
+    const streakTarget = Math.max(dropping ? 1 : 0, this.fallFlash * 0.8);
+    const rate = streakTarget > this.fallStreaks ? FALL_STREAK_RISE : FALL_STREAK_DECAY;
+    this.fallStreaks += (streakTarget - this.fallStreaks) * (1 - Math.exp(-rate * dt));
+    if (this.fallStreaks < FEEDBACK_EPSILON) this.fallStreaks = 0;
+
     const target = dead ? 1 : 0;
     this.dim += (target - this.dim) * (1 - Math.exp(-(dead ? DEAD_RATE : REVIVE_RATE) * dt));
     if (!dead && this.dim < FEEDBACK_EPSILON) this.dim = 0;
+  }
+
+  /**
+   * The reward for drifting close to a wall: sparks streaming off the side of the car nearest the road edge, more
+   * of them the closer it is, tinted cyan to magenta to amber as the multiplier climbs.
+   */
+  private emitProximitySparks(frame: RenderFrame, score: ScoreState, dt: number): void {
+    const car = frame.car;
+    if (!score.drifting || !(score.proximity > PROXIMITY_MIN) || car.airborne === true || !(dt > 0)) {
+      this.proximityDue = 0;
+      return;
+    }
+    const closeness = Math.min(1, (score.proximity - PROXIMITY_MIN) / (1 - PROXIMITY_MIN));
+    const rate =
+      (PROXIMITY_RATE_MIN + (PROXIMITY_RATE_MAX - PROXIMITY_RATE_MIN) * closeness) *
+      (this.reducedFlash ? PROXIMITY_RATE_REDUCED : 1);
+    this.proximityDue = Math.min(PROXIMITY_MAX_PER_FRAME, this.proximityDue + rate * dt);
+    if (this.proximityDue < 1) return;
+
+    const { pose, params } = frame;
+    const carY = frame.height || 0;
+    const surface = this.surface;
+    surface.heightAt(pose.x, pose.z, carY);
+    const road = surface.hit;
+    if (!road) return;
+    // Towards the nearer road edge, where the walls are: the road's right is (-dirZ, dirX).
+    const side = road.lateral >= 0 ? 1 : -1;
+    const nx = -road.dirZ * side;
+    const nz = road.dirX * side;
+    const cos = Math.cos(pose.heading);
+    const sin = Math.sin(pose.heading);
+    const color = proximityTint(score.multiplier, this.proximityColor);
+    while (this.proximityDue >= 1) {
+      this.proximityDue -= 1;
+      // Cosmetic only, so Math.random is fine. Mostly from the rear half, where the tail swings out.
+      const along = -params.cgToRear + Math.random() * (params.cgToRear + params.cgToFront * 0.5);
+      const out = params.halfWidth * 0.95;
+      const x = pose.x + cos * along + nx * out;
+      const z = pose.z + sin * along + nz * out;
+      const push = 1.5 + Math.random() * 3.5;
+      this.sparks.emit(
+        x,
+        carY + 0.2 + Math.random() * 0.4,
+        z,
+        -car.vx * 0.3 + nx * push + (Math.random() - 0.5) * 2,
+        1.2 + Math.random() * 3.2,
+        -car.vz * 0.3 + nz * push + (Math.random() - 0.5) * 2,
+        0.22 + Math.random() * 0.3,
+        carY + 0.04,
+        color,
+      );
+    }
   }
 
   /** The car is the only lit object; every other surface is unlit with baked shading. */
@@ -330,7 +476,7 @@ class NeonRenderer implements GameRenderer {
         car.vx * SMOKE_DRIFT,
         car.vz * SMOKE_DRIFT,
         intensity,
-        this.track.heightAt(car.x, car.z),
+        this.surface.heightAt(car.x, car.z, car.y || 0),
       );
     }
   }
@@ -341,7 +487,7 @@ class NeonRenderer implements GameRenderer {
     if (impact < LANDING_MIN) return;
     const cos = Math.cos(car.heading);
     const sin = Math.sin(car.heading);
-    const groundY = this.track.heightAt(car.x, car.z);
+    const groundY = this.surface.heightAt(car.x, car.z, car.y || 0);
 
     const puffs = LANDING_PUFFS_MIN + Math.round(impact * LANDING_PUFFS_EXTRA);
     for (let i = 0; i < puffs; i++) {
@@ -375,7 +521,7 @@ class NeonRenderer implements GameRenderer {
     if (hit.impact < SPARK_MIN_IMPACT || this.ticksSinceSparks < cooldown) return;
     this.ticksSinceSparks = 0;
     const count = this.reducedFlash ? SPARK_COUNT_REDUCED : Math.min(SPARK_COUNT_MAX, 6 + Math.floor(hit.impact * 1.2));
-    this.sparks.burst(hit.x, hit.z, hit.nx, hit.nz, hit.impact, count, this.track.heightAt(hit.x, hit.z));
+    this.sparks.burst(hit.x, hit.z, hit.nx, hit.nz, hit.impact, count, this.surface.heightAt(hit.x, hit.z, this.simCarY));
     if (!this.reducedFlash) this.follow.addShake(Math.min(1, hit.impact / SHAKE_IMPACT_REF) * SHAKE_METRES);
   }
 }

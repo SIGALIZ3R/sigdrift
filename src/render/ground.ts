@@ -1,19 +1,24 @@
 import type { Bump } from '../types';
 
 /**
- * Height of the ground, for everything the renderer stands on it: the car's shadow, skid marks, smoke, sparks.
- * The weekly level is flat; the endless road has bumps (see `Bump` in types.ts for the shape).
+ * Height of the road surface, for everything the renderer stands on it: the car's shadow, skid marks, smoke,
+ * sparks. Roads sit at heights and cross over each other, so a query names the height it is asked from: the
+ * answer is the surface a car at `fromY` would stand on (see ROAD SURFACE HEIGHT in types.ts).
  *
- * This is the renderer's own copy of the formula, with Math.cos: it only has to agree with the simulation to well
- * under a millimetre, not bit for bit.
+ * This is the renderer's own copy of the bump formula, with Math.cos: it only has to agree with the simulation to
+ * well under a millimetre, not bit for bit.
  */
 export interface Ground {
-  heightAt(x: number, z: number): number;
+  /** Surface at (x, z) for something at height `fromY` (the highest surface when left out). */
+  heightAt(x: number, z: number, fromY?: number): number;
 }
 
 export const FLAT_GROUND: Ground = {
   heightAt: () => 0,
 };
+
+/** A bump only lifts a road whose surface is within this of the bump's own `y` (see Bump in types.ts), m. */
+export const BUMP_BAND = 1.5;
 
 /**
  * A road edge that lies exactly on a bump's side limit must not fall off it through rounding: the road surface
@@ -24,13 +29,17 @@ const EDGE_TOLERANCE = 1e-3;
 /** Slope of the ground at the point last passed to `bumpHeightAt`: metres of rise per metre along x and z. */
 export const bumpSlope = { x: 0, z: 0 };
 
-/** Ground height at (x, z) from the first `count` bumps of `bumps`: the highest one that covers the point. */
-export function bumpHeightAt(bumps: readonly Bump[], count: number, x: number, z: number): number {
+/**
+ * Height a bump adds at (x, z) to a road whose own surface there is `baseY`, from the first `count` bumps of
+ * `bumps`: the highest one that covers the point. 0 where none does.
+ */
+export function bumpHeightAt(bumps: readonly Bump[], count: number, x: number, z: number, baseY: number): number {
   let best = 0;
   bumpSlope.x = 0;
   bumpSlope.z = 0;
   for (let i = 0; i < count; i++) {
     const bump = bumps[i];
+    if (Math.abs(bump.y - baseY) > BUMP_BAND) continue;
     const dx = x - bump.x;
     const dz = z - bump.z;
     const u = dx * bump.dirX + dz * bump.dirZ;
@@ -81,8 +90,8 @@ function nearOne(bump: Bump, ax: number, az: number, bx: number, bz: number, pad
 
 /**
  * How finely the stretch from a to b has to be cut up: the shortest `bumpStep` among the bumps it may touch once
- * widened by `pad` metres all round, or 0 when it touches none. When this says 0 the ground is flat everywhere
- * within `pad` of the stretch.
+ * widened by `pad` metres all round, or 0 when it touches none. Only bumps whose `y` is within BUMP_BAND of the
+ * stretch's height range [y0, y1] count. When this says 0 the road is free of bumps within `pad` of the stretch.
  */
 export function stepNear(
   bumps: readonly Bump[],
@@ -92,11 +101,17 @@ export function stepNear(
   bx: number,
   bz: number,
   pad: number,
+  y0 = -Infinity,
+  y1 = Infinity,
 ): number {
   let step = 0;
+  const lo = Math.min(y0, y1) - BUMP_BAND;
+  const hi = Math.max(y0, y1) + BUMP_BAND;
   for (let i = 0; i < count; i++) {
-    if (!nearOne(bumps[i], ax, az, bx, bz, pad)) continue;
-    const s = bumpStep(bumps[i]);
+    const bump = bumps[i];
+    if (bump.y < lo || bump.y > hi) continue;
+    if (!nearOne(bump, ax, az, bx, bz, pad)) continue;
+    const s = bumpStep(bump);
     if (step === 0 || s < step) step = s;
   }
   return step;

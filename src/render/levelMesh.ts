@@ -1,18 +1,31 @@
 import { Color, DynamicDrawUsage, Group, Mesh } from 'three';
 import type { BoxGeometry, BufferAttribute, BufferGeometry, InstancedMesh, MeshBasicMaterial } from 'three';
-import type { Bump, Gate, Level, Pose, RunState, Vec2 } from '../types';
+import { TERRAIN_Y } from '../types';
+import type { Gate, Level, Pose, RunState, Vec2 } from '../types';
 import { GeometryBuilder } from './geometry';
+import { blockSet } from './occlusion';
+import type { BlockSet, DeckSections } from './occlusion';
 import { GATE, SURFACE } from './palette';
-import { Y_PAINT, addRoadPiece, addRoadPieceGlow, buildDecorMesh, closedEndCorner } from './roadPiece';
+import {
+  Y_PAINT,
+  addRoadPiece,
+  addRoadPieceGlow,
+  addRoadShadow,
+  allocateSections,
+  buildDecorMesh,
+  closedEndCorner,
+} from './roadPiece';
 import type { RoadPiece, TrackShared } from './roadPiece';
+import { PathIndex } from './surface';
 
 // Kept for the modules that grew up importing the builder from here.
 export { GeometryBuilder, builderMaterial } from './geometry';
 
-// Heights of the flat layers, kept well apart so they never z-fight. The road, its glow and its paint are in
-// roadPiece.ts (0.01 to 0.03); skid marks sit at 0.04 (see skid.ts).
-export const Y_GROUND = -0.06;
-export const Y_GRID = -0.04;
+// The city floor, far below every road. The road, its glow and its paint are in roadPiece.ts (0.01 to 0.03 above
+// the road surface); skid marks sit at 0.04 above it (see skid.ts); deck shadows at TERRAIN_Y + 0.03.
+export const Y_GROUND = TERRAIN_Y - 0.02;
+export const Y_GRID = TERRAIN_Y;
+/** Gate bars, above the road surface. */
 const Y_GATE = 0.06;
 
 function smoothstep(edge0: number, edge1: number, x: number): number {
@@ -104,6 +117,12 @@ function addGrid(b: GeometryBuilder, level: Level): void {
 interface RoadOutline {
   left: Vec2[];
   right: Vec2[];
+  heights: number[];
+  /** Outline points added before path[0]. */
+  lead: number;
+  /** How far the walled ends reach past the first and the last path point, m. */
+  runStart: number;
+  runEnd: number;
 }
 
 /**
@@ -112,19 +131,33 @@ interface RoadOutline {
  * added here, so the surface and its edge strips reach every wall the car can.
  */
 function roadOutline(level: Level): RoadOutline {
-  const outline: RoadOutline = { left: level.left.slice(), right: level.right.slice() };
+  const outline: RoadOutline = {
+    left: level.left.slice(),
+    right: level.right.slice(),
+    heights: level.path.map((p) => p.y),
+    lead: 0,
+    runStart: 0,
+    runEnd: 0,
+  };
   const n = level.path.length;
   if (n < 2) return outline;
   const extend = (index: number, neighbour: number, atStart: boolean): void => {
     const l = closedEndCorner(level.walls, level.left[index], level.left[neighbour]);
     const r = closedEndCorner(level.walls, level.right[index], level.right[neighbour]);
     if (!l || !r) return;
+    const y = level.path[index].y;
+    const reach = Math.hypot((l.x + r.x) / 2 - level.path[index].x, (l.z + r.z) / 2 - level.path[index].z);
     if (atStart) {
       outline.left.unshift(l);
       outline.right.unshift(r);
+      outline.heights.unshift(y);
+      outline.lead = 1;
+      outline.runStart = reach;
     } else {
       outline.left.push(l);
       outline.right.push(r);
+      outline.heights.push(y);
+      outline.runEnd = reach;
     }
   };
   extend(0, 1, true);
@@ -140,20 +173,32 @@ const START_HALF_LENGTH = 3.4;
 const START_HALF_WIDTH = 1.9;
 const START_LINE_HALF_WIDTH = 0.07;
 
-function addStartMarking(b: GeometryBuilder, start: Pose): void {
+/** Surface height of the level's road at (x, z), for a point near the height `y`. */
+function roadY(index: PathIndex, x: number, z: number, y: number): number {
+  const h = index.surfaceAt(x, z, y + 1.5);
+  return h === -Infinity ? y : h;
+}
+
+function addStartMarking(b: GeometryBuilder, start: Pose, index: PathIndex): void {
   const fx = Math.cos(start.heading);
   const fz = Math.sin(start.heading);
   const rx = -fz;
   const rz = fx;
+  const y = start.y ?? 0;
   // (s, t) = metres ahead of and to the right of the start pose.
   const mark = (s0: number, t0: number, s1: number, t1: number): void => {
-    b.line(
-      start.x + fx * s0 + rx * t0,
-      start.z + fz * s0 + rz * t0,
-      start.x + fx * s1 + rx * t1,
-      start.z + fz * s1 + rz * t1,
+    const ax = start.x + fx * s0 + rx * t0;
+    const az = start.z + fz * s0 + rz * t0;
+    const bx = start.x + fx * s1 + rx * t1;
+    const bz = start.z + fz * s1 + rz * t1;
+    b.line3(
+      ax,
+      roadY(index, ax, az, y) + Y_PAINT,
+      az,
+      bx,
+      roadY(index, bx, bz, y) + Y_PAINT,
+      bz,
       START_LINE_HALF_WIDTH,
-      Y_PAINT,
       SURFACE.startMark,
     );
   };
@@ -191,27 +236,31 @@ interface GatePart {
 }
 
 function addGatePosts(b: GeometryBuilder, gate: Gate): void {
-  b.box(gate.ax, gate.az, 1, 0, POST_HALF, POST_HALF, 0, POST_HEIGHT, SURFACE.post, SURFACE.post);
-  b.box(gate.bx, gate.bz, 1, 0, POST_HALF, POST_HALF, 0, POST_HEIGHT, SURFACE.post, SURFACE.post);
+  const y = gate.y;
+  b.box(gate.ax, gate.az, 1, 0, POST_HALF, POST_HALF, y, y + POST_HEIGHT, SURFACE.post, SURFACE.post);
+  b.box(gate.bx, gate.bz, 1, 0, POST_HALF, POST_HALF, y, y + POST_HEIGHT, SURFACE.post, SURFACE.post);
 }
 
-/** Light bar on the road across the gate, shifted `offset` metres along the road. */
-function addGateBar(b: GeometryBuilder, gate: Gate, offset: number, halfWidth: number, color: Color): void {
+/** Light bar on the road across the gate, shifted `offset` metres along the road (and up or down its slope). */
+function addGateBar(b: GeometryBuilder, gate: Gate, offset: number, halfWidth: number, color: Color, index: PathIndex): void {
   const dx = gate.bx - gate.ax;
   const dz = gate.bz - gate.az;
   const len = Math.sqrt(dx * dx + dz * dz) || 1;
   const ox = (-dz / len) * offset;
   const oz = (dx / len) * offset;
-  b.line(gate.ax + ox, gate.az + oz, gate.bx + ox, gate.bz + oz, halfWidth, Y_GATE, color);
+  const mx = (gate.ax + gate.bx) / 2 + ox;
+  const mz = (gate.az + gate.bz) / 2 + oz;
+  const y = roadY(index, mx, mz, gate.y) + Y_GATE;
+  b.line3(gate.ax + ox, y, gate.az + oz, gate.bx + ox, y, gate.bz + oz, halfWidth, color);
 }
 
 function addPostCaps(b: GeometryBuilder, gate: Gate, color: Color): void {
-  const y = POST_HEIGHT + 0.02;
+  const y = gate.y + POST_HEIGHT + 0.02;
   b.line(gate.ax - POST_HALF, gate.az, gate.ax + POST_HALF, gate.az, POST_HALF, y, color);
   b.line(gate.bx - POST_HALF, gate.bz, gate.bx + POST_HALF, gate.bz, POST_HALF, y, color);
 }
 
-function buildGateParts(b: GeometryBuilder, level: Level): GatePart[] {
+function buildGateParts(b: GeometryBuilder, level: Level, index: PathIndex): GatePart[] {
   const parts: GatePart[] = [];
   const part = (gate: number, color: Color, add: () => void): void => {
     const start = b.vertexCount;
@@ -220,17 +269,17 @@ function buildGateParts(b: GeometryBuilder, level: Level): GatePart[] {
   };
   level.checkpoints.forEach((gate, i) => {
     part(i, GATE.checkpoint, () => {
-      addGateBar(b, gate, 0, CHECKPOINT_HALF_WIDTH, GATE.checkpoint);
+      addGateBar(b, gate, 0, CHECKPOINT_HALF_WIDTH, GATE.checkpoint, index);
       addPostCaps(b, gate, GATE.checkpoint);
     });
   });
   const goalIndex = level.checkpoints.length;
   part(goalIndex, GATE.goalWhite, () => {
-    addGateBar(b, level.goal, -GOAL_BAR_OFFSET, GOAL_HALF_WIDTH, GATE.goalWhite);
+    addGateBar(b, level.goal, -GOAL_BAR_OFFSET, GOAL_HALF_WIDTH, GATE.goalWhite, index);
     addPostCaps(b, level.goal, GATE.goalWhite);
   });
   part(goalIndex, GATE.goalGreen, () => {
-    addGateBar(b, level.goal, GOAL_BAR_OFFSET, GOAL_HALF_WIDTH, GATE.goalGreen);
+    addGateBar(b, level.goal, GOAL_BAR_OFFSET, GOAL_HALF_WIDTH, GATE.goalGreen, index);
   });
   return parts;
 }
@@ -248,38 +297,48 @@ function gateBrightness(gate: number, goalIndex: number, run: RunState, time: nu
 
 export interface LevelVisual {
   readonly group: Group;
+  /** The level's road, indexed for height queries (also registered with the shared surface). */
+  readonly index: PathIndex;
   /** Recolours the gates: passed ones dim, the next one pulsing (steady when `reducedFlash`). */
   update(run: RunState, time: number, reducedFlash: boolean): void;
-  /** Frees the level's own geometry. The shared materials stay with whoever made them. */
+  /** Frees the level's own geometry and its section ids. The shared materials stay with whoever made them. */
   dispose(): void;
 }
 
-const NO_BUMPS: readonly Bump[] = [];
+/** Key the level's road is registered under in the shared surface (chunks use their index, >= 0). */
+export const LEVEL_SURFACE_KEY = -1;
 
 /** The whole level as one road piece: its tarmac is the outline extended to the walled ends. */
-function levelPiece(level: Level): RoadPiece {
-  const outline = roadOutline(level);
+function levelPiece(level: Level, outline: RoadOutline, sections: DeckSections): RoadPiece {
   return {
     path: level.path,
     left: outline.left,
     right: outline.right,
+    heights: outline.heights,
+    lead: outline.lead,
+    leftOpen: level.leftOpen,
+    rightOpen: level.rightOpen,
     walls: level.walls,
     props: level.props,
+    supports: level.supports,
     decor: level.decor,
-    bumps: NO_BUMPS,
-    ground: NO_BUMPS,
-    groundCount: 0,
+    bumps: level.bumps,
+    ground: level.bumps,
+    groundCount: level.bumps.length,
     overlap: 0,
     variation: 0,
+    sectionBase: sections.base,
+    sectionStarts: sections.starts,
   };
 }
 
-function buildStaticGeometry(level: Level, piece: RoadPiece): BufferGeometry {
+function buildStaticGeometry(level: Level, piece: RoadPiece, index: PathIndex): BufferGeometry {
   const b = new GeometryBuilder(32768);
+  b.trackSections = true;
   addGround(b, level);
   addGrid(b, level);
   addRoadPiece(b, piece);
-  addStartMarking(b, level.start);
+  addStartMarking(b, level.start, index);
   for (const gate of level.checkpoints) addGatePosts(b, gate);
   addGatePosts(b, level.goal);
   return b.build();
@@ -287,33 +346,54 @@ function buildStaticGeometry(level: Level, piece: RoadPiece): BufferGeometry {
 
 class LevelMeshes implements LevelVisual {
   readonly group = new Group();
+  readonly index: PathIndex;
   private readonly staticMesh: Mesh<BufferGeometry, MeshBasicMaterial>;
   private readonly gateMesh: Mesh<BufferGeometry, MeshBasicMaterial>;
   private readonly glowMesh: Mesh<BufferGeometry, MeshBasicMaterial> | null = null;
+  private readonly shadowMesh: Mesh<BufferGeometry, MeshBasicMaterial> | null = null;
   private readonly decor: InstancedMesh<BoxGeometry, MeshBasicMaterial> | null;
+  private readonly blocks: BlockSet | null = null;
+  private readonly sections: DeckSections;
   private readonly gateParts: GatePart[];
   private readonly gateColors: BufferAttribute;
   private readonly goalIndex: number;
 
-  constructor(level: Level, shared: TrackShared) {
-    const piece = levelPiece(level);
-    this.staticMesh = new Mesh(buildStaticGeometry(level, piece), shared.solid);
+  constructor(
+    level: Level,
+    private readonly shared: TrackShared,
+  ) {
+    const outline = roadOutline(level);
+    this.index = new PathIndex(level.path, outline.runStart, outline.runEnd);
+    this.sections = allocateSections(level.path, shared.sections);
+    const piece = levelPiece(level, outline, this.sections);
+    this.staticMesh = new Mesh(buildStaticGeometry(level, piece, this.index), shared.deck);
     this.staticMesh.frustumCulled = false;
 
     const gates = new GeometryBuilder();
-    this.gateParts = buildGateParts(gates, level);
+    this.gateParts = buildGateParts(gates, level, this.index);
     this.goalIndex = level.checkpoints.length;
     this.gateMesh = new Mesh(gates.build(), shared.solid);
     this.gateMesh.frustumCulled = false;
     this.gateColors = this.gateMesh.geometry.getAttribute('color') as BufferAttribute;
     this.gateColors.setUsage(DynamicDrawUsage);
 
-    if (level.props.length > 0) {
-      const glow = new GeometryBuilder();
-      addRoadPieceGlow(glow, piece);
-      this.glowMesh = new Mesh(glow.build(), shared.glow);
+    const glow = new GeometryBuilder();
+    glow.trackSections = true;
+    addRoadPieceGlow(glow, piece);
+    if (glow.vertexCount > 0) {
+      this.glowMesh = new Mesh(glow.build(), shared.deckGlow);
       this.glowMesh.frustumCulled = false;
+      this.glowMesh.renderOrder = 1;
       this.group.add(this.glowMesh);
+    }
+
+    const shadow = new GeometryBuilder(4096);
+    addRoadShadow(shadow, piece);
+    if (shadow.vertexCount > 0) {
+      this.shadowMesh = new Mesh(shadow.build(), shared.shadow);
+      this.shadowMesh.frustumCulled = false;
+      this.shadowMesh.renderOrder = -1;
+      this.group.add(this.shadowMesh);
     }
 
     this.decor = buildDecorMesh(level.decor, shared);
@@ -321,7 +401,11 @@ class LevelMeshes implements LevelVisual {
     if (this.decor) {
       this.decor.frustumCulled = false;
       this.group.add(this.decor);
+      this.blocks = blockSet(level.decor, this.decor);
+      shared.sinker.add(this.blocks);
     }
+    shared.fader.add(this.sections);
+    shared.surface.add(LEVEL_SURFACE_KEY, this.index, level.bumps);
   }
 
   update(run: RunState, time: number, reducedFlash: boolean): void {
@@ -344,16 +428,22 @@ class LevelMeshes implements LevelVisual {
   }
 
   dispose(): void {
+    const shared = this.shared;
     this.group.removeFromParent();
     this.staticMesh.geometry.dispose();
     this.gateMesh.geometry.dispose();
     this.glowMesh?.geometry.dispose();
+    this.shadowMesh?.geometry.dispose();
     // Not its geometry or material: those are the shared ones.
     this.decor?.dispose();
+    if (this.blocks) shared.sinker.remove(this.blocks);
+    shared.fader.remove(this.sections);
+    shared.sections.free(this.sections.base, this.sections.starts.length - 1);
+    shared.surface.remove(LEVEL_SURFACE_KEY);
   }
 }
 
-/** `shared` supplies the materials; they are not disposed with the level. */
+/** `shared` supplies the materials and registries; they are not disposed with the level. */
 export function buildLevelVisual(level: Level, shared: TrackShared): LevelVisual {
   return new LevelMeshes(level, shared);
 }

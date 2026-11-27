@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { Gate, InputState, Level, RunMode, World } from '../../src/types';
-import { DT, SIM_HZ } from '../../src/types';
-import { PI } from '../../src/core/fixedMath';
-import { COUNTDOWN_TICKS, createRunMode } from '../../src/modes/run';
+import { DT, SIM_HZ, TERRAIN_Y } from '../../src/types';
+import { HALF_PI, PI } from '../../src/core/fixedMath';
+import { createScoreState } from '../../src/modes/driftScore';
+import { COUNTDOWN_TICKS, FALL_RESPAWN_TICKS, GATE_HEIGHT_REACH, createRunMode } from '../../src/modes/run';
 import { createWorld } from '../../src/sim/world';
-import { makeOpenLevel, makeStraightLevel } from '../helpers/handLevel';
+import { OPEN_EDGE, makeOpenEdgeLevel, makeOpenLevel, makeStraightLevel } from '../helpers/handLevel';
 
 const IDLE: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
 const FULL_THROTTLE: InputState = { ...IDLE, throttle: 1 };
@@ -16,7 +17,7 @@ const GOAL_X = 200;
 
 function gateAcross(level: Level, x: number, halfSpan = HALF_WIDTH, heading = 0): Gate {
   const pathIndex = level.path.findIndex((p) => p.x >= x);
-  return { ax: x, az: -halfSpan, bx: x, bz: halfSpan, pathIndex, respawn: { x, z: 0, heading } };
+  return { ax: x, az: -halfSpan, bx: x, bz: halfSpan, pathIndex, y: 0, respawn: { x, z: 0, heading, y: 0 } };
 }
 
 /** A 200 m straight along +x with checkpoints at x = 50, 100 and 150 and the goal at x = 200. */
@@ -37,11 +38,15 @@ function steps(run: RunMode, count: number, input: InputState = IDLE): void {
   for (let i = 0; i < count; i++) run.step(input);
 }
 
-/** Puts the car just short of the line x = `lineX` at `speed` along +x (negative: rolling backwards) and steps once. */
-function cross(run: RunMode, lineX: number, speed = 20, z = 0): void {
+/**
+ * Puts the car just short of the line x = `lineX` at `speed` along +x (negative: rolling backwards), `y` metres up,
+ * and steps once.
+ */
+function cross(run: RunMode, lineX: number, speed = 20, z = 0, y = 0): void {
   const car = run.world.car;
   car.x = lineX - Math.sign(speed) * 0.05;
   car.z = z;
+  car.y = y;
   car.heading = 0;
   car.vx = speed;
   car.vz = 0;
@@ -66,12 +71,11 @@ describe('countdown', () => {
       splits: [],
       respawn: level.start,
       resets: 0,
-      driftScore: 0,
-      chainScore: 0,
-      multiplier: 1,
-      drifting: false,
+      falls: 0,
+      lastFallTick: -1,
+      respawnInTicks: 0,
+      score: createScoreState(),
       lastCheckpointTick: -1,
-      lastChainBreakTick: -1,
     });
     expect(run.state.respawn).not.toBe(level.start);
   });
@@ -178,6 +182,25 @@ describe('gates', () => {
     expect(run.state.nextCheckpoint).toBe(0);
     cross(run, 50, 20, 1.9);
     expect(run.state.nextCheckpoint).toBe(1);
+  });
+
+  it(`only counts a car within ${GATE_HEIGHT_REACH} m of the gate's height: a road passing over or under it does not`, () => {
+    const level = threeGateLevel();
+    const { run } = start(level);
+    cross(run, 50, 20, 0, 7);
+    expect(run.state.nextCheckpoint).toBe(0);
+    cross(run, 50, 20, 0, GATE_HEIGHT_REACH + 0.5);
+    expect(run.state.nextCheckpoint).toBe(0);
+    cross(run, 50, 20, 0, 0);
+    expect(run.state.nextCheckpoint).toBe(1);
+    // The same for a raised gate and a car on the road beneath it.
+    const raised = threeGateLevel();
+    raised.checkpoints[0].y = 7;
+    const under = start(raised).run;
+    cross(under, 50, 20, 0, 0);
+    expect(under.state.nextCheckpoint).toBe(0);
+    cross(under, 50, 20, 0, 7);
+    expect(under.state.nextCheckpoint).toBe(1);
   });
 
   it('does not count a car that is standing or creeping short of the line', () => {
@@ -292,6 +315,104 @@ describe('reset', () => {
     run.step(RESET);
     expect(run.state.resets).toBe(0);
     expect(run.world.car.x).toBeGreaterThan(GOAL_X);
+  });
+});
+
+describe('falling off', () => {
+  /** On top of the open-edged stretch, facing the right-hand drop, rolling towards it. */
+  function overTheEdge(run: RunMode): void {
+    run.world.placeCar({ x: (OPEN_EDGE.openFrom + OPEN_EDGE.openTo) / 2, z: 0, heading: HALF_PI, y: OPEN_EDGE.height });
+  }
+
+  function fallOff(run: RunMode): number {
+    let ticks = 0;
+    while (run.state.falls === 0 && ticks < 10 * SIM_HZ) {
+      run.step(FULL_THROTTLE);
+      ticks++;
+    }
+    expect(run.state.falls).toBe(1);
+    return ticks;
+  }
+
+  it('is counted once the car lies on the city floor; it is left there a moment, then put back, the clock running on', () => {
+    const level = makeOpenEdgeLevel();
+    const { world, run } = start(level);
+    overTheEdge(run);
+    const ticks = fallOff(run);
+    expect(world.offTrack).toBe(true);
+    expect(world.car.y).toBeLessThan(TERRAIN_Y + 1);
+    expect(run.state.lastFallTick).toBe(run.state.ticks);
+    expect(run.state.ticks).toBe(ticks);
+    expect(run.state.respawnInTicks).toBe(FALL_RESPAWN_TICKS);
+    expect(run.state.resets).toBe(0);
+
+    // The wait: the world keeps stepping (the car stays on the floor), the clock keeps running, the driver is ignored.
+    for (let i = 1; i < FALL_RESPAWN_TICKS; i++) {
+      run.step({ ...FULL_THROTTLE, steer: 1 });
+      expect(run.state.respawnInTicks).toBe(FALL_RESPAWN_TICKS - i);
+      expect(world.car.y).toBeLessThan(TERRAIN_Y + 1);
+      expect(world.car.throttle).toBe(0);
+    }
+    expect(run.state.falls).toBe(1);
+    run.step(FULL_THROTTLE);
+    expect(run.state.respawnInTicks).toBe(0);
+    expect(run.state.ticks).toBe(ticks + FALL_RESPAWN_TICKS);
+    expect(world.offTrack).toBe(false);
+    expect(world.car.x).toBe(level.start.x);
+    expect(world.car.z).toBe(level.start.z);
+    expect(world.car.y).toBe(0);
+    expect(world.car.speed).toBe(0);
+    expect(run.state.falls).toBe(1);
+    expect(run.state.resets).toBe(0);
+    run.step(FULL_THROTTLE);
+    expect(world.car.speed).toBeGreaterThan(0);
+  });
+
+  it('puts the car back at the last checkpoint, at the height of the road there', () => {
+    const level = makeOpenEdgeLevel();
+    const { world, run } = start(level);
+    const gate = level.checkpoints[0];
+    expect(gate.y).toBeGreaterThan(OPEN_EDGE.height - 0.01);
+    run.world.placeCar({ x: gate.respawn.x - 1, z: 0, heading: 0, y: gate.y });
+    cross(run, gate.ax, 20, 0, gate.y);
+    expect(run.state.nextCheckpoint).toBe(1);
+    overTheEdge(run);
+    fallOff(run);
+    for (let i = 0; i < FALL_RESPAWN_TICKS; i++) run.step(IDLE);
+    expect(world.car.x).toBe(gate.respawn.x);
+    expect(world.car.y).toBeCloseTo(gate.y, 6);
+    expect(world.car.airborne).toBe(false);
+    expect(run.state.nextCheckpoint).toBe(1);
+  });
+
+  it('can be cut short with the reset button, which is not counted as a reset', () => {
+    const level = makeOpenEdgeLevel();
+    const { world, run } = start(level);
+    overTheEdge(run);
+    fallOff(run);
+    run.step(IDLE);
+    run.step(RESET);
+    expect(run.state.respawnInTicks).toBe(0);
+    expect(world.car.x).toBe(level.start.x);
+    expect(run.state.resets).toBe(0);
+    expect(run.state.falls).toBe(1);
+  });
+
+  it('counts every fall', () => {
+    const { run } = start(makeOpenEdgeLevel());
+    for (let n = 1; n <= 3; n++) {
+      overTheEdge(run);
+      for (let i = 0; i < 10 * SIM_HZ && run.state.falls < n; i++) run.step(FULL_THROTTLE);
+      expect(run.state.falls).toBe(n);
+      for (let i = 0; i < FALL_RESPAWN_TICKS; i++) run.step(IDLE);
+    }
+  });
+
+  it('does not happen to a car that drives the open-edged road down the middle', () => {
+    const { run } = start(makeOpenEdgeLevel());
+    for (let i = 0; i < 40 * SIM_HZ && run.state.phase === 'running'; i++) run.step(FULL_THROTTLE);
+    expect(run.state.phase).toBe('finished');
+    expect(run.state.falls).toBe(0);
   });
 });
 

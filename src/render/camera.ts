@@ -26,6 +26,12 @@ const WIDEN_MAX = 0.15;
 const WIDEN_SPEED_REF = 48;
 const WIDEN_RATE = 1.4;
 
+/**
+ * How fast the view follows the height of the road the car is on, 1/s. Quick enough to keep up with a climb,
+ * slow enough that a crest or a step down never jolts the picture.
+ */
+const HEIGHT_RATE = 5;
+
 const SHAKE_MAX = 0.7;
 const SHAKE_DECAY = 9;
 
@@ -40,10 +46,13 @@ export interface FollowCamera {
   readonly up: Vector3;
   setAspect(aspect: number): void;
   /**
-   * Follows the car on the ground plane only: a jump moves the car on screen, never the camera. With `lookAhead`
-   * off the view settles on the car itself instead of leading it (used once a run is over).
+   * Follows the car across the ground and `trackY`, the height of the road it is on (not the car's own height:
+   * a jump or a drop moves the car on screen, the view only follows the road). With `lookAhead` off the view
+   * settles on the car itself instead of leading it (used once a run is over).
    */
-  update(pose: Pose, car: CarState, dt: number, lookAhead?: boolean): void;
+  update(pose: Pose, car: CarState, dt: number, lookAhead?: boolean, trackY?: number): void;
+  /** Height the view is centred on at the moment, m. */
+  readonly focusY: number;
   /** Adds screen shake; `amount` is in metres of view-plane travel. */
   addShake(amount: number): void;
   /** Makes the next update cut straight to the car. */
@@ -66,6 +75,7 @@ class LockedCamera implements FollowCamera {
   private appliedWiden = -1;
   private focusX = 0;
   private focusZ = 0;
+  private height = 0;
   private lookX = 0;
   private lookZ = 0;
   private shake = 0;
@@ -94,8 +104,15 @@ class LockedCamera implements FollowCamera {
     this.snapNext = true;
   }
 
-  update(pose: Pose, car: CarState, dt: number, lookAhead = true): void {
-    this.follow(pose, car, dt, lookAhead);
+  get focusY(): number {
+    return this.height;
+  }
+
+  update(pose: Pose, car: CarState, dt: number, lookAhead = true, trackY = 0): void {
+    const snapped = this.follow(pose, car, dt, lookAhead);
+    const target = Number.isFinite(trackY) ? trackY : 0;
+    if (snapped) this.height = target;
+    else this.height += (target - this.height) * damp(HEIGHT_RATE, dt);
     this.updateWiden(car.speed, dt);
 
     this.shakeTime += dt;
@@ -104,13 +121,13 @@ class LockedCamera implements FollowCamera {
     const sy = this.shake * Math.cos(this.shakeTime * 47);
     this.camera.position.set(
       this.focusX + this.offset.x + this.right.x * sx + this.up.x * sy,
-      this.offset.y + this.right.y * sx + this.up.y * sy,
+      this.height + this.offset.y + this.right.y * sx + this.up.y * sy,
       this.focusZ + this.offset.z + this.right.z * sx + this.up.z * sy,
     );
   }
 
   /** Moves the focus point towards the car plus a smoothed, speed-based look-ahead. */
-  private follow(pose: Pose, car: CarState, dt: number, lookAhead: boolean): void {
+  private follow(pose: Pose, car: CarState, dt: number, lookAhead: boolean): boolean {
     let aheadX = lookAhead ? car.vx * LOOK_AHEAD_S : 0;
     let aheadZ = lookAhead ? car.vz * LOOK_AHEAD_S : 0;
     const ahead = Math.sqrt(aheadX * aheadX + aheadZ * aheadZ);
@@ -127,7 +144,7 @@ class LockedCamera implements FollowCamera {
       this.lookZ = aheadZ;
       this.focusX = pose.x + aheadX;
       this.focusZ = pose.z + aheadZ;
-      return;
+      return true;
     }
 
     const lookK = damp(LOOK_RATE, dt);
@@ -136,6 +153,7 @@ class LockedCamera implements FollowCamera {
     const followK = damp(FOLLOW_RATE, dt);
     this.focusX += (pose.x + this.lookX - this.focusX) * followK;
     this.focusZ += (pose.z + this.lookZ - this.focusZ) * followK;
+    return false;
   }
 
   private updateWiden(speed: number, dt: number): void {

@@ -3,27 +3,27 @@ import type { GameAudio } from './audio/mixer';
 import { lerp, lerpAngle } from './core/fixedMath';
 import { createFixedLoop } from './core/loop';
 import type { FixedLoop } from './core/loop';
+import { LEVELS, generateLevelFor, getLevelDef } from './gen/levels';
 import { generateLevel } from './gen/trackGen';
-import { validateLevel } from './gen/validate';
 import { previousWeekIds } from './gen/weeklySeed';
 import { createInput } from './input/actions';
 import type { GameInput } from './input/actions';
-import { createRenderer } from './render/renderer';
-import { createEndlessSession, createWeeklySession } from './session';
-import type { Session, SessionDeps, SessionPhase } from './session';
+import { openRenderer, randomSeed, startsFromTitle, watchPixelRatio } from './platform';
+import { createEndlessSession, createTrackSession } from './session';
+import type { Session, SessionDeps, SessionPhase, TrackInfo } from './session';
 import { ASSIST_STRENGTH, DEFAULT_CAR_PARAMS, cloneParams } from './sim/params';
 import { decodeInput, encodeInput } from './sim/replay';
 import { DT, SIM_HZ } from './types';
 import type {
-  BestRecord,
   CarParams,
   Difficulty,
-  EndlessBest,
   EndlessMode,
   EndlessWorld,
+  GameMode,
   GameRenderer,
   InputState,
   Level,
+  MetaInput,
   Pose,
   RenderFrame,
   RunMode,
@@ -34,45 +34,40 @@ import { createGlitcher } from './ui/glitch';
 import { createHud } from './ui/hud';
 import type { Hud } from './ui/hud';
 import { createMenu } from './ui/menu';
-import type { Menu, TitleData } from './ui/menu';
+import type { Menu, UiSound } from './ui/menu';
 import { createMuteButton } from './ui/muteButton';
 import type { MuteButton } from './ui/muteButton';
-import { DIFFICULTIES, loadBest, loadEndlessBest, loadSettings, saveSettings } from './ui/storage';
+import { loadSettings, saveSettings } from './ui/storage';
 import { createTuningPanel } from './ui/tuning';
 import type { TuningPanel } from './ui/tuning';
+
+export type { GameMode } from './types';
 
 export interface GameOptions {
   /** Receives the canvas. */
   app: HTMLElement;
   /** Receives the HUD, menus, mute button and tuning panel. */
   ui: HTMLElement;
-  /** The week shown on the title screen as "this week". */
+  /** The week shown in the menus as "this week". */
   weekId: string;
-  /** Gives every endless run this road, for testing. Left out, each run from the title or RETRY gets a new one. */
+  /** Gives every endless run this road, for testing. Left out, each run gets a new one. */
   endlessSeed?: string | null;
 }
 
-export type GameMode = Session['kind'];
-
-/** `results` is the finish or game-over screen; the car keeps coasting behind it. */
-type Screen = 'title' | 'driving' | 'paused' | 'results';
+/**
+ * `menu`: title, main menu and the select screens, with this week's level parked behind them.
+ * `results`: the finish or game-over screen; the car keeps coasting behind it.
+ */
+type Screen = 'menu' | 'driving' | 'paused' | 'results';
 
 const PAST_WEEKS = 8;
 /** Closing speed (m/s) below which a wall touch makes no sound. */
 const MIN_AUDIBLE_IMPACT = 2;
-const WEBGL_MESSAGE =
-  'SigDRIFT needs WebGL 2, which this browser or device could not provide. ' +
-  'Try a current browser with hardware acceleration switched on.';
+/** A car that moved further than this in one tick was put somewhere: never draw it streaking there. */
+const TELEPORT_DISTANCE = 6;
+const UI_BLIPS = { move: 'uiMove', select: 'uiSelect', back: 'uiBack' } as const;
 
 const NEUTRAL_INPUT: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
-
-function openRenderer(app: HTMLElement, settings: Settings): GameRenderer {
-  try {
-    return createRenderer(app, settings);
-  } catch (cause) {
-    throw new Error(WEBGL_MESSAGE, { cause });
-  }
-}
 
 /** True when every tuning value matches. Steering assist included: both sides follow the player's setting. */
 function sameParams(a: CarParams, b: CarParams): boolean {
@@ -80,38 +75,10 @@ function sameParams(a: CarParams, b: CarParams): boolean {
   return true;
 }
 
-function copyPose(into: Pose, from: Pose): void {
-  into.x = from.x;
-  into.z = from.z;
-  into.heading = from.heading;
-}
-
-/** A road nobody has driven before. Only ever used as a generator seed, so any unpredictable string will do. */
-function randomSeed(): string {
-  const words = new Uint32Array(2);
-  try {
-    globalThis.crypto.getRandomValues(words);
-  } catch {
-    words[0] = Math.random() * 0x100000000;
-    words[1] = Math.random() * 0x100000000;
-  }
-  return words[0].toString(36) + words[1].toString(36);
-}
-
-/** Calls `onChange` whenever the window moves to a screen with a different pixel density, or the page is zoomed. */
-function watchPixelRatio(onChange: () => void): void {
-  const listen = (): void => {
-    const query = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
-    query.addEventListener(
-      'change',
-      () => {
-        onChange();
-        listen();
-      },
-      { once: true },
-    );
-  };
-  listen();
+/** The level after `id` among the five, or null. */
+function nextLevelOf(id: string): string | null {
+  const index = LEVELS.findIndex((def) => def.id === id);
+  return index >= 0 && index + 1 < LEVELS.length ? LEVELS[index + 1].id : null;
 }
 
 export class Game {
@@ -132,15 +99,15 @@ export class Game {
   private readonly sessionDeps: SessionDeps;
   /** What "Reset to defaults" in the tuning panel restores; its steering assist follows the setting. */
   private readonly tuningDefaults: CarParams = cloneParams(DEFAULT_CAR_PARAMS);
+  /** Levels generated so far, by week id or level id: going back to one never generates it again. */
+  private readonly levels = new Map<string, Level>();
 
   private settings: Settings;
-  private screen: Screen = 'title';
-  /** The run in progress, or the one parked behind the title screen. */
+  private screen: Screen = 'menu';
+  /** The run in progress, or the one parked behind the menus. */
   private session: Session;
-  /** The weekly level generated last, kept so that returning to it does not generate it again. */
-  private level: Level | null = null;
-  /** Whether `level` is what the renderer shows; false while an endless road has taken its place. */
-  private levelOnScreen = false;
+  /** Id of the level the renderer shows, or null while an endless road has taken its place. */
+  private levelOnScreen: string | null = null;
 
   private readonly prevPose: Pose = { x: 0, z: 0, heading: 0 };
   private prevHeight = 0;
@@ -153,10 +120,18 @@ export class Game {
   private countdownSecond = 0;
   /** Ticks until the result screen opens; counts only once the run is over. */
   private endScreenDelayTicks = 0;
+  /** Set when a key left the title screen: that key's menu flags, read next frame, must not act on the main menu. */
+  private swallowMeta = false;
+  /**
+   * Set when a menu opens over a car that was being driven (pause, result screen). The driving keys double as menu
+   * navigation and a held key auto-repeats, so a throttle still held when the finish screen appears would walk the
+   * focus away from RETRY. Nav is ignored until the driving controls have been let go.
+   */
+  private navHeld = false;
   /**
    * True once the current run has been driven, even for a moment, with a car that is not the stock one. Such a
-   * run is not saved as a best: its time or distance means nothing next to the stock car's. Set by any
-   * tuning-panel edit and by starting a run with edited values; a value changed and put back mid-run still counts.
+   * run is not saved: its time or score means nothing next to the stock car's. Set by any tuning-panel edit and by
+   * starting a run with edited values; a value changed and put back mid-run still counts.
    */
   private runTuned = false;
 
@@ -170,17 +145,24 @@ export class Game {
     this.audio = createAudio();
     this.sessionDeps = { renderer: this.renderer, audio: this.audio, params: this.params };
     this.hud = createHud(opts.ui);
-    this.menu = createMenu(opts.ui, {
-      onPlay: (weekId) => this.play(weekId),
-      onPlayEndless: (difficulty) => this.playEndless(difficulty),
-      onResume: () => this.resume(),
-      onRestart: () => this.onMenuRestart(),
-      onQuit: () => this.showTitle(),
-      onSettings: (settings) => {
-        saveSettings(settings);
-        this.applySettings(settings);
+    this.menu = createMenu(
+      opts.ui,
+      {
+        onPlayWeekly: (weekId) => this.playWeekly(weekId),
+        onPlayLevel: (levelId) => this.playLevel(levelId),
+        onPlayEndless: (difficulty) => this.playEndless(difficulty),
+        onResume: () => this.resume(),
+        onRestart: () => this.onMenuRestart(),
+        onQuit: () => this.showMainMenu(),
+        onNextLevel: (levelId) => this.playLevel(levelId),
+        onSettings: (settings) => {
+          saveSettings(settings);
+          this.applySettings(settings);
+        },
+        onUiSound: (kind: UiSound) => this.audio.blip(UI_BLIPS[kind]),
       },
-    });
+      { currentWeek: this.currentWeek, pastWeeks: previousWeekIds(this.currentWeek, PAST_WEEKS), levels: LEVELS },
+    );
     // The button and the menus' Sound switch tell each other about changes; the game only hears the outcome.
     this.muteButton = createMuteButton(opts.ui, {
       muted: this.settings.muted,
@@ -200,7 +182,7 @@ export class Game {
 
     this.session = this.weeklySession(this.currentWeek);
     this.renderFrame = {
-      pose: { x: 0, z: 0, heading: 0 },
+      pose: { x: 0, z: 0, heading: 0, y: 0 },
       car: this.session.world.car,
       params: this.params,
       run: this.session.run,
@@ -208,6 +190,7 @@ export class Game {
       height: 0,
       dt: 0,
     };
+    this.snapCar();
     this.hud.setVisible(false);
 
     this.loop = createFixedLoop({
@@ -228,19 +211,19 @@ export class Game {
     return this.session.mode.world;
   }
 
-  /** The weekly run in progress, or null in endless mode. */
+  /** The weekly run or level in progress, or null in endless mode. */
   get run(): RunMode | null {
-    return this.session.kind === 'weekly' ? this.session.mode : null;
+    return this.session.kind === 'endless' ? null : this.session.mode;
   }
 
-  /** The endless run in progress, or null in a weekly run. */
+  /** The endless run in progress, or null otherwise. */
   get endless(): EndlessMode | null {
     return this.session.kind === 'endless' ? this.session.mode : null;
   }
 
-  /** The weekly level being driven, or null in endless mode. */
+  /** The level being driven (or parked behind the menus), or null in endless mode. */
   get currentLevel(): Level | null {
-    return this.session.kind === 'weekly' ? this.session.level : null;
+    return this.session.kind === 'endless' ? null : this.session.level;
   }
 
   // ---- Screens --------------------------------------------------------------------------------------------------
@@ -251,60 +234,88 @@ export class Game {
 
   /** The title screen over this week's level, with the car parked on the start line. */
   showTitle(): void {
-    this.adopt(this.weeklySession(this.currentWeek));
-    this.renderer.clearEffects();
-    this.hud.setVisible(false);
-    this.screen = 'title';
-    this.menu.showTitle(this.titleData());
+    this.parkBehindMenu();
+    this.menu.showTitle();
   }
 
-  play(weekId: string): void {
-    try {
-      this.adopt(this.weeklySession(weekId));
-    } catch (error) {
-      console.error(`SigDRIFT: could not build the level for ${weekId}`, error);
-      this.showTitle();
+  /** The main menu over this week's level: where QUIT TO MENU and MENU lead. */
+  showMainMenu(): void {
+    this.parkBehindMenu();
+    this.menu.showMain();
+  }
+
+  playWeekly(weekId: string): void {
+    this.startTrack(weekId, () =>
+      createTrackSession(this.levelFor(weekId, () => generateLevel(weekId)), this.weeklyInfo(weekId), this.sessionDeps),
+    );
+  }
+
+  playLevel(levelId: string): void {
+    const def = getLevelDef(levelId);
+    if (!def) {
+      console.warn(`SigDRIFT: there is no level ${levelId}`);
+      this.showMainMenu();
       return;
     }
-    this.beginRun();
+    const info: TrackInfo = { kind: 'level', trackId: def.id, trackName: def.name, nextLevelId: nextLevelOf(def.id) };
+    this.startTrack(levelId, () => createTrackSession(this.levelFor(def.id, () => generateLevelFor(def)), info, this.sessionDeps));
   }
 
   /** A new endless run on a road of its own (or on the fixed test seed). */
   playEndless(difficulty: Difficulty): void {
     const seed = this.fixedEndlessSeed ?? randomSeed();
-    // Whether or not the road gets built, the renderer may already have let go of the weekly level.
-    this.levelOnScreen = false;
+    // Whether or not the road gets built, the renderer may already have let go of the level.
+    this.levelOnScreen = null;
+    this.startTrack(`the ${difficulty} endless road (seed ${seed})`, () =>
+      createEndlessSession(seed, difficulty, this.sessionDeps),
+    );
+  }
+
+  // ---- Sessions and runs ----------------------------------------------------------------------------------------
+
+  private startTrack(what: string, build: () => Session): void {
     try {
-      this.adopt(createEndlessSession(seed, difficulty, this.sessionDeps));
+      this.adopt(build());
     } catch (error) {
-      console.error(`SigDRIFT: could not build the ${difficulty} endless road for seed ${seed}`, error);
-      this.showTitle();
+      console.error(`SigDRIFT: could not build ${what}`, error);
+      this.showMainMenu();
       return;
     }
     this.beginRun();
   }
 
-  // ---- Sessions and runs ----------------------------------------------------------------------------------------
-
-  private weeklySession(weekId: string): Session {
-    return createWeeklySession(this.levelFor(weekId), this.sessionDeps);
+  private weeklyInfo(weekId: string): TrackInfo {
+    return { kind: 'weekly', trackId: weekId, trackName: weekId, nextLevelId: null };
   }
 
-  /** Generates the level and hands it to the renderer, unless it is the one already on screen. */
-  private levelFor(weekId: string): Level {
-    let level = this.level;
-    if (level === null || level.id !== weekId) {
-      level = generateLevel(weekId);
-      const check = validateLevel(level);
-      if (!check.ok) console.warn(`SigDRIFT: level ${weekId} failed validation`, check.errors);
-      this.level = level;
-      this.levelOnScreen = false;
+  private weeklySession(weekId: string): Session {
+    return createTrackSession(this.levelFor(weekId, () => generateLevel(weekId)), this.weeklyInfo(weekId), this.sessionDeps);
+  }
+
+  /** Generates the level once and hands it to the renderer, unless it is the one already on screen. */
+  private levelFor(id: string, generate: () => Level): Level {
+    let level = this.levels.get(id);
+    if (!level) {
+      level = generate();
+      this.levels.set(id, level);
     }
-    if (!this.levelOnScreen) {
+    if (this.levelOnScreen !== id) {
       this.renderer.setLevel(level);
-      this.levelOnScreen = true;
+      this.levelOnScreen = id;
     }
     return level;
+  }
+
+  /** This week's level behind the menus, the car resting on its start line. */
+  private parkBehindMenu(): void {
+    const session = this.session;
+    const parked = session.kind === 'weekly' && session.info.trackId === this.currentWeek && this.levelOnScreen === this.currentWeek;
+    if (parked) session.restart();
+    else this.adopt(this.weeklySession(this.currentWeek));
+    this.snapCar();
+    this.renderer.clearEffects();
+    this.hud.setVisible(false);
+    this.screen = 'menu';
   }
 
   private adopt(session: Session): void {
@@ -315,7 +326,9 @@ export class Game {
   /** Makes the car's current position the one to interpolate from: nothing is drawn sliding in from elsewhere. */
   private snapCar(): void {
     const car = this.session.world.car;
-    copyPose(this.prevPose, car);
+    this.prevPose.x = car.x;
+    this.prevPose.z = car.z;
+    this.prevPose.heading = car.heading;
     this.prevHeight = car.y;
   }
 
@@ -335,15 +348,15 @@ export class Game {
     this.audio.resume();
   }
 
-  /** The same road again from the start: the restart key at any time, and Restart in the pause menu. */
+  /** The same road again from the start: the restart key while driving, and RESTART in the pause menu. */
   private restartRun(): void {
     this.session.restart();
     this.beginRun();
   }
 
   /**
-   * Restart from a menu. On the pause screen that is the run in progress again. RETRY after an endless run is a
-   * new run instead, and so a new road: the road is different every time.
+   * RESTART / RETRY from a menu. On the pause screen that is the run in progress again. RETRY after an endless run
+   * is a new run instead, and so a new road: the road is different every time.
    */
   private onMenuRestart(): void {
     const session = this.session;
@@ -351,30 +364,19 @@ export class Game {
     else this.restartRun();
   }
 
-  private canPause(): boolean {
-    return this.screen === 'driving' && this.session.phase !== 'over';
-  }
-
   private pause(): void {
-    if (!this.canPause()) return;
+    if (this.screen !== 'driving' || this.session.phase === 'over') return;
     this.screen = 'paused';
-    this.menu.showPause(this.settings);
+    this.navHeld = true;
+    this.menu.showPause();
   }
 
   private resume(): void {
+    if (this.screen !== 'paused') return;
     this.menu.hide();
     // The countdown stood still while paused but its number's pop did not: show the number again.
     this.hud.resetCountdown();
     this.screen = 'driving';
-  }
-
-  private titleData(): TitleData {
-    const pastWeeks = previousWeekIds(this.currentWeek, PAST_WEEKS);
-    const bests: Record<string, BestRecord | null> = { [this.currentWeek]: loadBest(this.currentWeek) };
-    for (const id of pastWeeks) bests[id] = loadBest(id);
-    const endlessBests = {} as Record<Difficulty, EndlessBest | null>;
-    for (const difficulty of DIFFICULTIES) endlessBests[difficulty] = loadEndlessBest(difficulty);
-    return { currentWeek: this.currentWeek, pastWeeks, bests, endlessBests, settings: this.settings };
   }
 
   // ---- Settings and sound ---------------------------------------------------------------------------------------
@@ -384,6 +386,7 @@ export class Game {
     this.renderer.applySettings(settings);
     this.audio.setVolume(settings.volume);
     this.audio.setMuted(settings.muted);
+    this.menu.setSettings(settings);
     const assist = settings.assist ? ASSIST_STRENGTH : 0;
     this.params.steerAssist = assist;
     this.tuningDefaults.steerAssist = assist;
@@ -414,22 +417,26 @@ export class Game {
     if (!this.isSimulating()) return;
     const session = this.session;
     const phaseBefore = session.phase;
-    const worldTickBefore = session.world.tick;
+    const world = session.world;
+    const worldTickBefore = world.tick;
 
     this.snapCar();
-    const teleported = session.step(phaseBefore === 'over' ? NEUTRAL_INPUT : this.sampleInput());
+    let teleported = session.step(phaseBefore === 'over' ? NEUTRAL_INPUT : this.sampleInput());
 
-    // The world is not stepped on every mode tick (countdown, a car that came down off the road). On those the
+    // The world is not stepped on every mode tick (countdown, waiting to be put back after a fall). On those the
     // car state is whatever the last real step left: laying marks and smoke from it, or replaying its collision,
     // would repeat that one moment for as long as the car stands still.
-    const world = session.world;
+    const car = world.car;
     if (world.tick !== worldTickBefore) {
       const collision = world.lastCollision;
-      this.renderer.onSimTick(world.car, world.params, collision);
+      this.renderer.onSimTick(car, world.params, collision);
       if (collision && collision.impact > MIN_AUDIBLE_IMPACT) this.audio.collision(collision.impact);
     }
 
     // Interpolating across a respawn would draw the car streaking back to the checkpoint.
+    const dx = car.x - this.prevPose.x;
+    const dz = car.z - this.prevPose.z;
+    if (dx * dx + dz * dz > TELEPORT_DISTANCE * TELEPORT_DISTANCE) teleported = true;
     if (teleported) this.snapCar();
     this.announcePhase(phaseBefore);
   }
@@ -461,6 +468,8 @@ export class Game {
       this.endScreenDelayTicks = session.endScreenDelayTicks;
     } else if (this.screen === 'driving' && --this.endScreenDelayTicks <= 0) {
       this.screen = 'results';
+      this.navHeld = true;
+      this.audio.blip('uiGlitch');
       session.showEndScreen(this.menu);
     }
   }
@@ -476,7 +485,7 @@ export class Game {
   // ---- Rendered frame -------------------------------------------------------------------------------------------
 
   private frame(alpha: number, frameSeconds: number): void {
-    this.handleMeta();
+    this.handleMeta(this.input.meta());
     // While nothing is stepping the loop's alpha keeps cycling; holding the last one keeps the car still.
     if (this.isSimulating()) this.alpha = alpha;
 
@@ -484,11 +493,12 @@ export class Game {
     const world = session.world;
     const car = world.car;
     const frame = this.renderFrame;
+    const height = lerp(this.prevHeight, car.y, this.alpha);
     frame.pose.x = lerp(this.prevPose.x, car.x, this.alpha);
     frame.pose.z = lerp(this.prevPose.z, car.z, this.alpha);
     frame.pose.heading = lerpAngle(this.prevPose.heading, car.heading, this.alpha);
-    // Always zero in a weekly run: its road is flat and the car never leaves it.
-    frame.height = lerp(this.prevHeight, car.y, this.alpha);
+    frame.pose.y = height;
+    frame.height = height;
     frame.car = car;
     frame.params = world.params;
     frame.run = session.run;
@@ -497,21 +507,69 @@ export class Game {
     frame.dt = this.screen === 'paused' ? 0 : frameSeconds;
     this.renderer.render(frame);
 
-    if (this.screen !== 'title') session.updateHud(this.hud);
+    if (this.screen !== 'menu') session.updateHud(this.hud);
     this.tuning.update(car);
     this.audio.update(car, world.params, this.screen === 'driving' && session.engineRunning);
   }
 
-  private handleMeta(): void {
-    const meta = this.input.meta();
+  // ---- Meta input -----------------------------------------------------------------------------------------------
+
+  private handleMeta(meta: MetaInput): void {
     if (meta.toggleMute) this.toggleMute();
     if (meta.toggleTuning) this.tuning.toggle();
-    if (meta.pause) {
-      if (this.screen === 'paused') this.resume();
-      else this.pause();
+    if (this.swallowMeta) {
+      this.swallowMeta = false;
+      return;
     }
-    if (meta.restart && this.screen !== 'title') this.restartRun();
-    if (meta.confirm && this.menu.isOpen) this.menu.confirm();
+    if (this.menu.isOpen) this.menuMeta(meta);
+    else if (this.screen === 'driving') {
+      // Escape / P / Start pause, Backspace / Back restart; the arrows and WASD are just driving here.
+      if (meta.pause) this.pause();
+      else if (meta.restart) this.restartRun();
+    }
+  }
+
+  /** While a menu is up the nav flags move its focus and Escape / Backspace go back. */
+  private menuMeta(meta: MetaInput): void {
+    const menu = this.menu;
+    if (menu.screen === 'title') {
+      if (meta.confirm) menu.confirm();
+      else if (meta.navUp || meta.navDown || meta.navLeft || meta.navRight || meta.back || meta.pause || meta.restart) {
+        this.leaveTitle();
+      }
+      return;
+    }
+    if (meta.back) {
+      menu.back();
+      return;
+    }
+    if (meta.pause) {
+      // Start / P on its own (Escape raises `back` as well and went above).
+      if (this.screen === 'paused' && menu.screen === 'pause') this.resume();
+      else menu.back();
+      return;
+    }
+    if (this.navHeld && this.drivingControlsHeld()) {
+      if (meta.confirm) menu.confirm();
+      return;
+    }
+    this.navHeld = false;
+    if (meta.navUp) menu.nav('up');
+    else if (meta.navDown) menu.nav('down');
+    else if (meta.navLeft) menu.nav('left');
+    else if (meta.navRight) menu.nav('right');
+    if (meta.confirm) menu.confirm();
+  }
+
+  /** Steering, throttle or brake held past the point where a stick flick counts as menu navigation. */
+  private drivingControlsHeld(): boolean {
+    const held = this.input.sample();
+    return Math.abs(held.steer) > 0.5 || held.throttle > 0.5 || held.brake > 0.5;
+  }
+
+  private leaveTitle(): void {
+    this.audio.blip('uiSelect');
+    this.menu.showMain();
   }
 
   // ---- Window ---------------------------------------------------------------------------------------------------
@@ -532,10 +590,16 @@ export class Game {
     window.addEventListener('gamepaddisconnected', () => {
       if (this.input.lastDevice === 'gamepad') this.pause();
     });
-    // While driving nothing on the page can take focus, so Tab (right beside Q, W and A) would hand it to the
-    // browser's own controls. In menus Tab keeps its normal job.
     window.addEventListener('keydown', (event) => {
+      // While driving nothing on the page can take focus, so Tab (right beside Q, W and A) would hand it to the
+      // browser's own controls. In menus Tab keeps its normal job.
       if (event.code === 'Tab' && this.screen === 'driving') event.preventDefault();
+      // Any key leaves the title screen (Enter and Space reach its focused button natively).
+      if (this.menu.screen === 'title' && startsFromTitle(event)) {
+        this.audio.resume();
+        this.leaveTitle();
+        this.swallowMeta = true;
+      }
     });
 
     // Menus can be confirmed from the frame loop (Enter, gamepad), which is not a user gesture as far as the

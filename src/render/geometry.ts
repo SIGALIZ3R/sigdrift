@@ -39,15 +39,24 @@ const INITIAL_VERTICES = 2048;
 export class GeometryBuilder {
   private positions: Float32Array;
   private colors: Float32Array;
+  private sections: Float32Array;
   private indices: Uint32Array;
   private vertices = 0;
   private indexCount = 0;
   private originX = 0;
   private originZ = 0;
+  /**
+   * While on, every vertex also records `section` and `build` adds it as a 'section' attribute: the id of the
+   * stretch of road deck it belongs to, which the deck materials fade as a whole (see sections.ts).
+   */
+  trackSections = false;
+  /** Section id written with each new vertex while `trackSections` is on. 0 = never fades. */
+  section = 0;
 
   constructor(vertexCapacity = INITIAL_VERTICES) {
     this.positions = new Float32Array(vertexCapacity * 3);
     this.colors = new Float32Array(vertexCapacity * 3);
+    this.sections = new Float32Array(vertexCapacity);
     this.indices = new Uint32Array(vertexCapacity * 2);
   }
 
@@ -60,6 +69,7 @@ export class GeometryBuilder {
     this.indexCount = 0;
     this.originX = originX;
     this.originZ = originZ;
+    this.section = 0;
     return this;
   }
 
@@ -83,6 +93,7 @@ export class GeometryBuilder {
     c[o] = r;
     c[o + 1] = g;
     c[o + 2] = b;
+    this.sections[v] = this.section;
     this.vertices = v + 1;
     return v;
   }
@@ -134,6 +145,51 @@ export class GeometryBuilder {
     this.quad(v0, v1, v2, v3);
   }
 
+  /** Flat-topped line from a (height ay) to b (height by): a strip of paint that follows a slope. */
+  line3(
+    ax: number,
+    ay: number,
+    az: number,
+    bx: number,
+    by: number,
+    bz: number,
+    halfWidth: number,
+    colorA: Color,
+    colorB: Color = colorA,
+  ): void {
+    const dx = bx - ax;
+    const dz = bz - az;
+    const len = Math.sqrt(dx * dx + dz * dz);
+    if (len < 1e-6) return;
+    const px = (-dz / len) * halfWidth;
+    const pz = (dx / len) * halfWidth;
+    const v0 = this.vertex(ax - px, ay, az - pz, colorA);
+    const v1 = this.vertex(bx - px, by, bz - pz, colorB);
+    const v2 = this.vertex(bx + px, by, bz + pz, colorB);
+    const v3 = this.vertex(ax + px, ay, az + pz, colorA);
+    this.quad(v0, v1, v2, v3);
+  }
+
+  /** Vertical quad on the line a-b from (ya0 at a, yb0 at b) up to (ya1 at a, yb1 at b). */
+  wall4(
+    ax: number,
+    az: number,
+    bx: number,
+    bz: number,
+    ya0: number,
+    yb0: number,
+    ya1: number,
+    yb1: number,
+    color: Color,
+    k = 1,
+  ): void {
+    const v0 = this.vertex(ax, ya0, az, color, k);
+    const v1 = this.vertex(bx, yb0, bz, color, k);
+    const v2 = this.vertex(bx, yb1, bz, color, k);
+    const v3 = this.vertex(ax, ya1, az, color, k);
+    this.quad(v0, v1, v2, v3);
+  }
+
   /** Vertical quad standing on the ground line a-b. */
   upright(ax: number, az: number, bx: number, bz: number, y0: number, y1: number, color: Color, k = 1): void {
     this.uprightSloped(ax, az, bx, bz, y0, y1, y1, color, k);
@@ -173,7 +229,7 @@ export class GeometryBuilder {
   ): void {
     const ex = ux * halfLen;
     const ez = uz * halfLen;
-    this.beam(cx - ex, cz - ez, cx + ex, cz + ez, halfThick, y0, y1, y1, true, true, side, top);
+    this.beam2(cx - ex, cz - ez, cx + ex, cz + ez, halfThick, y0, y0, y1, y1, true, true, side, top);
   }
 
   /**
@@ -188,6 +244,25 @@ export class GeometryBuilder {
     bz: number,
     halfThick: number,
     y0: number,
+    ya: number,
+    yb: number,
+    capA: boolean,
+    capB: boolean,
+    side: Color,
+    top: Color,
+  ): void {
+    this.beam2(ax, az, bx, bz, halfThick, y0, y0, ya, yb, capA, capB, side, top);
+  }
+
+  /** As `beam`, with a bottom that also slopes: from `ba` at a to `bb` at b. */
+  beam2(
+    ax: number,
+    az: number,
+    bx: number,
+    bz: number,
+    halfThick: number,
+    ba: number,
+    bb: number,
     ya: number,
     yb: number,
     capA: boolean,
@@ -213,10 +288,10 @@ export class GeometryBuilder {
     const z2 = bz + tz;
     const x3 = ax + tx;
     const z3 = az + tz;
-    this.uprightSloped(x0, z0, x1, z1, y0, ya, yb, side, sideShade(-nx, -nz));
-    if (capB) this.uprightSloped(x1, z1, x2, z2, y0, yb, yb, side, sideShade(ux, uz));
-    this.uprightSloped(x2, z2, x3, z3, y0, yb, ya, side, sideShade(nx, nz));
-    if (capA) this.uprightSloped(x3, z3, x0, z0, y0, ya, ya, side, sideShade(-ux, -uz));
+    this.wall4(x0, z0, x1, z1, ba, bb, ya, yb, side, sideShade(-nx, -nz));
+    if (capB) this.wall4(x1, z1, x2, z2, bb, bb, yb, yb, side, sideShade(ux, uz));
+    this.wall4(x2, z2, x3, z3, bb, ba, yb, ya, side, sideShade(nx, nz));
+    if (capA) this.wall4(x3, z3, x0, z0, ba, ba, ya, ya, side, sideShade(-ux, -uz));
     const a = this.vertex(x0, ya, z0, top);
     const b = this.vertex(x1, yb, z1, top);
     const c = this.vertex(x2, yb, z2, top);
@@ -233,6 +308,7 @@ export class GeometryBuilder {
     const geometry = new BufferGeometry();
     geometry.setAttribute('position', new BufferAttribute(this.positions.slice(0, n * 3), 3));
     geometry.setAttribute('color', new BufferAttribute(this.colors.slice(0, n * 3), 3));
+    if (this.trackSections) geometry.setAttribute('section', new BufferAttribute(this.sections.slice(0, n), 1));
     const used = this.indices.subarray(0, this.indexCount);
     geometry.setIndex(new BufferAttribute(n > 65535 ? used.slice() : new Uint16Array(used), 1));
     geometry.boundingSphere = this.bounds();
@@ -275,6 +351,9 @@ export class GeometryBuilder {
     const colors = new Float32Array(this.colors.length * 2);
     colors.set(this.colors);
     this.colors = colors;
+    const sections = new Float32Array(this.sections.length * 2);
+    sections.set(this.sections);
+    this.sections = sections;
   }
 
   private growIndices(): void {

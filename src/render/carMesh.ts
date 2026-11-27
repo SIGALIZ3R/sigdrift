@@ -84,6 +84,12 @@ const FLIGHT_PITCH_GAIN = 0.7;
 const FLIGHT_PITCH_MAX = 0.24;
 /** Below this speed the flight path's angle is worked out as if the car were doing this, m/s. */
 const FLIGHT_MIN_SPEED = 8;
+/** An axle counts as on the car's own road while the surface under it is within this of the car's height, m. */
+const AXLE_MATCH = 0.8;
+/** The body never rides further than this above or below the ground under its centre (bump crests, dips), m. */
+const MAX_RIDE = 0.4;
+/** The headlight pool is left out where the road ahead is not at the car's level (an edge, a drop), m. */
+const BEAM_MAX_STEP = 1.5;
 
 // What stays on the ground while the car is in the air: a dark blob and the underglow. Both shrink and fade as
 // the car climbs, which is what makes its height readable from a camera that never moves.
@@ -182,15 +188,16 @@ function groundShadow(length: number, width: number, texture: Texture): GroundMe
 export interface CarVisual {
   readonly group: Group;
   /**
-   * Poses the car for this frame. `ground` is the road it is on or above (flat when left out); `flash`, 0..1,
-   * lights the body red for a counted crash.
+   * Poses the car for this frame at `frame.height`. `ground` answers how high the road is (flat when left out):
+   * it places the shadow and underglow on the surface under the car and tilts the car with the slope. `flash`,
+   * 0..1, lights the body red for a counted crash.
    */
   update(frame: RenderFrame, ground?: Ground, flash?: number): void;
   dispose(): void;
 }
 
 class CarModel implements CarVisual {
-  /** At the car's position on the ground plane, turned to its heading. Never leaves y = 0. */
+  /** At the car's position on the ground plane, turned to its heading. Never leaves y = 0: heights are below. */
   readonly group = new Group();
   /** The car itself: raised to its height, pitched with the slope or the flight path. */
   private readonly body = new Group();
@@ -240,24 +247,40 @@ class CarModel implements CarVisual {
     const airborne = car.airborne === true;
     const cos = Math.cos(pose.heading);
     const sin = Math.sin(pose.heading);
-    const groundY = ground.heightAt(pose.x, pose.z);
-    const frontY = ground.heightAt(pose.x + cos * params.cgToFront, pose.z + sin * params.cgToFront);
-    const rearY = ground.heightAt(pose.x - cos * params.cgToRear, pose.z - sin * params.cgToRear);
-    const axleY = (frontY + rearY) / 2;
-    const wheelbase = params.cgToFront + params.cgToRear;
-    const groundPitch = wheelbase > 0 ? Math.atan2(frontY - rearY, wheelbase) : 0;
     const carY = frame.height || 0;
+    // The surface right under the car: its own road, or whatever is below once it has gone over an edge.
+    let groundY = ground.heightAt(pose.x, pose.z, carY);
+    // A grounded car stands on its road: if the render's ground has none at its height right under its centre (it is
+    // hugging an edge, or the render footprint disagrees with the simulation's by a hair), the car's own height is
+    // the ground. Otherwise the body would be lifted to the axles from the city floor far below.
+    if (!airborne && Math.abs(groundY - carY) > AXLE_MATCH) groundY = carY;
+    const wheelbase = params.cgToFront + params.cgToRear;
 
     // On the ground the car stands on its axles; in the air its nose follows where it is going.
-    let pitchTarget = groundPitch;
-    let rideTarget = axleY - groundY;
+    let pitchTarget = 0;
+    let rideTarget = 0;
+    let restY = groundY;
+    let groundPitch = 0;
     let rate = GROUND_PITCH_RATE;
     if (airborne) {
       const along = Math.max(FLIGHT_MIN_SPEED, Math.abs(car.forwardSpeed));
       const path = Math.atan2(car.vy || 0, along) * (car.forwardSpeed < 0 ? -1 : 1);
       pitchTarget = clamp(path * FLIGHT_PITCH_GAIN, FLIGHT_PITCH_MAX);
-      rideTarget = 0;
       rate = FLIGHT_PITCH_RATE;
+    } else {
+      const frontY = ground.heightAt(pose.x + cos * params.cgToFront, pose.z + sin * params.cgToFront, carY);
+      const rearY = ground.heightAt(pose.x - cos * params.cgToRear, pose.z - sin * params.cgToRear, carY);
+      if (wheelbase > 0 && Math.abs(frontY - carY) < AXLE_MATCH && Math.abs(rearY - carY) < AXLE_MATCH) {
+        // Both axles on the road: their heights give the slope and, over a crest, how far the body dips.
+        groundPitch = Math.atan2(frontY - rearY, wheelbase);
+        const axleY = (frontY + rearY) / 2;
+        rideTarget = clamp(axleY - groundY, MAX_RIDE);
+        restY = Math.max(groundY, axleY);
+      } else {
+        // Half over an edge or a step: trust the simulation's slope.
+        groundPitch = Math.atan(car.pitchSlope || 0);
+      }
+      pitchTarget = groundPitch;
     }
     const settle = 1 - Math.exp(-rate * dt);
     this.bodyPitch += (pitchTarget - this.bodyPitch) * settle;
@@ -274,7 +297,7 @@ class CarModel implements CarVisual {
     this.chassis.rotation.x = this.roll;
     this.chassis.rotation.z = this.pitch;
 
-    this.updateGroundLights(ground, pose.x, pose.z, cos, sin, Math.max(groundY, axleY), groundPitch, carY - groundY);
+    this.updateGroundLights(ground, pose.x, pose.z, cos, sin, restY, groundPitch, carY - groundY, carY);
 
     const braking = car.handbrake ? 1 : Math.min(1, Math.max(0, car.brake));
     this.brakeLight += (braking - this.brakeLight) * (1 - Math.exp(-BRAKE_LIGHT_RATE * dt));
@@ -302,6 +325,7 @@ class CarModel implements CarVisual {
     restY: number,
     groundPitch: number,
     altitude: number,
+    carY: number,
   ): void {
     const up = Math.min(1, Math.max(0, altitude / SHADOW_FADE_HEIGHT));
     this.groundRig.position.y = restY;
@@ -317,8 +341,10 @@ class CarModel implements CarVisual {
       this.underglow.material.color.copy(CAR.underglow).multiplyScalar(1 + (UNDERGLOW_MIN_LIGHT - 1) * up);
     }
     if (this.beam) {
-      // The beam lands ahead of the car, on whatever height the road has there.
-      this.beam.position.y = Y_BEAM + ground.heightAt(x + cos * this.beamReach, z + sin * this.beamReach);
+      // The beam lands ahead of the car, on whatever height the road has there; not off an edge or down a drop.
+      const beamY = ground.heightAt(x + cos * this.beamReach, z + sin * this.beamReach, carY);
+      this.beam.visible = Math.abs(beamY - restY) < BEAM_MAX_STEP;
+      this.beam.position.y = Y_BEAM + beamY;
       this.beam.material.color.copy(CAR.headlightBeam).multiplyScalar(1 + (BEAM_MIN_LIGHT - 1) * up);
     }
   }

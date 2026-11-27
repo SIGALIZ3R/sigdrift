@@ -1,17 +1,17 @@
 import { Game } from './game';
-import type { GameMode } from './game';
+import { LEVELS, getLevelDef } from './gen/levels';
 import { currentWeekId, parseWeekId } from './gen/weeklySeed';
-import type { CarParams, Difficulty, EndlessMode, EndlessWorld, GameRenderer, Level, RunMode, World } from './types';
+import type { CarParams, Difficulty, EndlessMode, EndlessWorld, GameMode, GameRenderer, Level, RunMode, World } from './types';
 import { DIFFICULTIES, loadEndlessDifficulty } from './ui/storage';
 
 interface DebugHandle {
   readonly mode: GameMode;
-  /** The weekly run, or null in endless mode. */
+  /** The weekly run or level, or null in endless mode. */
   readonly run: RunMode | null;
-  /** The endless run, or null in a weekly run. */
+  /** The endless run, or null otherwise. */
   readonly endless: EndlessMode | null;
   readonly world: World | EndlessWorld;
-  /** The weekly level, or null in endless mode. */
+  /** The level being driven or parked behind the menus, or null in endless mode. */
   readonly level: Level | null;
   params: CarParams;
   renderer: GameRenderer;
@@ -24,6 +24,8 @@ declare global {
     __sigdrift?: DebugHandle;
   }
 }
+
+const MODES: readonly GameMode[] = ['weekly', 'level', 'endless'];
 
 function requireElement(id: string): HTMLElement {
   const element = document.getElementById(id);
@@ -41,7 +43,7 @@ function chosenWeek(query: URLSearchParams): string {
   return currentWeekId(new Date());
 }
 
-/** `?difficulty=hard` for an endless autostart; otherwise the one last picked on the title screen. */
+/** `?difficulty=hard` for an endless autostart; otherwise the one last picked in the menus. */
 function chosenDifficulty(query: URLSearchParams): Difficulty {
   const requested = query.get('difficulty');
   const match = DIFFICULTIES.find((difficulty) => difficulty === requested);
@@ -50,6 +52,26 @@ function chosenDifficulty(query: URLSearchParams): Difficulty {
     console.warn(`SigDRIFT: ignoring ?difficulty=${requested}; it can be ${DIFFICULTIES.join(', ')}`);
   }
   return loadEndlessDifficulty();
+}
+
+/** `?mode=weekly|level|endless`; `?level=L3` alone implies level mode. Default: weekly. */
+function chosenMode(query: URLSearchParams): GameMode {
+  const requested = query.get('mode');
+  const match = MODES.find((mode) => mode === requested);
+  if (match) return match;
+  if (requested !== null) console.warn(`SigDRIFT: ignoring ?mode=${requested}; it can be ${MODES.join(', ')}`);
+  return query.get('level') !== null ? 'level' : 'weekly';
+}
+
+/** `?level=L3` (case-insensitive); otherwise the first level. */
+function chosenLevel(query: URLSearchParams): string {
+  const requested = query.get('level');
+  if (requested !== null) {
+    const def = getLevelDef(requested.toUpperCase());
+    if (def) return def.id;
+    console.warn(`SigDRIFT: ignoring ?level=${requested}; it can be ${LEVELS.map((d) => d.id).join(', ')}`);
+  }
+  return LEVELS[0].id;
 }
 
 function exposeForDebugging(game: Game): void {
@@ -96,12 +118,17 @@ function boot(): void {
   try {
     const query = new URLSearchParams(window.location.search);
     const weekId = chosenWeek(query);
-    // `?seed=abc` gives every endless run the same road. `?mode=endless&autostart=1` skips the title into one.
+    // `?seed=abc` gives every endless run the same road. `?autostart=1` skips the menus into the chosen mode.
     const game = new Game({ app: requireElement('app'), ui, weekId, endlessSeed: query.get('seed') });
     if (import.meta.env.DEV) exposeForDebugging(game);
-    if (query.get('autostart') !== '1') game.showTitle();
-    else if (query.get('mode') === 'endless') game.playEndless(chosenDifficulty(query));
-    else game.play(weekId);
+    if (query.get('autostart') !== '1') {
+      game.showTitle();
+    } else {
+      const mode = chosenMode(query);
+      if (mode === 'endless') game.playEndless(chosenDifficulty(query));
+      else if (mode === 'level') game.playLevel(chosenLevel(query));
+      else game.playWeekly(weekId);
+    }
     game.start();
   } catch (error) {
     console.error(error);

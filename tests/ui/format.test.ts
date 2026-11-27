@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { formatDelta, formatDistance, formatScore, formatTime } from '../../src/ui/format';
+import {
+  formatDate,
+  formatDelta,
+  formatDistance,
+  formatMultiplier,
+  formatRank,
+  formatScore,
+  formatTime,
+} from '../../src/ui/format';
 
 describe('formatTime', () => {
   it('formats ticks at 120 Hz as m:ss.mmm', () => {
@@ -107,5 +115,49 @@ describe('formatDistance', () => {
     expect(formatDistance(-0)).toBe('0 m');
     expect(formatDistance(NaN)).toBe('0 m');
     expect(formatDistance(Infinity)).toBe('0 m');
+  });
+});
+
+describe('formatMultiplier', () => {
+  it('shows one decimal, rounded down, with an x', () => {
+    expect(formatMultiplier(1)).toBe('x1.0');
+    expect(formatMultiplier(3.4)).toBe('x3.4');
+    expect(formatMultiplier(3.49)).toBe('x3.4');
+    expect(formatMultiplier(10)).toBe('x10.0');
+    expect(formatMultiplier(2.3)).toBe('x2.3');
+  });
+
+  it('reads anything below 1 or not a number as x1.0', () => {
+    expect(formatMultiplier(0)).toBe('x1.0');
+    expect(formatMultiplier(-4)).toBe('x1.0');
+    expect(formatMultiplier(NaN)).toBe('x1.0');
+    expect(formatMultiplier(Infinity)).toBe('x1.0');
+  });
+});
+
+describe('formatDate', () => {
+  it('keeps the calendar date of an ISO date-time', () => {
+    expect(formatDate('2026-11-27T12:34:56.000Z')).toBe('2026-11-27');
+    expect(formatDate('2026-01-02')).toBe('2026-01-02');
+  });
+
+  it('shows a date-time stamp on the player’s own calendar day', () => {
+    // Half past midnight local time is the previous day in UTC east of Greenwich.
+    expect(formatDate(new Date(2026, 10, 28, 0, 30).toISOString())).toBe('2026-11-28');
+    expect(formatDate(new Date(2026, 10, 27, 23, 50).toISOString())).toBe('2026-11-27');
+  });
+
+  it('is empty for anything else', () => {
+    expect(formatDate('')).toBe('');
+    expect(formatDate('yesterday')).toBe('');
+    expect(formatDate(5 as unknown as string)).toBe('');
+  });
+});
+
+describe('formatRank', () => {
+  it('adds English ordinal suffixes', () => {
+    expect([1, 2, 3, 4, 5, 11, 12, 13, 21, 22, 23, 101].map(formatRank)).toEqual([
+      '1st', '2nd', '3rd', '4th', '5th', '11th', '12th', '13th', '21st', '22nd', '23rd', '101st',
+    ]);
   });
 });

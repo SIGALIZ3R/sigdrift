@@ -7,7 +7,13 @@ import {
   MAX_BURST_MS,
   MAX_DIPS,
   MAX_INTERVAL_MS,
+  MAX_TRANSITION_MS,
   MIN_BURST_MS,
+  MIN_TRANSITION_MS,
+  ROW_FLICKER_MAX_MS,
+  ROW_FLICKER_MIN_MS,
+  SIGNAL_LOSS_MAX_DELAY_MS,
+  SIGNAL_LOSS_MIN_DELAY_MS,
   MIN_INTERVAL_MS,
   SOFT_MAX_BURST_MS,
   SOFT_MAX_OFFSET_PX,
@@ -21,6 +27,9 @@ import {
   notchClip,
   pickWeighted,
   planBurst,
+  planRowFlicker,
+  planSignalLoss,
+  planTransition,
   sliceBands,
 } from '../../src/ui/glitch';
 import type { GlitchKind, GlitchLevel, GlitchTraits } from '../../src/ui/glitch';
@@ -701,5 +710,55 @@ describe('createGlitcher', () => {
     advance(30_000);
     expect(node.history.length).toBe(before);
     glitcher.dispose();
+  });
+});
+
+describe('screen transitions, row flicker and signal loss (plans)', () => {
+  it('plans a 180-260 ms transition with every property it needs', () => {
+    for (let seed = 1; seed <= 200; seed++) {
+      const plan = planTransition(seeded(seed));
+      expect(plan.durationMs).toBeGreaterThanOrEqual(MIN_TRANSITION_MS);
+      expect(plan.durationMs).toBeLessThanOrEqual(MAX_TRANSITION_MS);
+      expect(plan.offsetPx).toBeGreaterThan(0);
+      expect(plan.offsetPx).toBeLessThanOrEqual(9);
+      expect(Object.keys(plan.props).sort()).toEqual(['--tx-b', '--tx-dur', '--tx-t', '--tx-x']);
+      const top = parseFloat(plan.props['--tx-t']);
+      const bottom = parseFloat(plan.props['--tx-b']);
+      expect(top).toBeGreaterThanOrEqual(0);
+      expect(bottom).toBeGreaterThanOrEqual(0);
+      expect(top + bottom).toBeLessThan(100);
+    }
+  });
+
+  it('plans row flickers within the soft limits', () => {
+    for (let seed = 1; seed <= 200; seed++) {
+      const plan = planRowFlicker(seeded(seed));
+      expect(plan.variant).toBe('flicker');
+      expect(plan.dips).toBeLessThanOrEqual(MAX_DIPS);
+      expect(plan.durationMs).toBeLessThanOrEqual(SOFT_MAX_BURST_MS);
+      expect(parseFloat(plan.props['--g-dip'])).toBeGreaterThanOrEqual(0.68);
+    }
+    // One row at a time, never sooner than the per-element cooldown allows a second flicker in the same second.
+    expect(ROW_FLICKER_MIN_MS).toBeGreaterThanOrEqual(500);
+    expect(ROW_FLICKER_MAX_MS).toBeGreaterThan(ROW_FLICKER_MIN_MS);
+  });
+
+  it('plans a signal loss every 6-10 s, short, with two tear bands', () => {
+    for (let seed = 1; seed <= 200; seed++) {
+      const plan = planSignalLoss(seeded(seed));
+      expect(plan.delayMs).toBeGreaterThanOrEqual(SIGNAL_LOSS_MIN_DELAY_MS);
+      expect(plan.delayMs).toBeLessThanOrEqual(SIGNAL_LOSS_MAX_DELAY_MS);
+      expect(plan.durationMs).toBeGreaterThanOrEqual(360);
+      expect(plan.durationMs).toBeLessThanOrEqual(520);
+      expect(plan.tearPx).toBeGreaterThanOrEqual(10);
+      expect(plan.tearPx).toBeLessThanOrEqual(22);
+      for (const i of [1, 2]) {
+        const top = parseFloat(plan.props[`--sl-t${i}`]);
+        const bottom = parseFloat(plan.props[`--sl-u${i}`]);
+        expect(top).toBeGreaterThanOrEqual(0);
+        expect(bottom).toBeGreaterThan(top);
+        expect(bottom).toBeLessThanOrEqual(100);
+      }
+    }
   });
 });

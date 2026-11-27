@@ -14,6 +14,7 @@ import type {
 } from '../../src/types';
 import { DT, SIM_HZ } from '../../src/types';
 import { hashNumbers } from '../../src/core/hash';
+import { MULTIPLIER_RATE, POINTS_RATE, RECOVER_TICKS, createScoreState } from '../../src/modes/driftScore';
 import {
   CHUNKS_AHEAD,
   CHUNKS_BEHIND,
@@ -125,11 +126,14 @@ function fullState(mode: EndlessMode): number[] {
     s.intensity,
     s.lastTakeoffTick,
     s.lastLandingTick,
-    s.driftScore,
-    s.chainScore,
-    s.multiplier,
-    s.drifting ? 1 : 0,
-    s.lastChainBreakTick,
+    s.score.points,
+    s.score.multiplier,
+    s.score.peakMultiplier,
+    s.score.drifting ? 1 : 0,
+    s.score.proximity,
+    s.score.combo,
+    s.score.lastMultiplierLossTick,
+    s.score.lastCloseTick,
   ];
 }
 
@@ -190,11 +194,7 @@ describe('start of an endless run', () => {
       intensity: 0,
       lastTakeoffTick: -1,
       lastLandingTick: -1,
-      driftScore: 0,
-      chainScore: 0,
-      multiplier: 1,
-      drifting: false,
-      lastChainBreakTick: -1,
+      score: createScoreState(),
     });
     expect(mode.world.chunks.map((c) => c.index)).toEqual([0, 1, 2, 3]);
     expect(road.served()).toBe(1 + CHUNKS_AHEAD);
@@ -442,7 +442,7 @@ describe('crashes', () => {
           ...generator,
           next(): TrackChunk {
             const chunk = generator.next();
-            if (chunk.index === 1) chunk.props.push({ kind: 'pillar', x: pillarX, z: 0, radius: 1.5, height: 5, hue: 0 });
+            if (chunk.index === 1) chunk.props.push({ kind: 'pillar', x: pillarX, z: 0, y: 0, radius: 1.5, height: 5, hue: 0 });
             return chunk;
           },
         };
@@ -526,8 +526,9 @@ describe('crashes', () => {
   it('is what happens to a driver who floors it and saws at the wheel', () => {
     const mode = started();
     for (let i = 0; i < 60 * SIM_HZ && mode.state.phase === 'running'; i++) {
-      // Full lock one way, then the other, every second.
-      mode.step({ ...FLOORED, steer: Math.floor(i / SIM_HZ) % 2 === 0 ? 1 : -1 });
+      // Full lock one way, then the other, every half second. (Sawing once a second, the loose car swings its nose
+      // into the wall and sits there with its wheels spinning.)
+      mode.step({ ...FLOORED, steer: Math.floor((2 * i) / SIM_HZ) % 2 === 0 ? 1 : -1 });
     }
     expect(mode.state.phase).toBe('dead');
     expect(mode.state.deathCause).toBe('crashes');
@@ -561,16 +562,22 @@ describe('leaving the road', () => {
     expect(mode.state.lastLandingTick - mode.state.lastTakeoffTick).toBe(flew);
   });
 
-  it('leaves the car where it came down', () => {
+  it('lets the car slide to a stop on the city floor where it came down, on its own brakes', () => {
     const mode = started({ bump: true });
     launch(mode, 40, -6, 0.45, 38);
     for (let i = 0; i < 3 * SIM_HZ && mode.state.phase === 'running'; i++) mode.step(IDLE);
     expect(mode.state.deathCause).toBe('offTrack');
-    const frozen = fullState(mode);
-    const { x, z, heading } = mode.world.car;
-    steps(mode, 2 * SIM_HZ, { ...FLOORED, steer: 1 });
-    expect(fullState(mode)).toEqual(frozen);
-    expect(mode.world.car).toMatchObject({ x, z, heading });
+    const frozen = { ...mode.state, score: { ...mode.state.score } };
+    const { x, z, y } = mode.world.car;
+    for (let i = 0; i < 4 * SIM_HZ; i++) {
+      mode.step({ ...FLOORED, steer: 1 });
+      expect(mode.world.car.throttle).toBe(0);
+    }
+    expect(mode.state).toEqual(frozen);
+    expect(mode.world.car.speed).toBe(0);
+    expect(mode.world.car.y).toBe(y);
+    expect(Math.hypot(mode.world.car.x - x, mode.world.car.z - z)).toBeGreaterThan(1);
+    expect(mode.world.offTrack).toBe(true);
   });
 
   it('does not end the run when a straight jump comes down on the road', () => {
@@ -655,100 +662,102 @@ describe('the window of live chunks', () => {
 });
 
 describe('drift scoring on the endless road', () => {
-  const POINTS_PER_TICK = 20 * 0.5 * DT * 10;
-  const GRACE_TICKS = Math.round(1.2 * SIM_HZ);
+  /** Points of the first tick of a 20 m/s, 0.5 rad slide in the open (multiplier 1 + one tick of climb). */
+  const FIRST_TICK = 20 * 0.5 * POINTS_RATE * DT * (1 + MULTIPLIER_RATE * DT);
 
-  it('follows the weekly rules: speed x angle x 10 a second, banked 1.2 s after the slide ends', () => {
+  it('follows the shared rules (driftScore.ts), with the world wall distance for the proximity', () => {
     const mode = started();
+    // In the middle of the road, well clear of the walls.
+    mode.world.placeCar({ x: 50, z: 0, heading: 0 });
+    expect(mode.world.wallDistance).toBeGreaterThan(4);
     stubPhysics(mode);
     slide(mode, 20, 0.5);
-    steps(mode, 100);
-    expect(mode.state.drifting).toBe(true);
-    expect(mode.state.chainScore).toBeCloseTo(100 * POINTS_PER_TICK, 9);
-    expect(mode.state.multiplier).toBe(1);
-    steps(mode, 2 * SIM_HZ);
-    expect(mode.state.multiplier).toBe(2);
-    const chain = mode.state.chainScore;
-    slide(mode, 20, 0);
-    steps(mode, GRACE_TICKS - 1);
-    expect(mode.state.driftScore).toBe(0);
     mode.step(IDLE);
-    expect(mode.state.driftScore).toBe(Math.round(chain * 2));
-    expect(mode.state.chainScore).toBe(0);
-    expect(mode.state.lastChainBreakTick).toBe(-1);
+    expect(mode.state.score.drifting).toBe(true);
+    expect(mode.state.score.points).toBeCloseTo(FIRST_TICK, 12);
+    steps(mode, 4 * SIM_HZ - 1);
+    expect(mode.state.score.multiplier).toBeCloseTo(1 + 4 * MULTIPLIER_RATE, 9);
+    expect(mode.state.score.proximity).toBe(0);
+    // Brushing a wall.
+    (mode.world as { wallDistance: number }).wallDistance = 0.2;
+    mode.step(IDLE);
+    expect(mode.state.score.proximity).toBe(1);
   });
 
-  it('scores nothing in the air, and the chain waits for the landing', () => {
+  it('scores nothing in the air, and the multiplier waits for the landing', () => {
     const mode = started();
     stubPhysics(mode);
     slide(mode, 20, 0.5);
     steps(mode, 50);
-    const chain = mode.state.chainScore;
+    const { points, multiplier } = mode.state.score;
     mode.world.car.airborne = true;
-    steps(mode, 3 * GRACE_TICKS);
-    expect(mode.state.drifting).toBe(false);
-    expect(mode.state.chainScore).toBe(chain);
-    expect(mode.state.driftScore).toBe(0);
+    steps(mode, 3 * SIM_HZ);
+    expect(mode.state.score.drifting).toBe(false);
+    expect(mode.state.score.points).toBe(points);
+    expect(mode.state.score.multiplier).toBe(multiplier);
     expect(mode.state.lastTakeoffTick).toBe(51);
     mode.world.car.airborne = false;
     steps(mode, 50);
-    expect(mode.state.lastLandingTick).toBe(51 + 3 * GRACE_TICKS);
-    expect(mode.state.drifting).toBe(true);
-    expect(mode.state.chainScore).toBeCloseTo(chain + 50 * POINTS_PER_TICK, 9);
-    expect(mode.state.lastChainBreakTick).toBe(-1);
+    expect(mode.state.lastLandingTick).toBe(51 + 3 * SIM_HZ);
+    expect(mode.state.score.drifting).toBe(true);
+    expect(mode.state.score.points).toBeGreaterThan(points);
   });
 
-  it('throws the chain away on a counted crash and on a spin', () => {
+  it('loses the multiplier, not the points, on a crash and on a spin', () => {
     const mode = started();
     const script = stubPhysics(mode);
     slide(mode, 20, 0.5);
-    steps(mode, 50);
+    steps(mode, 2 * SIM_HZ);
+    const points = mode.state.score.points;
     script.hit = hit(CRASH_IMPACT);
     mode.step(IDLE);
     expect(mode.state.crashes).toBe(1);
-    expect(mode.state.chainScore).toBe(0);
-    expect(mode.state.drifting).toBe(false);
-    expect(mode.state.lastChainBreakTick).toBe(51);
+    expect(mode.state.score.multiplier).toBe(1);
+    expect(mode.state.score.combo).toBe(0);
+    expect(mode.state.score.points).toBe(points);
+    expect(mode.state.score.lastMultiplierLossTick).toBe(2 * SIM_HZ + 1);
 
     script.hit = null;
+    // The wreck still sliding at an angle scores nothing until the car has straightened up after the lockout.
     steps(mode, 50);
-    expect(mode.state.chainScore).toBeGreaterThan(0);
-    slide(mode, 20, 2.3);
+    expect(mode.state.score.points).toBe(points);
+    expect(mode.state.score.multiplier).toBe(1);
+    slide(mode, 20, 0);
+    steps(mode, RECOVER_TICKS);
+    slide(mode, 20, 0.5);
+    steps(mode, 50);
+    expect(mode.state.score.multiplier).toBeGreaterThan(1);
+    slide(mode, 20, 2.4);
     mode.step(IDLE);
-    expect(mode.state.chainScore).toBe(0);
-    expect(mode.state.lastChainBreakTick).toBe(102);
-    expect(mode.state.driftScore).toBe(0);
+    expect(mode.state.score.multiplier).toBe(1);
+    expect(mode.state.score.lastMultiplierLossTick).toBe(2 * SIM_HZ + 102 + RECOVER_TICKS);
+    expect(mode.state.score.points).toBeGreaterThan(points);
     expect(mode.state.crashes).toBe(1);
   });
 
-  it('keeps what was banked and loses the chain in progress when the run ends', () => {
+  it('keeps every point when the run ends', () => {
     const mode = started();
     const script = stubPhysics(mode);
-    slide(mode, 20, 0.5);
-    steps(mode, 60);
+    // Going fast enough for each hit to be an accident of its own.
     slide(mode, 20, 0);
-    steps(mode, GRACE_TICKS);
-    const banked = mode.state.driftScore;
-    expect(banked).toBe(Math.round(60 * POINTS_PER_TICK));
-    // Two crashes without a chain, then a slide that ends in the third.
     for (let crash = 0; crash < 2; crash++) {
       script.hit = hit(6);
       mode.step(IDLE);
       script.hit = null;
       steps(mode, CRASH_COOLDOWN_TICKS);
     }
-    expect(mode.state.lastChainBreakTick).toBe(-1);
     slide(mode, 20, 0.5);
     steps(mode, 60);
-    expect(mode.state.chainScore).toBeGreaterThan(0);
+    const points = mode.state.score.points;
+    expect(points).toBeGreaterThan(0);
     script.hit = hit(6);
     mode.step(IDLE);
     expect(mode.state.phase).toBe('dead');
-    expect(mode.state.chainScore).toBe(0);
-    expect(mode.state.multiplier).toBe(1);
-    expect(mode.state.drifting).toBe(false);
-    expect(mode.state.driftScore).toBe(banked);
-    expect(mode.state.lastChainBreakTick).toBe(mode.state.ticks);
+    expect(mode.state.score.points).toBe(points);
+    expect(mode.state.score.multiplier).toBe(1);
+    expect(mode.state.score.drifting).toBe(false);
+    steps(mode, SIM_HZ);
+    expect(mode.state.score.points).toBe(points);
   });
 });
 
@@ -769,14 +778,16 @@ describe('a dead run', () => {
 
   it('is frozen: time, distance, crashes and score stay as they were, whatever the driver does', () => {
     const mode = crashOut();
-    const { ticks, distance, crashes, driftScore, lastCrashTick, intensity } = mode.state;
+    const { ticks, distance, crashes, lastCrashTick, intensity } = mode.state;
+    const points = mode.state.score.points;
     expect(mode.world.car.speed).toBeGreaterThan(15);
     const frozen = { ...mode.state };
     for (let i = 0; i < 8 * SIM_HZ; i++) {
       mode.step({ steer: i % 50 < 25 ? 1 : -1, throttle: 1, brake: 0, handbrake: false, reset: true });
       expect(mode.state).toEqual(frozen);
     }
-    expect(mode.state).toMatchObject({ ticks, distance, crashes, driftScore, lastCrashTick, intensity });
+    expect(mode.state).toMatchObject({ ticks, distance, crashes, lastCrashTick, intensity });
+    expect(mode.state.score.points).toBe(points);
     expect(mode.state.deathCause).toBe('crashes');
   });
 
@@ -855,7 +866,7 @@ describe('restart', () => {
     const first = trace(mode);
     // The script is rough enough to mean something: it jumps, slides, crashes three times and rolls to a stop.
     expect(mode.state.lastTakeoffTick).toBeGreaterThan(0);
-    expect(mode.state.driftScore).toBeGreaterThan(0);
+    expect(mode.state.score.points).toBeGreaterThan(0);
     expect(mode.state.deathCause).toBe('crashes');
     expect(mode.world.car.speed).toBe(0);
     mode.restart();

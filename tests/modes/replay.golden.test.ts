@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { hashNumbers } from '../../src/core/hash';
 import { Rng } from '../../src/core/rng';
 import { generateLevel } from '../../src/gen/trackGen';
+import { getLevelDef, generateLevelFor } from '../../src/gen/levels';
 import { createBot } from '../../src/modes/bot';
 import { createRunMode } from '../../src/modes/run';
 import { ASSIST_STRENGTH, DEFAULT_CAR_PARAMS, cloneParams } from '../../src/sim/params';
@@ -11,21 +12,28 @@ import type { InputState, Level, RunMode, World } from '../../src/types';
 import { GEN_VERSION, PHYSICS_VERSION, SIM_HZ } from '../../src/types';
 
 const WEEK = '2026-W48';
+/** The rough runs need pillars, which 2026-W48 no longer has at GEN_VERSION 2. */
+const ROUGH_WEEK = '2027-W05';
+/** The fall run needs raised road with open edges taken at full throttle: Vertigo Ramps has both. */
+const FALL_LEVEL = 'L3';
 const TICK_LIMIT = 200 * SIM_HZ;
 
 /**
- * Three recordings on 2026-W48, pinned. Between them they are the guard that says "the simulation changed".
+ * Recordings, pinned. Between them they are the guard that says "the simulation changed".
  *
  * WHAT EACH ONE COVERS
- * - The clean run: the bot drives to the finish. It grips, so it exercises the generator's output for the week,
- *   the engine, brakes, drag, steering, the pre-peak part of the tyre curve, gates and the clock. It touches no
- *   wall, never slides, never uses the handbrake and never scores a drift.
+ * - The clean run on 2026-W48: the bot drives to the finish. It grips, so it exercises the generator's output for
+ *   the week (hills, crests, an overpass, open edges), the engine, brakes, drag, steering, slope gravity, the
+ *   pre-peak part of the tyre curve, gates and the clock. It touches no wall and never leaves the ground.
  * - The roll-out: the same run carried on past the line while the car brakes itself to a stop in the run-off.
- * - The rough runs: a scripted hooligan (see `roughDriver`) for a fixed 75 s, once with the steering assist as the
- *   game ships it and once with it off. These cover what the clean run cannot: wall and pillar collisions,
- *   tyres past their peak, the handbrake, the steering assist, brake-to-reverse, respawns and drift scoring. The
- *   test asserts that each of those really happened, so the pin cannot quietly lose its coverage, and it hashes
- *   the run state (score, chain, splits, resets) along with the world, once a second.
+ * - The rough runs on 2027-W05: a scripted hooligan (see `roughDriver`) for a fixed 75 s, once with the steering
+ *   assist as the game ships it and once with it off. These cover what the clean run cannot: wall and pillar
+ *   collisions, tyres past their peak, the handbrake, the steering assist, brake-to-reverse, respawns, drift
+ *   scoring with the proximity bonus and lost multipliers. The test asserts that each of those really happened, so
+ *   the pin cannot quietly lose its coverage, and it hashes the run state (score, splits, resets) along with the
+ *   world, once a second.
+ * - The fall run on L3: full throttle and on/off steering along the bot's line for 90 s. It flies off crests and
+ *   off open edges onto the city floor, and is put back at its checkpoint after each fall.
  *
  * WHEN A PIN MOVES
  * If the generator or the physics changed ON PURPOSE in a released game, bump GEN_VERSION or PHYSICS_VERSION in
@@ -38,20 +46,29 @@ const TICK_LIMIT = 200 * SIM_HZ;
  *   the clean run went from 7146 ticks (59.55 s) to 6919 (57.66 s). The bot did not change.
  * - Still before release, braking stopped moving weight forward beyond BRAKE_TRANSFER_LIMIT (the brake pedal
  *   with a steering key held threw the tail out). Every hash moved; the clean run still takes 6919 ticks.
+ * - PHYSICS_VERSION 3 / GEN_VERSION 2 (2.5D roads, the drift retune, ScoreState scoring, falls, the bot's care
+ *   on hills and crests) moved every pin. The rough runs moved to 2027-W05 (W48 has no pillar left) with seed
+ *   golden-rough-3, and the fall run was added.
+ * - Open edges keep their whole landing zone clear of other road (not just 16 m), pillars stay off the outside of a
+ *   bend's exit, and the score locks out while a wreck slides after a crash: the rough and fall pins moved (the
+ *   generator's output for the weekly options changed, GEN_VERSION stays 2 before release). The clean run is
+ *   unchanged.
  */
-const PINNED_GEN_VERSION = 1;
-const PINNED_PHYSICS_VERSION = 2;
-const PINNED_FINISH_TICKS = 6919;
-const PINNED_FINISH_HASH = '1dfe335110005800';
-const PINNED_ROLL_OUT_HASH = '2a2abe5965dd636b';
-const PINNED_ROUGH_ASSISTED_HASH = '7bc62e22bf8e3420';
-const PINNED_ROUGH_UNASSISTED_HASH = '6e6a530794e08c34';
+const PINNED_GEN_VERSION = 2;
+const PINNED_PHYSICS_VERSION = 3;
+const PINNED_FINISH_TICKS = 6846;
+const PINNED_FINISH_HASH = 'df1b3dd29b743c1f';
+const PINNED_ROLL_OUT_HASH = '5d66b21d43398cb1';
+const PINNED_ROUGH_ASSISTED_HASH = '8032ac6d2a19b047';
+const PINNED_ROUGH_UNASSISTED_HASH = '21abae8bce4195ea';
+const PINNED_FALL_HASH = '952fcb22876474f3';
 
 const ROLL_OUT_TICKS = 4 * SIM_HZ;
 const ROUGH_TICKS = 75 * SIM_HZ;
 const ROUGH_SAMPLE_EVERY = SIM_HZ;
 /** Chosen because this script finds walls, a pillar, spins and three checkpoints. Changing it moves the pins. */
-const ROUGH_SEED = 'golden-rough-6';
+const ROUGH_SEED = 'golden-rough-3';
+const FALL_TICKS = 90 * SIM_HZ;
 /** Share of the half-second slots in which the rough driver simply follows the road. */
 const ROUGH_FOLLOW = 0.6;
 
@@ -93,15 +110,22 @@ function fullState(run: RunMode): number[] {
     s.countdownTicks,
     s.nextCheckpoint,
     s.resets,
-    s.driftScore,
-    s.chainScore,
-    s.multiplier,
-    s.drifting ? 1 : 0,
+    s.falls,
+    s.lastFallTick,
+    s.respawnInTicks,
+    s.score.points,
+    s.score.multiplier,
+    s.score.peakMultiplier,
+    s.score.drifting ? 1 : 0,
+    s.score.proximity,
+    s.score.combo,
+    s.score.lastMultiplierLossTick,
+    s.score.lastCloseTick,
     s.lastCheckpointTick,
-    s.lastChainBreakTick,
     s.respawn.x,
     s.respawn.z,
     s.respawn.heading,
+    s.respawn.y ?? 0,
     ...s.splits,
   ];
 }
@@ -155,14 +179,15 @@ interface RoughRun {
   handbrakeTicks: number;
   reversingTicks: number;
   driftingTicks: number;
-  chainBreaks: number;
+  multiplierLosses: number;
+  closeCalls: number;
   resets: number;
   checkpoints: number;
-  driftScore: number;
+  points: number;
 }
 
 function roughRun(steerAssist: number): RoughRun {
-  const level = generateLevel(WEEK);
+  const level = generateLevel(ROUGH_WEEK);
   const params = cloneParams(DEFAULT_CAR_PARAMS);
   params.steerAssist = steerAssist;
   const world = createWorld(level, params);
@@ -179,12 +204,14 @@ function roughRun(steerAssist: number): RoughRun {
     handbrakeTicks: 0,
     reversingTicks: 0,
     driftingTicks: 0,
-    chainBreaks: 0,
+    multiplierLosses: 0,
+    closeCalls: 0,
     resets: 0,
     checkpoints: 0,
-    driftScore: 0,
+    points: 0,
   };
-  let lastBreak = -1;
+  let lastLoss = -1;
+  let lastClose = -1;
   for (let tick = 0; tick < ROUGH_TICKS; tick++) {
     run.step(quantizeInput(driver(world, run, tick)));
     const car = world.car;
@@ -199,10 +226,15 @@ function roughRun(steerAssist: number): RoughRun {
       if (car.rearSlide === 1 && car.frontSlide > 0) seen.pastPeakTicks++;
       if (car.handbrake) seen.handbrakeTicks++;
       if (car.reversing && car.forwardSpeed < -1) seen.reversingTicks++;
-      if (run.state.drifting) seen.driftingTicks++;
-      if (run.state.lastChainBreakTick !== lastBreak) {
-        lastBreak = run.state.lastChainBreakTick;
-        seen.chainBreaks++;
+      const score = run.state.score;
+      if (score.drifting) seen.driftingTicks++;
+      if (score.lastMultiplierLossTick !== lastLoss) {
+        lastLoss = score.lastMultiplierLossTick;
+        seen.multiplierLosses++;
+      }
+      if (score.lastCloseTick !== lastClose) {
+        lastClose = score.lastCloseTick;
+        seen.closeCalls++;
       }
     }
     if ((tick + 1) % ROUGH_SAMPLE_EVERY === 0) samples.push(...fullState(run));
@@ -210,7 +242,7 @@ function roughRun(steerAssist: number): RoughRun {
   // Not finishing is part of the design: the run is a fixed length, so the pin never depends on reaching the goal.
   seen.resets = run.state.resets;
   seen.checkpoints = run.state.nextCheckpoint;
-  seen.driftScore = run.state.driftScore;
+  seen.points = run.state.score.points;
   seen.hash = hashNumbers(samples);
   return seen;
 }
@@ -276,15 +308,16 @@ describe(`rough golden runs on ${WEEK}`, () => {
     // script needs changing: the pin below would otherwise stop guarding it.
     expect(seen.collisionTicks).toBeGreaterThan(20);
     expect(seen.hardHits).toBeGreaterThan(1);
-    // Pillars are circles and take their own path through the collision code; the assisted run clips one.
-    if (steerAssist > 0) expect(seen.pillarHits).toBeGreaterThan(0);
+    // Pillars are circles and take their own path through the collision code.
+    expect(seen.pillarHits).toBeGreaterThan(0);
     expect(seen.slidingTicks).toBeGreaterThan(SIM_HZ);
     expect(seen.pastPeakTicks).toBeGreaterThan(0);
     expect(seen.handbrakeTicks).toBeGreaterThan(SIM_HZ);
     expect(seen.reversingTicks).toBeGreaterThan(SIM_HZ);
     expect(seen.driftingTicks).toBeGreaterThan(SIM_HZ);
-    expect(seen.chainBreaks).toBeGreaterThan(0);
-    expect(seen.driftScore).toBeGreaterThan(0);
+    expect(seen.multiplierLosses).toBeGreaterThan(1);
+    expect(seen.closeCalls).toBeGreaterThan(1);
+    expect(seen.points).toBeGreaterThan(0);
     expect(seen.resets).toBeGreaterThanOrEqual(3);
     expect(seen.checkpoints).toBeGreaterThanOrEqual(1);
     expect(seen.hash).toBe(pinned);
@@ -296,5 +329,54 @@ describe(`rough golden runs on ${WEEK}`, () => {
 
   it('is a different run with the assist off', () => {
     expect(roughRun(0).hash).not.toBe(roughRun(ASSIST_STRENGTH).hash);
+  });
+});
+
+describe(`golden fall run on ${FALL_LEVEL}`, () => {
+  function fallRun(): { hash: string; falls: number; waitTicks: number; airTicks: number; floorTicks: number; checkpoints: number } {
+    const def = getLevelDef(FALL_LEVEL);
+    if (def === null) throw new Error(FALL_LEVEL);
+    const level = generateLevelFor(def);
+    const world = createWorld(level);
+    const run = createRunMode(world);
+    const bot = createBot(level);
+    const input: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
+    const samples: number[] = [];
+    let waitTicks = 0;
+    let airTicks = 0;
+    let floorTicks = 0;
+    for (let tick = 0; tick < FALL_TICKS; tick++) {
+      const wanted = bot(world, run.state);
+      input.steer = Math.abs(wanted.steer) > 0.2 ? Math.sign(wanted.steer) : 0;
+      input.throttle = run.state.phase === 'running' ? 1 : 0;
+      input.reset = wanted.reset;
+      run.step(quantizeInput(input));
+      if (run.state.respawnInTicks > 0) waitTicks++;
+      if (world.car.airborne) airTicks++;
+      if (world.offTrack) floorTicks++;
+      if ((tick + 1) % ROUGH_SAMPLE_EVERY === 0) samples.push(...fullState(run));
+    }
+    return {
+      hash: hashNumbers(samples),
+      falls: run.state.falls,
+      waitTicks,
+      airTicks,
+      floorTicks,
+      checkpoints: run.state.nextCheckpoint,
+    };
+  }
+
+  it('falls off, waits on the floor and is put back, and matches its pin', () => {
+    const seen = fallRun();
+    expect(seen.falls).toBeGreaterThanOrEqual(2);
+    expect(seen.waitTicks).toBeGreaterThan(seen.falls * (SIM_HZ / 2));
+    expect(seen.floorTicks).toBeGreaterThan(0);
+    expect(seen.airTicks).toBeGreaterThan(SIM_HZ);
+    expect(seen.checkpoints).toBeGreaterThanOrEqual(1);
+    expect(seen.hash).toBe(PINNED_FALL_HASH);
+  });
+
+  it('is the same run twice over', () => {
+    expect(fallRun()).toEqual(fallRun());
   });
 });

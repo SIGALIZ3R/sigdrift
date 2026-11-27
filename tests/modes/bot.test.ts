@@ -5,11 +5,20 @@ import { cos, sin } from '../../src/core/fixedMath';
 import { createBot } from '../../src/modes/bot';
 import { COUNTDOWN_TICKS, createRunMode } from '../../src/modes/run';
 import { generateLevel } from '../../src/gen/trackGen';
+import { LEVELS, generateLevelFor } from '../../src/gen/levels';
 import { shiftWeek } from '../../src/gen/weeklySeed';
 import { ASSIST_STRENGTH, DEFAULT_CAR_PARAMS, cloneParams } from '../../src/sim/params';
 import { quantizeInput } from '../../src/sim/replay';
 import { createWorld } from '../../src/sim/world';
-import { makeStraightLevel } from '../helpers/handLevel';
+import {
+  CROSSING,
+  OPEN_EDGE,
+  makeCrossingLevel,
+  makeOpenEdgeLevel,
+  makeRampLevel,
+  makeShapedLevel,
+  makeStraightLevel,
+} from '../helpers/handLevel';
 
 const FIRST_WEEK = '2026-W48';
 const WEEKS = Array.from({ length: 12 }, (_, i) => shiftWeek(FIRST_WEEK, i));
@@ -43,6 +52,8 @@ interface Drive {
   run: RunMode;
   /** Ticks on which the car touched anything while the run was on. */
   contacts: number;
+  /** Ticks the car spent in the air while the run was on. */
+  airTicks: number;
   resetPresses: number[];
 }
 
@@ -51,19 +62,20 @@ function botDrive(level: Level, seconds: number): Drive {
   const world = createWorld(level);
   const run = createRunMode(world);
   const bot = createBot(level);
-  const drive: Drive = { world, run, contacts: 0, resetPresses: [] };
+  const drive: Drive = { world, run, contacts: 0, airTicks: 0, resetPresses: [] };
   const limit = COUNTDOWN_TICKS + seconds * SIM_HZ;
   for (let i = 0; i < limit && run.state.phase !== 'finished'; i++) {
     const input = quantizeInput(bot(world, run.state));
     if (input.reset) drive.resetPresses.push(run.state.ticks);
     run.step(input);
     if (run.state.phase === 'running' && world.lastCollision !== null) drive.contacts++;
+    if (run.state.phase === 'running' && world.car.airborne) drive.airTicks++;
   }
   return drive;
 }
 
 function withPillar(level: Level, x: number, z: number, radius: number): Level {
-  level.props.push({ kind: 'pillar', x, z, radius, height: 4, hue: 0 });
+  level.props.push({ kind: 'pillar', x, z, y: 0, radius, height: 4, hue: 0 });
   return level;
 }
 
@@ -144,7 +156,7 @@ describe('bot', () => {
   it('presses reset for one tick after 4 s without progress, and again every 4 s', () => {
     const level = makeStraightLevel(200, 8);
     // A wall right across the road: there is no way through.
-    level.walls.push({ ax: 30, az: -8, bx: 30, bz: 8 });
+    level.walls.push({ ax: 30, az: -8, bx: 30, bz: 8, ya: 0, yb: 0 });
     const { run, resetPresses } = botDrive(level, 30);
     expect(run.state.phase).toBe('running');
     expect(resetPresses.length).toBeGreaterThanOrEqual(3);
@@ -192,12 +204,98 @@ describe('bot', () => {
  * The driveability gate: a level the bot cannot finish cleanly is a level a player should not be given. A failure
  * here means the bot, the physics or the generator changed; the week id in the test name says where to look.
  */
+describe('the bot on roads with height', () => {
+  it('climbs and descends a ramp without leaving the ground or touching anything', () => {
+    const { run, contacts, airTicks } = botDrive(makeRampLevel(), 60);
+    expect(run.state.phase).toBe('finished');
+    expect(contacts).toBe(0);
+    expect(airTicks).toBe(0);
+  });
+
+  it('takes a crest slowly enough to keep its wheels down', () => {
+    // A short sharp hump: up 4 m over 30 m and straight back down.
+    const level = makeShapedLevel('hump', [{ length: 120 }, { length: 30, rise: 4 }, { length: 30, rise: -4 }, { length: 120 }], 9);
+    const { run, contacts, airTicks } = botDrive(level, 60);
+    expect(run.state.phase).toBe('finished');
+    expect(contacts).toBe(0);
+    expect(airTicks).toBe(0);
+  });
+
+  it('follows its own road where it passes over itself, and is not confused by the road below', () => {
+    const level = makeCrossingLevel();
+    const { world, run, contacts } = botDrive(level, 60);
+    expect(run.state.phase).toBe('finished');
+    expect(contacts).toBe(0);
+    expect(run.state.falls).toBe(0);
+    expect(world.car.y).toBeCloseTo(CROSSING.height, 1);
+  });
+
+  it('crosses an open-edged bridge over the road below without falling', () => {
+    const { run, contacts } = botDrive(makeCrossingLevel(true), 60);
+    expect(run.state.phase).toBe('finished');
+    expect(contacts).toBe(0);
+    expect(run.state.falls).toBe(0);
+  });
+
+  it('finds itself on the right level after a respawn over the road below', () => {
+    const level = makeCrossingLevel();
+    const world = createWorld(level);
+    const run = createRunMode(world);
+    const bot = createBot(level);
+    for (let i = 0; i < COUNTDOWN_TICKS; i++) run.step(bot(world, run.state));
+    // Straight onto the bridge, right above the lower road, as a respawn would put it.
+    const bridge = level.path.findIndex((p) => p.y > CROSSING.height - 0.01 && Math.abs(p.z) < 3);
+    expect(bridge).toBeGreaterThan(0);
+    const p = level.path[bridge];
+    world.placeCar({ x: p.x, z: p.z, heading: -HALF_PI_FOR_TEST, y: p.y });
+    // Only the goal, at the far end of the bridge, is left to cross.
+    run.state.nextCheckpoint = run.state.checkpointCount;
+    for (let i = 0; i < 30 * SIM_HZ && run.state.phase !== 'finished'; i++) {
+      run.step(quantizeInput(bot(world, run.state)));
+      expect(world.lastCollision).toBeNull();
+    }
+    expect(run.state.phase).toBe('finished');
+  });
+
+  it('keeps away from open edges and does not fall off a raised open stretch with a pillar on it', () => {
+    const level = makeOpenEdgeLevel();
+    const middle = (OPEN_EDGE.openFrom + OPEN_EDGE.openTo) / 2;
+    level.props.push({ kind: 'pillar', x: middle, z: 0, y: OPEN_EDGE.height, radius: 1.5, height: 4, hue: 0 });
+    const { world, run, contacts } = botDrive(level, 60);
+    expect(run.state.phase).toBe('finished');
+    expect(contacts).toBe(0);
+    expect(run.state.falls).toBe(0);
+    expect(world.offTrack).toBe(false);
+  });
+});
+
+/** Heading north (-z) in the crossing level's frame. */
+const HALF_PI_FOR_TEST = Math.PI / 2;
+
+describe('driveability of the five levels', () => {
+  it.each(LEVELS.map((def) => [def.id, def.name] as const))('%s (%s): the bot finishes cleanly in under 150 s', (id) => {
+    const def = LEVELS.find((d) => d.id === id);
+    if (def === undefined) throw new Error(id);
+    const { run, contacts } = botDrive(generateLevelFor(def), TIME_LIMIT_S);
+    expect(run.state.phase).toBe('finished');
+    expect(contacts).toBe(0);
+    expect(run.state.falls).toBe(0);
+    expect(run.state.resets).toBe(0);
+    expect(run.state.ticks * DT).toBeLessThan(TIME_LIMIT_S);
+    expect(run.state.splits).toHaveLength(run.state.checkpointCount);
+    expect(rollOutContacts(run)).toBe(0);
+    expect(run.world.car.speed).toBe(0);
+  });
+});
+
 describe('driveability of the weekly levels', () => {
   it.each(WEEKS)('%s: the bot finishes in under 150 s with at most 3 resets', (id) => {
     const { run, contacts } = botDrive(generateLevel(id), TIME_LIMIT_S);
     expect(run.state.phase).toBe('finished');
-    // It does better than the limits ask: no wall and no pillar is so much as brushed on the way.
+    // It does better than the limits ask: no wall and no pillar is so much as brushed on the way, and it never
+    // falls off the road.
     expect(contacts).toBe(0);
+    expect(run.state.falls).toBe(0);
     expect(run.state.ticks * DT).toBeLessThan(TIME_LIMIT_S);
     expect(run.state.resets).toBeLessThanOrEqual(MAX_RESETS);
     expect(run.state.nextCheckpoint).toBe(run.state.checkpointCount);
@@ -250,6 +348,7 @@ interface KeyboardDrive {
   resets: number;
   /** Times the car went past 1.6 rad of drift at speed: a spin. */
   spins: number;
+  falls: number;
 }
 
 function keyboardDrive(level: Level, steerAssist: number, keys: KeyboardStyle): KeyboardDrive {
@@ -281,6 +380,7 @@ function keyboardDrive(level: Level, steerAssist: number, keys: KeyboardStyle): 
     seconds: run.state.ticks * DT,
     resets: run.state.resets,
     spins,
+    falls: run.state.falls,
   };
 }
 
@@ -293,11 +393,12 @@ describe('driveability of the weekly levels on a keyboard, assist on', () => {
     const drive = keyboardDrive(generateLevel(id), ASSIST_STRENGTH, STEADY_HANDS);
     expect(drive.finished).toBe(true);
     expect(drive.spins).toBe(0);
+    expect(drive.falls).toBe(0);
     expect(drive.resets).toBeLessThanOrEqual(1);
     expect(drive.seconds).toBeLessThan(90);
   });
 
-  it('copes with twitchy hands on every level, where the same hands without the assist spin', () => {
+  it('copes with twitchy hands on every level, with the assist on and with it off', () => {
     let assistedSpins = 0;
     let unaidedSpins = 0;
     let unaidedFinishes = 0;
@@ -306,17 +407,17 @@ describe('driveability of the weekly levels on a keyboard, assist on', () => {
       const assisted = keyboardDrive(level, ASSIST_STRENGTH, TWITCHY_HANDS);
       expect(assisted.finished, id).toBe(true);
       expect(assisted.resets, id).toBeLessThanOrEqual(MAX_RESETS);
+      expect(assisted.falls, id).toBe(0);
       assistedSpins += assisted.spins;
       const unaided = keyboardDrive(level, 0, TWITCHY_HANDS);
       unaidedSpins += unaided.spins;
       if (unaided.finished) unaidedFinishes++;
     }
+    console.log(`twitchy hands on ${WEEKS.length} weeks: ${assistedSpins} spins with the assist, ${unaidedSpins} without it (${unaidedFinishes} finished)`);
     expect(assistedSpins).toBeLessThanOrEqual(WEEKS.length / 2);
-    // With the assist off the car is as loose as it was built to be: these hands are not good enough for it.
-    // (About one spin a level. It was three before braking stopped unloading the rear axle past
-    // BRAKE_TRANSFER_LIMIT: most of those spins came from the brake pedal, not from the hands.)
-    expect(unaidedSpins).toBeGreaterThan(8);
-    expect(unaidedSpins).toBeGreaterThan(2 * assistedSpins);
-    expect(unaidedFinishes).toBeLessThan(WEEKS.length);
+    // PHYSICS_VERSION 3: the drift-happy car no longer punishes these hands without the assist (about one spin in
+    // twelve levels, where the old car spun about once a level), so the old "the assist is what saves them"
+    // comparison is gone. Both ways round the levels must be finishable on keys.
+    expect(unaidedFinishes).toBeGreaterThanOrEqual(WEEKS.length - 2);
   });
 });

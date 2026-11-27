@@ -126,15 +126,15 @@ describe('world', () => {
       expect(snapshot).toContain(value);
     }
     expect(snapshot.every(Number.isFinite)).toBe(true);
-    // The height state is in there too. A fixed level is flat: wheels at 0, no vertical speed, never airborne.
-    expect(snapshot.slice(-3)).toEqual([0, 0, 0]);
+    // The height state and offTrack are in there too. This level is flat at y = 0: wheels at 0, no vertical speed.
+    expect(snapshot.slice(-4)).toEqual([0, 0, 0, 0]);
     expect(car).toMatchObject({ y: 0, vy: 0, airborne: false });
     world.step(IDLE);
     expect(world.snapshot()).not.toEqual(snapshot);
     world.car.y = 0.5;
     world.car.vy = 2;
     world.car.airborne = true;
-    expect(world.snapshot().slice(-3)).toEqual([0.5, 2, 1]);
+    expect(world.snapshot().slice(-4)).toEqual([0.5, 2, 1, 0]);
   });
 
   it('takes steps of exactly DT', () => {

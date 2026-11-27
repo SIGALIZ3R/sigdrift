@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createAudio } from '../../src/audio/mixer';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { BLIP_KINDS, createAudio } from '../../src/audio/mixer';
 import type { BlipKind, GameAudio } from '../../src/audio/mixer';
-import { CLIP_CEILING } from '../../src/audio/mapping';
+import { CLIP_CEILING, OUTPUT_TRIM } from '../../src/audio/mapping';
 import { DEFAULT_CAR_PARAMS } from '../../src/sim/params';
 import type { CarState } from '../../src/types';
 import { FakeAudioContext, FakeNode } from './fakeAudio';
@@ -69,6 +69,7 @@ function car(overrides: Partial<CarState> = {}): CarState {
     y: 0,
     vy: 0,
     airborne: false,
+    pitchSlope: 0,
     ...overrides,
   };
 }
@@ -82,6 +83,7 @@ function started(): { audio: GameAudio; ctx: FakeAudioContext } {
 
 /** The fixed end of the graph, found by walking back from the speakers. */
 interface MasterChain {
+  trim: FakeNode;
   clipper: FakeNode;
   limiter: FakeNode;
   mute: FakeNode;
@@ -90,14 +92,16 @@ interface MasterChain {
 
 function masterChain(ctx: FakeAudioContext): MasterChain {
   expect(ctx.destination.inputs).toHaveLength(1);
-  const clipper = ctx.destination.inputs[0];
+  const trim = ctx.destination.inputs[0];
+  expect(trim.inputs).toHaveLength(1);
+  const clipper = trim.inputs[0];
   expect(clipper.inputs).toHaveLength(1);
   const limiter = clipper.inputs[0];
   expect(limiter.inputs).toHaveLength(1);
   const mute = limiter.inputs[0];
   expect(mute.inputs).toHaveLength(1);
   const master = mute.inputs[0];
-  return { clipper, limiter, mute, master };
+  return { trim, clipper, limiter, mute, master };
 }
 
 function gain(node: FakeNode): FakeParam {
@@ -112,7 +116,7 @@ function drive(audio: GameAudio, ctx: FakeAudioContext, state: CarState, frames:
   }
 }
 
-const ALL_BLIPS: BlipKind[] = ['countdown', 'go', 'checkpoint', 'finish', 'reset', 'crash', 'death', 'land'];
+const ALL_BLIPS: BlipKind[] = [...BLIP_KINDS];
 
 describe('audio without WebAudio', () => {
   it('is a silent no-op when there is no AudioContext at all', () => {
@@ -165,9 +169,10 @@ describe('audio without WebAudio', () => {
 });
 
 describe('audio graph', () => {
-  it('ends in volume -> mute -> limiter -> clipper -> speakers, with no way round', () => {
+  it('ends in volume -> mute -> limiter -> clipper -> trim -> speakers, with no way round', () => {
     const { ctx } = started();
-    const { clipper, limiter, mute, master } = masterChain(ctx);
+    const { trim, clipper, limiter, mute, master } = masterChain(ctx);
+    expect(trim.kind).toBe('gain');
     expect(clipper.kind).toBe('waveShaper');
     expect(limiter.kind).toBe('compressor');
     expect(mute.kind).toBe('gain');
@@ -180,8 +185,9 @@ describe('audio graph', () => {
     if (curve) for (const y of curve) expect(Math.abs(y)).toBeLessThanOrEqual(CLIP_CEILING + 1e-6);
     // Everything else has to go through the volume control.
     for (const node of ctx.nodes) {
-      if (node === master || node === mute || node === limiter || node === clipper) continue;
+      if (node === master || node === mute || node === limiter || node === clipper || node === trim) continue;
       for (const output of node.outputs) {
+        expect(output).not.toBe(trim);
         expect(output).not.toBe(mute);
         expect(output).not.toBe(limiter);
         expect(output).not.toBe(clipper);
@@ -804,3 +810,235 @@ describe('lifecycle', () => {
     expect(FakeAudioContext.instances).toHaveLength(1);
   });
 });
+
+describe('ten percent quieter', () => {
+  it('trims everything by OUTPUT_TRIM = 0.9 after the limiter and clipper, leaving the volume setting alone', () => {
+    expect(OUTPUT_TRIM).toBe(0.9);
+    const { audio, ctx } = started();
+    const { trim, master } = masterChain(ctx);
+    expect(gain(trim).value).toBe(0.9);
+    expect(gain(master).value).toBe(0.5);
+    // Every sound the game can make: engine, tyres, ambience, a thump and every cue.
+    drive(audio, ctx, car({ speed: 25, forwardSpeed: 22, throttle: 1, rearSlide: 1, driftAngle: 0.6 }), 30);
+    audio.collision(10);
+    for (const kind of ALL_BLIPS) {
+      ctx.currentTime += 1;
+      audio.blip(kind);
+    }
+    const sources = ctx.nodes.filter((node) => node.isSource);
+    expect(sources.length).toBeGreaterThan(30);
+    // The speakers hear one node, and that is the trim: no sound has a way past it.
+    expect(ctx.destination.inputs).toEqual([trim]);
+    for (const source of sources) expect(source.reaches(trim)).toBe(true);
+    for (const node of ctx.nodes) if (node !== trim) expect(node.outputs).not.toContain(ctx.destination);
+    // Volume and mute never touch it.
+    audio.setVolume(1);
+    audio.setMuted(true);
+    audio.setMuted(false);
+    expect(gain(trim).events).toHaveLength(0);
+    expect(gain(trim).value).toBe(0.9);
+  });
+});
+
+describe('new cues', () => {
+  function play(kind: BlipKind): { ctx: FakeAudioContext; created: FakeNode[]; master: FakeNode; t0: number } {
+    const { audio, ctx } = started();
+    const existing = new Set(ctx.nodes);
+    ctx.currentTime = 2;
+    audio.blip(kind);
+    return { ctx, created: ctx.nodes.filter((n) => !existing.has(n)), master: masterChain(ctx).master, t0: 2 };
+  }
+
+  /** Sum of the peak levels of every envelope a cue put on the master. */
+  function loudness(created: FakeNode[], master: FakeNode): number {
+    return created
+      .filter((n) => n.kind === 'gain' && n.outputs[0] === master)
+      .reduce((sum, env) => sum + Math.max(...gain(env).events.map((e) => e.value)), 0);
+  }
+
+  function length(created: FakeNode[], t0: number): number {
+    return Math.max(...created.filter((n) => n.isSource).map((s) => s.stopTime)) - t0;
+  }
+
+  it('fall: a whoosh of noise sweeping down, a falling whistle, then a low thud from the floor', () => {
+    const { created, t0 } = play('fall');
+    const whoosh = created.find((n) => n.kind === 'biquad' && n.type === 'bandpass');
+    expect(whoosh).toBeDefined();
+    if (whoosh) {
+      const f = whoosh.params.frequency.events;
+      expect(f[f.length - 1].value).toBeLessThan(f[0].value * 0.2);
+      expect(f[f.length - 1].time - f[0].time).toBeGreaterThan(0.5);
+    }
+    const thud = created.find((n) => n.kind === 'oscillator' && n.type === 'sine');
+    expect(thud).toBeDefined();
+    if (thud) {
+      expect(thud.params.frequency.events[0].value).toBeLessThan(150);
+      expect(thud.startTime - t0).toBeGreaterThan(0.5);
+    }
+    const len = length(created, t0);
+    expect(len).toBeGreaterThan(0.8);
+    expect(len).toBeLessThan(1.5);
+  });
+
+  it('close: a short, quiet, bright glint', () => {
+    const { created, master, t0 } = play('close');
+    for (const tone of created.filter((n) => n.kind === 'oscillator')) {
+      expect(tone.params.frequency.events[0].value).toBeGreaterThan(1500);
+    }
+    expect(length(created, t0)).toBeLessThan(0.15);
+    expect(loudness(created, master)).toBeLessThan(0.15);
+  });
+
+  it('close is rate-limited to four a second however often it is asked for', () => {
+    const { audio, ctx } = started();
+    const oscillators = (): number => ctx.ofKind('oscillator').length;
+    const before = oscillators();
+    ctx.currentTime = 1;
+    let plays = 0;
+    let last = before;
+    for (let frame = 0; frame < 60; frame++) {
+      audio.blip('close');
+      if (oscillators() > last) plays++;
+      last = oscillators();
+      ctx.currentTime += 1 / 60;
+    }
+    expect(plays).toBe(4);
+    // After a pause it plays straight away again.
+    ctx.currentTime += 0.5;
+    audio.blip('close');
+    expect(oscillators()).toBeGreaterThan(last);
+  });
+
+  it('does not rate-limit the race chimes', () => {
+    const { audio, ctx } = started();
+    const before = ctx.nodes.length;
+    audio.blip('checkpoint');
+    const one = ctx.nodes.length - before;
+    audio.blip('checkpoint');
+    expect(ctx.nodes.length - before).toBe(one * 2);
+  });
+
+  it('multiplier: a tiny rising blip', () => {
+    const { created, master, t0 } = play('multiplier');
+    const glide = created.find((n) => n.kind === 'oscillator' && n.params.frequency.events.length === 2);
+    expect(glide).toBeDefined();
+    if (glide) {
+      const f = glide.params.frequency.events;
+      expect(f[1].value).toBeGreaterThan(f[0].value * 1.5);
+    }
+    expect(length(created, t0)).toBeLessThan(0.3);
+    expect(loudness(created, master)).toBeLessThan(0.3);
+  });
+
+  it('comboLost: a short, stepped, crushed fall', () => {
+    const { created, t0 } = play('comboLost');
+    const stepped = created.find((n) => n.kind === 'oscillator' && n.params.frequency.events.length > 4);
+    expect(stepped).toBeDefined();
+    if (stepped) {
+      const f = stepped.params.frequency.events;
+      expect(f.every((e) => e.kind === 'set')).toBe(true);
+      expect(f[f.length - 1].value).toBeLessThan(f[0].value * 0.5);
+      // Not a smooth fall: it goes back up on the way down.
+      expect(f.some((e, i) => i > 0 && e.value > f[i - 1].value)).toBe(true);
+    }
+    const crusher = created.find((n) => n.kind === 'waveShaper');
+    expect(crusher?.curve).toBeTruthy();
+    if (crusher?.curve) expect(new Set(crusher.curve).size).toBeLessThan(10);
+    expect(length(created, t0)).toBeLessThan(0.4);
+  });
+
+  it.each(['uiMove', 'uiSelect', 'uiBack', 'uiGlitch'] as BlipKind[])('%s is short and quiet', (kind) => {
+    const { created, master, t0 } = play(kind);
+    expect(length(created, t0)).toBeLessThan(0.25);
+    expect(loudness(created, master)).toBeLessThan(0.4);
+  });
+
+  it('uiMove is the softest of the interface sounds, uiBack sits lower than uiSelect', () => {
+    const results = (['uiMove', 'uiSelect', 'uiBack'] as BlipKind[]).map((kind) => {
+      FakeAudioContext.instances = [];
+      const { created, master } = play(kind);
+      const pitches = created.filter((n) => n.kind === 'oscillator').map((o) => o.params.frequency.events[0].value);
+      return { loud: loudness(created, master), pitch: Math.max(...pitches) };
+    });
+    const [move, select, back] = results;
+    expect(move.loud).toBeLessThan(select.loud);
+    expect(move.loud).toBeLessThan(back.loud);
+    expect(back.pitch).toBeLessThan(select.pitch);
+  });
+
+  it('uiGlitch is bit-crushed noise with a sample-and-hold tone', () => {
+    const { created } = play('uiGlitch');
+    expect(created.some((n) => n.kind === 'waveShaper')).toBe(true);
+    expect(created.some((n) => n.kind === 'oscillator' && n.params.frequency.events.length >= 4)).toBe(true);
+  });
+
+  it('thins out a uiMove or uiGlitch asked for every frame, but not one per key press', () => {
+    const { audio, ctx } = started();
+    const count = (): number => ctx.ofKind('oscillator').length;
+    const before = count();
+    ctx.currentTime = 1;
+    audio.blip('uiMove');
+    audio.blip('uiMove');
+    expect(count() - before).toBe(1);
+    ctx.currentTime += 0.12;
+    audio.blip('uiMove');
+    expect(count() - before).toBe(2);
+  });
+
+  it('plays nothing at all while muted, and plays again once unmuted', () => {
+    const { audio, ctx } = started();
+    audio.setMuted(true);
+    const before = ctx.nodes.length;
+    for (const kind of ALL_BLIPS) audio.blip(kind);
+    audio.collision(12);
+    expect(ctx.nodes).toHaveLength(before);
+    audio.setMuted(false);
+    audio.blip('uiSelect');
+    expect(ctx.nodes.length).toBeGreaterThan(before);
+  });
+});
+
+describe('slopes', () => {
+  // Off the throttle the engine's overrun flutter is random; pin it so levels can be compared.
+  beforeEach(() => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function engineAfter(slope: number, throttle: number): { level: number; drive: number } {
+    FakeAudioContext.instances = [];
+    const { audio, ctx } = started();
+    const { master } = masterChain(ctx);
+    drive(audio, ctx, car({ speed: 18, forwardSpeed: 18, throttle, pitchSlope: slope }), 90);
+    const shaper = ctx.ofKind('waveShaper').find((n) => n.oversample === '2x');
+    return { level: gain(master.inputs[0]).settled, drive: shaper ? gain(shaper.inputs[0]).settled : Number.NaN };
+  }
+
+  it('the engine labours uphill: louder and grittier on the throttle than on the flat', () => {
+    const flat = engineAfter(0, 1);
+    const climb = engineAfter(0.12, 1);
+    expect(climb.level).toBeGreaterThan(flat.level * 1.05);
+    expect(climb.level).toBeLessThan(flat.level * 1.3);
+    expect(climb.drive).toBeGreaterThan(flat.drive);
+  });
+
+  it('eases off downhill off the throttle', () => {
+    const flat = engineAfter(0, 0);
+    const descent = engineAfter(-0.12, 0);
+    expect(descent.level).toBeLessThan(flat.level);
+    expect(descent.level).toBeGreaterThan(flat.level * 0.85);
+  });
+
+  it('copes with a car state that has no slope at all', () => {
+    const flat = engineAfter(0, 1);
+    FakeAudioContext.instances = [];
+    const { audio, ctx } = started();
+    const legacy = car({ speed: 18, forwardSpeed: 18, throttle: 1 }) as Partial<CarState>;
+    delete legacy.pitchSlope;
+    expect(() => drive(audio, ctx, legacy as CarState, 90)).not.toThrow();
+    expect(gain(masterChain(ctx).master.inputs[0]).settled).toBeCloseTo(flat.level, 9);
+  });
+});
+

@@ -1,16 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { generateLevel } from '../../src/gen/trackGen';
 import {
+  RULES,
   SpatialHash,
   WallIndex,
   distPointSegment,
   distSegmentBox,
+  findCrossings,
   insideWalls,
   segmentsTouch,
   validateLevel,
 } from '../../src/gen/validate';
-import { RULES } from '../../src/gen/validate';
-import type { Level, Segment, Vec2 } from '../../src/types';
+import type { Level, Segment, Vec2, Wall } from '../../src/types';
+import { CROSSING_CLEARANCE } from '../../src/types';
 
 const base = generateLevel('2026-W48');
 
@@ -22,19 +24,39 @@ function broken(mutate: (level: Level) => void): string[] {
   return result.errors;
 }
 
-/** A path index on straight road, well away from both ends. */
-function straightIndex(level: Level): number {
+function has(errors: string[], rule: string): boolean {
+  return errors.some((e) => e.startsWith(rule));
+}
+
+/** A path index on straight road with barriers on both sides, well away from both ends. */
+function straightIndex(level: Level, from = 40): number {
   const p = level.path;
-  for (let i = 40; i < p.length - 40; i++) {
+  for (let i = from; i < p.length - 40; i++) {
     const a = p[i - 6];
     const b = p[i + 6];
-    let straight = true;
+    let ok = true;
     for (let k = i - 5; k < i + 6; k++) {
-      if (distPointSegment(p[k].x, p[k].z, a.x, a.z, b.x, b.z) > 1e-6) straight = false;
+      if (distPointSegment(p[k].x, p[k].z, a.x, a.z, b.x, b.z) > 1e-6) ok = false;
+      if (level.leftOpen[k] || level.rightOpen[k]) ok = false;
     }
-    if (straight) return i;
+    if (ok) return i;
   }
   throw new Error('no straight found');
+}
+
+/** A path index in the middle of a bend. */
+function bendIndex(level: Level): number {
+  const p = level.path;
+  for (let i = 30; i < p.length - 30; i++) {
+    let bent = true;
+    for (let k = i - 3; k <= i + 3; k++) {
+      const cross =
+        (p[k].x - p[k - 1].x) * (p[k + 1].z - p[k].z) - (p[k].z - p[k - 1].z) * (p[k + 1].x - p[k].x);
+      if (Math.abs(cross) < 1e-3) bent = false;
+    }
+    if (bent) return i;
+  }
+  throw new Error('no bend found');
 }
 
 /** Unit vector pointing to the left of the road at a path index. */
@@ -54,7 +76,31 @@ function seg(ax: number, az: number, bx: number, bz: number): Segment {
   return { ax, az, bx, bz };
 }
 
-/** Moves every wall end that sits at `from`, so the loop stays closed. The road edge arrays are left alone. */
+function wall(ax: number, az: number, bx: number, bz: number, y = 0): Wall {
+  return { ax, az, bx, bz, ya: y, yb: y };
+}
+
+/** Index of the wall on edge segment i of one side. */
+function edgeWall(level: Level, edge: Vec2[], i: number): number {
+  const a = edge[i];
+  const b = edge[i + 1];
+  const found = level.walls.findIndex(
+    (w) => (w.ax === a.x && w.az === a.z && w.bx === b.x && w.bz === b.z) || (w.ax === b.x && w.az === b.z && w.bx === a.x && w.bz === a.z),
+  );
+  if (found < 0) throw new Error(`no wall on segment ${i}`);
+  return found;
+}
+
+/** Opens the left edge from segment `from` to `to` (exclusive), taking its walls away. */
+function openLeft(level: Level, from: number, to: number): void {
+  for (let i = from; i < to; i++) {
+    if (level.leftOpen[i]) continue;
+    level.walls.splice(edgeWall(level, level.left, i), 1);
+    level.leftOpen[i] = true;
+  }
+}
+
+/** Moves every wall end that sits at `from`. The road edge arrays are left alone. */
 function moveWallVertex(level: Level, from: Vec2, to: Vec2): void {
   let moved = 0;
   for (const w of level.walls) {
@@ -111,12 +157,27 @@ function setRunOff(level: Level, distance: number): void {
   }
 }
 
+/** The path indices at the heart of the level's crossing on the lower and on the upper road. */
+function crossingHeart(level: Level): { low: number; high: number } {
+  const { dists } = findCrossings(level);
+  expect(dists.length).toBeGreaterThan(0);
+  const first = level.path.findIndex((p) => p.dist === dists[0]);
+  const last = level.path.findIndex((p) => p.dist === dists[dists.length - 1]);
+  return level.path[first].y < level.path[last].y ? { low: first, high: last } : { low: last, high: first };
+}
+
 describe('validateLevel', () => {
   it('accepts a generated level', () => {
     expect(validateLevel(base)).toEqual({ ok: true, errors: [] });
   });
 
-  it('rejects road edges that cross', () => {
+  it('the pinned level has a crossing, open edges, supports and raised road to test against', () => {
+    expect(findCrossings(base).count).toBe(1);
+    expect(base.leftOpen.some(Boolean) || base.rightOpen.some(Boolean)).toBe(true);
+    expect(base.supports.length).toBeGreaterThan(5);
+  });
+
+  it('rejects road edges that cross at the same level', () => {
     const errors = broken((level) => {
       const i = straightIndex(level);
       const p = level.path[i];
@@ -124,36 +185,56 @@ describe('validateLevel', () => {
       // Drags one left edge point clean through the right edge.
       level.left[i] = { x: 2 * r.x - p.x, z: 2 * r.z - p.z };
     });
-    expect(errors.some((e) => e.startsWith('road edges intersect'))).toBe(true);
+    expect(has(errors, 'road edges intersect')).toBe(true);
   });
 
   it('rejects a missing wall', () => {
-    const errors = broken((level) => level.walls.splice(100, 1));
-    expect(errors.some((e) => e.startsWith('walls are not a closed loop'))).toBe(true);
+    const errors = broken((level) => level.walls.splice(edgeWall(level, level.right, straightIndex(level)), 1));
+    expect(errors).toEqual([expect.stringMatching(/^road edge has no wall: right\[\d+\]/)]);
   });
 
-  it('rejects walls that form two separate loops', () => {
-    const errors = broken((level) => {
+  it('rejects a wall on an open edge and a wall that belongs to nothing', () => {
+    const open = broken((level) => {
+      const i = level.leftOpen.findIndex(Boolean);
+      level.walls.push(wall(level.left[i].x, level.left[i].z, level.left[i + 1].x, level.left[i + 1].z, level.path[i].y));
+    });
+    expect(has(open, 'open edge has a wall')).toBe(true);
+    const stray = broken((level) => {
       const x = level.bounds.maxX - 40;
       const z = level.bounds.maxZ - 40;
-      level.walls.push(seg(x, z, x + 5, z), seg(x + 5, z, x, z + 5), seg(x, z + 5, x, z));
+      level.walls.push(wall(x, z, x + 5, z));
     });
-    expect(errors.some((e) => e.startsWith('walls form more than one loop'))).toBe(true);
+    expect(has(stray, 'wall belongs to no edge')).toBe(true);
+  });
+
+  it('rejects a wall at the wrong height', () => {
+    const errors = broken((level) => (level.walls[edgeWall(level, level.left, straightIndex(level))].ya += 1));
+    expect(has(errors, 'wall height differs from the road')).toBe(true);
+  });
+
+  it('rejects ends that are not closed off', () => {
+    const start = broken((level) => {
+      // The wall straight across behind the start.
+      const back = level.walls.findIndex((w) => !level.left.some((p) => p.x === w.ax && p.z === w.az) && !level.right.some((p) => p.x === w.ax && p.z === w.az));
+      level.walls.splice(back, 1);
+    });
+    expect(has(start, 'start is not closed off')).toBe(true);
   });
 
   it('rejects a wall dragged across the road, even when it stops short of the far wall', () => {
-    // The road is physically shut 0.2 m from the right wall, yet the loop is still closed and still simple.
+    // The road is physically shut 0.2 m from the right wall, yet no two walls cross.
     const errors = broken((level) => {
       const i = straightIndex(level);
       const n = leftNormal(level, i);
       const r = level.right[i];
       moveWallVertex(level, level.left[i], { x: r.x + n.x * 0.2, z: r.z + n.z * 0.2 });
     });
-    expect(errors.some((e) => e.startsWith('road edge has no wall'))).toBe(true);
-    expect(errors.some((e) => e.startsWith('walls intersect'))).toBe(false);
+    expect(has(errors, 'road edge has no wall')).toBe(true);
+    expect(has(errors, 'wall cuts across the road')).toBe(true);
+    expect(has(errors, 'walls intersect')).toBe(false);
   });
 
-  it('rejects a wall loop that crosses itself', () => {
+  it('rejects walls that cross each other at the same height', () => {
     const errors = broken((level) => {
       const i = straightIndex(level);
       const p = level.path[i];
@@ -161,10 +242,10 @@ describe('validateLevel', () => {
       // The left wall is pulled clean through the right wall.
       moveWallVertex(level, level.left[i], { x: 2 * r.x - p.x, z: 2 * r.z - p.z });
     });
-    expect(errors.some((e) => e.startsWith('walls intersect'))).toBe(true);
+    expect(has(errors, 'walls intersect')).toBe(true);
   });
 
-  it('rejects a wall loop that crosses itself where no road edge is involved', () => {
+  it('rejects a cap that crosses itself where no road edge is involved', () => {
     // Stretching the cap beyond the goal until it reaches back across another part of the level is how a longer
     // run-off would go wrong: here the far corners are simply swapped, which twists the cap into a bow tie.
     const errors = broken((level) => {
@@ -174,8 +255,8 @@ describe('validateLevel', () => {
       moveWallVertex(level, b, a);
       moveWallVertex(level, parked, b);
     });
-    expect(errors.some((e) => e.startsWith('walls intersect'))).toBe(true);
-    expect(errors.some((e) => e.startsWith('road edge has no wall'))).toBe(false);
+    expect(has(errors, 'walls intersect')).toBe(true);
+    expect(has(errors, 'road edge has no wall')).toBe(false);
   });
 
   it('gives a generated level its full run-off beyond the goal', () => {
@@ -189,7 +270,7 @@ describe('validateLevel', () => {
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatch(/^run-off beyond the goal is too short: a wall 16 m past the line/);
     const barely = broken((level) => setRunOff(level, RULES.goalRunOff - 0.5));
-    expect(barely.some((e) => e.startsWith('run-off beyond the goal is too short'))).toBe(true);
+    expect(has(barely, 'run-off beyond the goal is too short')).toBe(true);
   });
 
   it('accepts a run-off of exactly the required length', () => {
@@ -203,85 +284,96 @@ describe('validateLevel', () => {
       const { respawn } = level.goal;
       const x = respawn.x + Math.cos(respawn.heading) * 30;
       const z = respawn.z + Math.sin(respawn.heading) * 30;
-      level.props.push({ kind: 'pillar', x, z, radius: 1.5, height: 5, hue: 0 });
+      level.props.push({ kind: 'pillar', x, z, y: level.goal.y, radius: 1.5, height: 5, hue: 0 });
     });
-    expect(errors.some((e) => e.startsWith('run-off beyond the goal is blocked'))).toBe(true);
+    expect(has(errors, 'run-off beyond the goal is blocked')).toBe(true);
   });
 
   it('rejects a prop that blocks the road', () => {
     const errors = broken((level) => {
       const p = level.path[straightIndex(level)];
-      level.props.push({ kind: 'pillar', x: p.x, z: p.z, radius: p.halfWidth - 2, height: 5, hue: 0 });
+      level.props.push({ kind: 'pillar', x: p.x, z: p.z, y: p.y, radius: p.halfWidth - 2, height: 5, hue: 0 });
     });
-    expect(errors.some((e) => e.startsWith('prop blocks the road'))).toBe(true);
+    expect(has(errors, 'prop blocks the road')).toBe(true);
   });
 
-  it('rejects a prop outside the road', () => {
-    const errors = broken((level) => {
+  it('rejects a prop outside the road, or floating above it', () => {
+    const outside = broken((level) => {
       const i = straightIndex(level);
-      const outside = beside(level, i, level.path[i].halfWidth + 3);
-      level.props.push({ kind: 'pillar', ...outside, radius: 1.5, height: 5, hue: 0 });
+      const at = beside(level, i, level.path[i].halfWidth + 3);
+      level.props.push({ kind: 'pillar', ...at, y: level.path[i].y, radius: 1.5, height: 5, hue: 0 });
     });
-    expect(errors.some((e) => e.startsWith('prop is not inside the road'))).toBe(true);
+    expect(has(outside, 'prop is not inside the road')).toBe(true);
+    const floating = broken((level) => {
+      const i = straightIndex(level);
+      const p = level.path[i];
+      level.props.push({ kind: 'pillar', x: p.x, z: p.z, y: p.y + 1, radius: 1.2, height: 5, hue: 0 });
+    });
+    expect(has(floating, 'prop is not inside the road')).toBe(true);
   });
 
   it('rejects a prop next to the start', () => {
     const errors = broken((level) => {
       const p = level.path[6];
-      level.props.push({ kind: 'pillar', x: p.x, z: p.z, radius: 1.2, height: 5, hue: 0 });
+      level.props.push({ kind: 'pillar', x: p.x, z: p.z, y: p.y, radius: 1.2, height: 5, hue: 0 });
     });
-    expect(errors.some((e) => e.startsWith('prop too close to the start'))).toBe(true);
+    expect(has(errors, 'prop too close to the start')).toBe(true);
   });
 
   it('rejects tall decor next to the road', () => {
     const errors = broken((level) => {
       const i = straightIndex(level);
-      // An 8 m block whose near face is 5 m outside the wall: fine as a kerb-side hut, not as a 50 m tower.
+      // An 8 m block whose near face is 5 m outside the edge: fine as a kerb-side hut, not as a 50 m tower.
       level.decor.push({ ...beside(level, i, level.path[i].halfWidth + 5 + 4), w: 8, d: 8, h: 50, hue: 2 });
     });
-    expect(errors.some((e) => e.startsWith('decor too tall or too close to the road'))).toBe(true);
+    expect(has(errors, 'decor too tall or too close to the road')).toBe(true);
   });
 
-  it('rejects decor standing on the road', () => {
-    const errors = broken((level) => {
+  it('rejects decor standing on the road, or under a raised road', () => {
+    const onRoad = broken((level) => {
       const p = level.path[straightIndex(level)];
       level.decor.push({ x: p.x, z: p.z, w: 6, d: 6, h: 3, hue: 0 });
     });
-    expect(errors.some((e) => e.startsWith('decor'))).toBe(true);
+    expect(has(onRoad, 'decor')).toBe(true);
+    const underBridge = broken((level) => {
+      const p = level.path[crossingHeart(level).high];
+      level.decor.push({ x: p.x, z: p.z, w: 6, d: 6, h: 3, hue: 0 });
+    });
+    expect(has(underBridge, 'decor stands on the road')).toBe(true);
   });
 
   it('rejects overlapping decor', () => {
     const errors = broken((level) => level.decor.push({ ...level.decor[0] }));
-    expect(errors.some((e) => e.startsWith('decor blocks overlap'))).toBe(true);
+    expect(has(errors, 'decor blocks overlap')).toBe(true);
   });
 
   it('rejects numbers that are not finite', () => {
     expect(broken((level) => (level.path[10].x = Number.NaN))[0]).toMatch(/^bad number: path\[10\]/);
+    expect(broken((level) => (level.path[10].y = Number.NaN))[0]).toMatch(/^bad number: path\[10\]/);
     expect(broken((level) => (level.walls[3].bz = Infinity))[0]).toMatch(/^bad number: walls\[3\]/);
+    expect(broken((level) => (level.walls[3].yb = Infinity))[0]).toMatch(/^bad number: walls\[3\]/);
   });
 
   it('rejects a road that is too narrow', () => {
     const errors = broken((level) => (level.path[50].halfWidth = 5));
-    expect(errors.some((e) => e.startsWith('road too narrow'))).toBe(true);
+    expect(has(errors, 'road too narrow')).toBe(true);
   });
 
   it('rejects path distances that do not increase', () => {
     const errors = broken((level) => (level.path[50].dist = level.path[49].dist));
-    expect(errors.some((e) => e.startsWith('path dist not increasing'))).toBe(true);
+    expect(has(errors, 'path dist not increasing')).toBe(true);
   });
 
   it('rejects a gap in the path', () => {
     const errors = broken((level) => {
-      level.path.splice(60, 2);
-      level.left.splice(60, 2);
-      level.right.splice(60, 2);
+      for (const list of [level.path, level.left, level.right, level.leftOpen, level.rightOpen]) list.splice(60, 2);
     });
-    expect(errors.some((e) => e.startsWith('path spacing outside 1..5 m'))).toBe(true);
+    expect(has(errors, 'path spacing outside 1..5 m')).toBe(true);
   });
 
   it('rejects edge arrays of the wrong length', () => {
-    const errors = broken((level) => level.left.pop());
-    expect(errors.some((e) => e.startsWith('edge arrays differ from path'))).toBe(true);
+    expect(has(broken((level) => level.left.pop()), 'edge arrays differ from path')).toBe(true);
+    expect(has(broken((level) => level.rightOpen.pop()), 'open-edge arrays differ from path')).toBe(true);
   });
 
   it('rejects a length outside the allowed range', () => {
@@ -289,47 +381,53 @@ describe('validateLevel', () => {
       for (const p of level.path) p.dist *= 2;
       level.length *= 2;
     });
-    expect(errors.some((e) => e.startsWith('length outside 600..1300 m'))).toBe(true);
+    expect(has(errors, 'length outside')).toBe(true);
   });
 
   it('rejects gates out of order and a goal that is not last', () => {
     const swapped = broken((level) => level.checkpoints.reverse());
-    expect(swapped.some((e) => e.startsWith('gates out of order'))).toBe(true);
+    expect(has(swapped, 'gates out of order')).toBe(true);
     const early = broken((level) => (level.goal.pathIndex = level.checkpoints[0].pathIndex));
-    expect(early.some((e) => e.startsWith('gates out of order: goal'))).toBe(true);
+    expect(has(early, 'gates out of order: goal')).toBe(true);
   });
 
-  it('rejects a respawn point off the road', () => {
-    const errors = broken((level) => (level.checkpoints[0].respawn.x = level.bounds.maxX + 50));
-    expect(errors.some((e) => e.startsWith('respawn is off the road'))).toBe(true);
+  it('rejects a respawn point off the road or at the wrong height', () => {
+    const off = broken((level) => (level.checkpoints[0].respawn.x = level.bounds.maxX + 50));
+    expect(has(off, 'respawn is off the road')).toBe(true);
+    const high = broken((level) => (level.checkpoints[0].respawn.y = (level.checkpoints[0].respawn.y ?? 0) + 2));
+    expect(has(high, 'respawn is off the road')).toBe(true);
+    const gate = broken((level) => (level.checkpoints[0].y += 2));
+    expect(has(gate, 'gate height differs from the road')).toBe(true);
   });
 
   it('rejects a start outside the road or against a wall', () => {
     const outside = broken((level) => (level.start.x = level.bounds.maxX + 50));
-    expect(outside.some((e) => e.startsWith('start is outside the road'))).toBe(true);
+    expect(has(outside, 'start is outside the road')).toBe(true);
     const hugging = broken((level) => {
       const nearWall = beside(level, 0, level.path[0].halfWidth - 3);
       level.start.x = nearWall.x;
       level.start.z = nearWall.z;
     });
-    expect(hugging.some((e) => e.startsWith('start too close to a wall'))).toBe(true);
+    expect(has(hugging, 'start too close to a wall')).toBe(true);
   });
 
   it('rejects bounds that leave something out', () => {
-    const errors = broken((level) => (level.bounds.maxX -= 30));
-    expect(errors.some((e) => e.startsWith('bounds do not contain everything'))).toBe(true);
+    expect(has(broken((level) => (level.bounds.maxX -= 30)), 'bounds do not contain everything')).toBe(true);
+    expect(has(broken((level) => (level.bounds.maxY -= 5)), 'bounds do not contain everything')).toBe(true);
+    expect(has(broken((level) => (level.bounds.minY += 1)), 'bounds do not contain everything')).toBe(true);
   });
 
   it('rejects a road that doubles back onto itself', () => {
     const errors = broken((level) => {
-      // Fold the second half of the centreline back over the first half.
+      // Fold the second half of the centreline back over the first half, at the same height.
       const n = level.path.length;
       for (let i = n >> 1; i < n; i++) {
         level.path[i].x = level.path[n - 1 - i].x;
         level.path[i].z = level.path[n - 1 - i].z;
+        level.path[i].y = level.path[n - 1 - i].y;
       }
     });
-    expect(errors.some((e) => e.startsWith('road runs into itself'))).toBe(true);
+    expect(has(errors, 'road runs into itself')).toBe(true);
   });
 
   it('counts repeated failures of one rule instead of listing each', () => {
@@ -339,6 +437,109 @@ describe('validateLevel', () => {
     const narrow = errors.filter((e) => e.startsWith('road too narrow'));
     expect(narrow).toHaveLength(1);
     expect(narrow[0]).toMatch(/\(and \d+ more\)$/);
+  });
+});
+
+describe('validateLevel in three dimensions', () => {
+  it('rejects a crossing where both roads are at the same level', () => {
+    const errors = broken((level) => {
+      for (const p of level.path) p.y = 0;
+    });
+    expect(has(errors, 'road runs into itself')).toBe(true);
+  });
+
+  it('rejects an overpass that is too low to drive under', () => {
+    const errors = broken((level) => {
+      const { low, high } = crossingHeart(level);
+      const floor = level.path[low].y;
+      const middle = level.path[high].dist;
+      for (const p of level.path) {
+        if (Math.abs(p.dist - middle) < 45) p.y = floor + CROSSING_CLEARANCE - 2;
+      }
+    });
+    expect(has(errors, 'crossing too low')).toBe(true);
+  });
+
+  it('rejects a road that is too steep, steep in a bend, kinked, or not level at the ends', () => {
+    const steep = broken((level) => (level.path[straightIndex(level, 60)].y += 3));
+    expect(has(steep, 'road too steep')).toBe(true);
+    expect(has(steep, 'grade changes too sharply')).toBe(true);
+    const bend = broken((level) => {
+      const i = bendIndex(level);
+      // A steady 9% ramp through the bend.
+      for (let k = i - 3; k <= i + 3; k++) level.path[k].y = level.path[i - 3].y + 0.09 * (level.path[k].dist - level.path[i - 3].dist);
+    });
+    expect(has(bend, 'road too steep in a bend')).toBe(true);
+    const start = broken((level) => (level.path[3].y += 0.2));
+    expect(has(start, 'start is not level')).toBe(true);
+    const below = broken((level) => (level.path[30].y = -1));
+    expect(has(below, 'road below the city')).toBe(true);
+  });
+
+  it('rejects a support standing on another road, or holding up nothing', () => {
+    const onRoad = broken((level) => {
+      const { high } = crossingHeart(level);
+      const p = level.path[high];
+      level.supports.push({ x: p.x, z: p.z, top: p.y - 0.6, radius: 1 });
+    });
+    expect(has(onRoad, 'support stands on a road')).toBe(true);
+    const nothing = broken((level) => (level.supports[0].top -= 2));
+    expect(has(nothing, 'support holds up nothing')).toBe(true);
+  });
+
+  it('rejects an open edge beside a gate, on low road, or on both sides of a bend', () => {
+    const gate = broken((level) => {
+      const at = level.checkpoints[1].pathIndex;
+      openLeft(level, at - 6, at + 6);
+    });
+    expect(has(gate, 'open edge near a gate')).toBe(true);
+    const low = broken((level) => openLeft(level, 2, 14));
+    expect(has(low, 'open edge on low road')).toBe(true);
+    const bend = broken((level) => {
+      const i = bendIndex(level);
+      openLeft(level, i - 3, i + 3);
+      for (let k = i - 3; k < i + 3; k++) {
+        if (level.rightOpen[k]) continue;
+        level.walls.splice(
+          level.walls.findIndex((w) => w.ax === level.right[k].x && w.az === level.right[k].z),
+          1,
+        );
+        level.rightOpen[k] = true;
+      }
+    });
+    expect(has(bend, 'open on both sides in a bend')).toBe(true);
+  });
+
+  it('rejects an open edge right at a crossing', () => {
+    const errors = broken((level) => {
+      const { high } = crossingHeart(level);
+      openLeft(level, high - 8, high + 8);
+    });
+    expect(has(errors, 'open edge at a crossing')).toBe(true);
+  });
+
+  it('rejects open stretches that are too short or too long', () => {
+    const short = broken((level) => {
+      const i = straightIndex(level);
+      openLeft(level, i, i + 2);
+    });
+    expect(has(short, 'open stretch too short')).toBe(true);
+  });
+
+  it('rejects a bump in a bend, off the road or out of size', () => {
+    const corner = broken((level) => {
+      const i = bendIndex(level);
+      const p = level.path[i];
+      const d = { x: level.path[i + 1].x - p.x, z: level.path[i + 1].z - p.z };
+      const len = Math.hypot(d.x, d.z);
+      level.bumps.push({ x: p.x, z: p.z, y: p.y, dirX: d.x / len, dirZ: d.z / len, halfLength: 5, halfWidth: p.halfWidth + 1, height: 0.5 });
+    });
+    expect(has(corner, 'bump in a corner')).toBe(true);
+    const floating = broken((level) => {
+      const p = level.path[straightIndex(level)];
+      level.bumps.push({ x: p.x, z: p.z, y: p.y + 3, dirX: 1, dirZ: 0, halfLength: 5, halfWidth: p.halfWidth + 1, height: 0.5 });
+    });
+    expect(has(floating, 'bump is not on the road')).toBe(true);
   });
 });
 

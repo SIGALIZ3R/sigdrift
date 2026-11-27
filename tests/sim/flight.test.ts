@@ -8,7 +8,7 @@ import { hashNumbers } from '../../src/core/hash';
 import { GRAVITY, createCarState, stepCar } from '../../src/sim/car';
 import { createEndlessWorld } from '../../src/sim/endlessWorld';
 import { bumpHeight, groundHeightOf } from '../../src/sim/ground';
-import { DEFAULT_CAR_PARAMS } from '../../src/sim/params';
+import { PLANTED_PARAMS as DEFAULT_CAR_PARAMS, plantedParams } from '../helpers/testCar';
 import { makeBump, makeStraightChunk } from '../helpers/handLevel';
 
 const IDLE: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
@@ -17,7 +17,7 @@ const HALF_WIDTH = 10;
 const BUMP_X = 150;
 
 describe('ground height', () => {
-  const bump: Bump = { x: 10, z: 5, dirX: 1, dirZ: 0, halfLength: 6, halfWidth: 9, height: 0.5 };
+  const bump: Bump = { x: 10, z: 5, y: 0, dirX: 1, dirZ: 0, halfLength: 6, halfWidth: 9, height: 0.5 };
 
   it('is a raised cosine along the road: full height at the crest, half way down at half length, flat at the ends', () => {
     expect(bumpHeight(bump, 10, 5)).toBeCloseTo(0.5, 12);
@@ -109,7 +109,7 @@ describe('tyre load over crests and through dips', () => {
 
 /** A long straight road with one standard bump on it. */
 function bumpRoad(height = 0.5, length = 12): EndlessWorld {
-  const world = createEndlessWorld({ x: 0, z: 0, heading: 0 });
+  const world = createEndlessWorld({ x: 0, z: 0, heading: 0 }, plantedParams());
   world.addChunk(makeStraightChunk(0, 0, 100, HALF_WIDTH));
   world.addChunk(makeStraightChunk(1, 100, 100, HALF_WIDTH, [makeBump(BUMP_X, 0, 0, HALF_WIDTH, height, length)]));
   world.addChunk(makeStraightChunk(2, 200, 200, HALF_WIDTH));
@@ -154,7 +154,7 @@ function jump(world: EndlessWorld, speed: number, seconds = 6): Jump {
     }
     wasAirborne = car.airborne;
     report.peakHeight = Math.max(report.peakHeight, car.y);
-    report.peakClearance = Math.max(report.peakClearance, car.y - world.groundHeight(car.x, car.z));
+    report.peakClearance = Math.max(report.peakClearance, car.y - world.groundHeight(car.x, car.z, 0));
     report.offTrack = report.offTrack || world.offTrack;
     report.finite = report.finite && Object.values(car).every((v) => typeof v !== 'number' || Number.isFinite(v));
   }

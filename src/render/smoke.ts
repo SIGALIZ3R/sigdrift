@@ -14,7 +14,7 @@ import {
   RGBAFormat,
   UnsignedByteType,
 } from 'three';
-import type { BufferAttribute, Texture, Vector3 } from 'three';
+import type { BufferAttribute, Color, Texture, Vector3 } from 'three';
 import { SMOKE_TINT, SPARK } from './palette';
 
 // Everything in this file is cosmetic and outside the simulation, so Math.random is fine here.
@@ -238,8 +238,8 @@ export function createSmoke(right: Vector3, up: Vector3, texture: Texture): Smok
 // Collision sparks
 // ---------------------------------------------------------------------------------------------------------------
 
-const MAX_SPARKS = 96;
-const SPARK_SIZE_PX = 3;
+const MAX_SPARKS = 288;
+const SPARK_SIZE_PX = 3.5;
 const SPARK_GRAVITY = 14;
 const SPARK_IMPACT_MAX = 20;
 
@@ -247,9 +247,14 @@ export interface Sparks {
   readonly points: Points;
   /**
    * Throws `count` sparks off a wall hit at (x, z); (nx, nz) is the normal pointing back at the car and `groundY`
-   * the height of the ground there (0 on flat road).
+   * the height of the road surface there.
    */
   burst(x: number, z: number, nx: number, nz: number, impact: number, count: number, groundY?: number): void;
+  /**
+   * Throws one spark from (x, y, z) with velocity (vx, vy, vz), living `life` seconds, in `color` (the usual spark
+   * colour when left out). It bounces off nothing and stops falling at `floorY`.
+   */
+  emit(x: number, y: number, z: number, vx: number, vy: number, vz: number, life: number, floorY: number, color?: Color): void;
   update(dt: number): void;
   /** While on, the points are drawn even with no live spark (all black), to build their program ahead of time. */
   setWarmUp(on: boolean): void;
@@ -265,6 +270,10 @@ class SparkPool implements Sparks {
   private readonly age = new Float32Array(MAX_SPARKS);
   /** 0 marks a free slot. */
   private readonly life = new Float32Array(MAX_SPARKS);
+  /** Lowest height each spark may fall to. */
+  private readonly floor = new Float32Array(MAX_SPARKS);
+  /** Colour of each spark at full brightness. */
+  private readonly tint = new Float32Array(MAX_SPARKS * 3);
   private cursor = 0;
   private live = 0;
 
@@ -309,7 +318,34 @@ class SparkPool implements Sparks {
       v[o + 2] = nz * out + nx * along;
       this.age[i] = 0;
       this.life[i] = 0.22 + Math.random() * 0.28;
+      this.floor[i] = groundY + 0.05;
+      this.tint[o] = SPARK.r;
+      this.tint[o + 1] = SPARK.g;
+      this.tint[o + 2] = SPARK.b;
     }
+    this.points.visible = true;
+  }
+
+  emit(x: number, y: number, z: number, vx: number, vy: number, vz: number, life: number, floorY: number, color?: Color): void {
+    const i = this.cursor;
+    this.cursor = (i + 1) % MAX_SPARKS;
+    if (this.life[i] === 0) this.live++;
+    const o = i * 3;
+    const p = this.positions.array;
+    const v = this.velocity;
+    p[o] = x;
+    p[o + 1] = y;
+    p[o + 2] = z;
+    v[o] = vx;
+    v[o + 1] = vy;
+    v[o + 2] = vz;
+    this.age[i] = 0;
+    this.life[i] = Math.max(0.01, life);
+    this.floor[i] = floorY;
+    const c = color ?? SPARK;
+    this.tint[o] = c.r;
+    this.tint[o + 1] = c.g;
+    this.tint[o + 2] = c.b;
     this.points.visible = true;
   }
 
@@ -330,12 +366,12 @@ class SparkPool implements Sparks {
       }
       v[o + 1] -= SPARK_GRAVITY * dt;
       p[o] += v[o] * dt;
-      p[o + 1] = Math.max(0.05, p[o + 1] + v[o + 1] * dt);
+      p[o + 1] = Math.max(this.floor[i], p[o + 1] + v[o + 1] * dt);
       p[o + 2] += v[o + 2] * dt;
       const fade = 1 - this.age[i] / this.life[i];
-      c[o] = SPARK.r * fade;
-      c[o + 1] = SPARK.g * fade;
-      c[o + 2] = SPARK.b * fade;
+      c[o] = this.tint[o] * fade;
+      c[o + 1] = this.tint[o + 1] * fade;
+      c[o + 2] = this.tint[o + 2] * fade;
     }
     this.positions.needsUpdate = true;
     this.colors.needsUpdate = true;

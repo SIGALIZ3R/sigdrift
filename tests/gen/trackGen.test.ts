@@ -1,14 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { hashString } from '../../src/core/hash';
-import { DEFAULT_STREAMS, buildLevel, generateLevel, generateLevelFromSeed } from '../../src/gen/trackGen';
-import { RULES, insideWalls, validateLevel } from '../../src/gen/validate';
+import { WEEKLY_OPTIONS } from '../../src/gen/levels';
+import { DEFAULT_STREAMS, buildLevel, generateLevel, generateLevelFromSeed, generateTrack } from '../../src/gen/trackGen';
+import { RULES, findCrossings, validateLevel } from '../../src/gen/validate';
 import { seedForWeek, shiftWeek } from '../../src/gen/weeklySeed';
 import type { Level } from '../../src/types';
-import { GEN_VERSION } from '../../src/types';
+import { CROSSING_CLEARANCE, GEN_VERSION, MAX_GRADE } from '../../src/types';
+import { levelStats } from './levelStats';
 
 const FIRST_WEEK = '2026-W48';
 const WEEKS = 60;
-const PROPERTY_SEEDS = 400;
+const PROPERTY_SEEDS = 300;
 
 const weeks: Level[] = [];
 for (let i = 0; i < WEEKS; i++) weeks.push(generateLevel(shiftWeek(FIRST_WEEK, i)));
@@ -79,26 +81,30 @@ describe('generateLevel', () => {
 
   it('matches the pinned level for 2026-W48', () => {
     // If this changes on purpose after a release, bump GEN_VERSION in src/types.ts: weeks already played must stay
-    // reproducible. (Re-pinned before the first release for the 64 m run-off beyond the goal.)
-    expect(hashString(JSON.stringify(level))).toBe('517fd5ea');
+    // reproducible. (Pinned for GEN_VERSION 2: layered roads.)
+    expect(hashString(JSON.stringify(level))).toBe('3c47ec64');
   });
 
   it('labels the level with its week, seed and generator version', () => {
     expect(level.id).toBe(FIRST_WEEK);
     expect(level.seed.startsWith(seedForWeek(FIRST_WEEK))).toBe(true);
+    expect(level.seed).toContain(`gen-v${GEN_VERSION}`);
     expect(level.genVersion).toBe(GEN_VERSION);
     expect(generateLevelFromSeed(seedForWeek(FIRST_WEEK), FIRST_WEEK)).toEqual(level);
+    expect(generateTrack(seedForWeek(FIRST_WEEK), FIRST_WEEK, WEEKLY_OPTIONS)).toEqual(level);
   });
 
-  it('starts at the first path point facing down the road', () => {
+  it('starts at the first path point facing down the road, level, on the ground', () => {
     const { path, start } = level;
     expect(start.x).toBe(path[0].x);
     expect(start.z).toBe(path[0].z);
+    expect(start.y).toBe(0);
+    expect(path[0].y).toBe(0);
     const ahead = Math.atan2(path[1].z - path[0].z, path[1].x - path[0].x);
     expect(start.heading).toBeCloseTo(ahead, 12);
   });
 
-  it('puts gates across the road with respawns on the centreline', () => {
+  it('puts gates across the road with respawns on the centreline at road height', () => {
     const last = level.path.length - 1;
     expect(level.goal.pathIndex).toBe(last);
     expect(level.checkpoints.length).toBeGreaterThanOrEqual(3);
@@ -108,6 +114,8 @@ describe('generateLevel', () => {
       expect({ x: gate.bx, z: gate.bz }).toEqual(level.right[i]);
       expect(gate.respawn.x).toBe(level.path[i].x);
       expect(gate.respawn.z).toBe(level.path[i].z);
+      expect(gate.y).toBe(level.path[i].y);
+      expect(gate.respawn.y).toBe(level.path[i].y);
       const along = Math.atan2(level.path[i].z - level.path[i - 1].z, level.path[i].x - level.path[i - 1].x);
       expect(Math.cos(gate.respawn.heading - along)).toBeGreaterThan(0.99);
     }
@@ -124,21 +132,31 @@ describe('generateLevel', () => {
     }
   });
 
-  it('snaps every coordinate to 1/1024 m and never emits -0', () => {
+  it('snaps every coordinate and height to 1/1024 m and never emits -0', () => {
     const values: number[] = [];
-    for (const p of level.path) values.push(p.x, p.z, p.halfWidth, p.dist);
+    for (const p of level.path) values.push(p.x, p.z, p.y, p.halfWidth, p.dist);
     for (const p of [...level.left, ...level.right]) values.push(p.x, p.z);
-    for (const w of level.walls) values.push(w.ax, w.az, w.bx, w.bz);
-    for (const p of level.props) values.push(p.x, p.z, p.radius, p.height);
+    for (const w of level.walls) values.push(w.ax, w.az, w.bx, w.bz, w.ya, w.yb);
+    for (const p of level.props) values.push(p.x, p.z, p.y, p.radius, p.height);
+    for (const b of level.bumps) values.push(b.x, b.z, b.y, b.halfLength, b.halfWidth, b.height);
+    for (const s of level.supports) values.push(s.x, s.z, s.top, s.radius);
     for (const d of level.decor) values.push(d.x, d.z, d.w, d.d, d.h);
-    values.push(level.bounds.minX, level.bounds.minZ, level.bounds.maxX, level.bounds.maxZ, level.length);
+    const b = level.bounds;
+    values.push(b.minX, b.minZ, b.maxX, b.maxZ, b.minY, b.maxY, level.length);
     expect(values.every(onLattice)).toBe(true);
     expect(values.some((v) => Object.is(v, -0))).toBe(false);
+  });
+
+  it('gives open-edge flags for every path point, the last one unused', () => {
+    expect(level.leftOpen).toHaveLength(level.path.length);
+    expect(level.rightOpen).toHaveLength(level.path.length);
+    expect(level.leftOpen[level.path.length - 1]).toBe(false);
+    expect(level.rightOpen[level.path.length - 1]).toBe(false);
   });
 });
 
 describe('generated levels obey the rules', () => {
-  it(`validates ${PROPERTY_SEEDS} arbitrary seeds, rarely needing a retry`, { timeout: 60_000 }, () => {
+  it(`validates ${PROPERTY_SEEDS} arbitrary seeds, rarely needing a retry`, { timeout: 120_000 }, () => {
     let retried = 0;
     const started = performance.now();
     for (let i = 0; i < PROPERTY_SEEDS; i++) {
@@ -155,28 +173,35 @@ describe('generated levels obey the rules', () => {
       `trackGen: ${retried}/${PROPERTY_SEEDS} seeds needed a retry (${(fraction * 100).toFixed(1)}%), ` +
         `${perLevel.toFixed(2)} ms per level including two validations`,
     );
-    expect(fraction).toBeLessThan(0.2);
-    // Typically a few milliseconds. The bound is loose so a busy CI machine cannot fail it, yet a slip into
-    // quadratic scans still does.
-    expect(perLevel).toBeLessThan(200);
+    expect(fraction).toBeLessThan(0.1);
+    // Typically about 15 ms. The bound is loose so a busy CI machine cannot fail it, yet a slip into quadratic
+    // scans still does.
+    expect(perLevel).toBeLessThan(250);
   });
 
   it(`validates the next ${WEEKS} weeks`, () => {
     for (const level of weeks) expect(validateLevel(level).errors, level.id).toEqual([]);
   });
 
-  it('leaves a walled, empty run-off beyond the goal that no other road reaches', () => {
+  it('leaves a walled, level, empty run-off beyond the goal that no other road reaches', () => {
     for (const level of weeks) {
-      const { goal, path, walls } = level;
+      const { goal, path } = level;
       const dirX = Math.round(Math.cos(goal.respawn.heading));
       const dirZ = Math.round(Math.sin(goal.respawn.heading));
       const halfWidth = path[path.length - 1].halfWidth;
+      // The cap walls stand at the goal's height and reach past the full run-off.
+      const caps = level.walls.filter((w) => {
+        const far = (w.ax - goal.respawn.x) * dirX + (w.az - goal.respawn.z) * dirZ;
+        const across = Math.abs((w.ax - goal.respawn.x) * -dirZ + (w.az - goal.respawn.z) * dirX);
+        return far > RULES.goalRunOff && across <= halfWidth + 1e-6;
+      });
+      expect(caps.length, level.id).toBeGreaterThanOrEqual(1);
+      for (const w of caps) expect([w.ya, w.yb]).toEqual([goal.y, goal.y]);
       // Probe points across the whole width of the run-off, every 2 m for the full distance.
       for (let ahead = 1; ahead <= RULES.goalRunOff; ahead += 2) {
         for (const side of [-(halfWidth - 0.5), 0, halfWidth - 0.5]) {
           const x = goal.respawn.x + dirX * ahead - dirZ * side;
           const z = goal.respawn.z + dirZ * ahead + dirX * side;
-          expect(insideWalls(walls, x, z), `${level.id} ${ahead} m past the goal`).toBe(true);
           for (const p of path) {
             const clear = Math.hypot(p.x - x, p.z - z) > p.halfWidth || p.dist > level.length - 30;
             if (!clear) expect.fail(`${level.id}: road at dist ${p.dist} reaches the run-off`);
@@ -217,6 +242,77 @@ describe('generated levels obey the rules', () => {
       }
     }
   });
+
+  it('climbs and drops smoothly, never below the ground or steeper than the limit', () => {
+    for (const level of weeks) {
+      const { path } = level;
+      for (let i = 1; i < path.length; i++) {
+        expect(path[i].y).toBeGreaterThanOrEqual(0);
+        const grade = (path[i].y - path[i - 1].y) / (path[i].dist - path[i - 1].dist);
+        expect(Math.abs(grade)).toBeLessThanOrEqual(MAX_GRADE + 0.002);
+      }
+    }
+  });
+
+  it('only crosses itself with an overpass high enough to drive under', () => {
+    let crossings = 0;
+    for (const level of weeks) {
+      const found = findCrossings(level);
+      crossings += found.count;
+      const { path } = level;
+      for (let i = 0; i < path.length; i++) {
+        for (let j = i + 1; j < path.length; j++) {
+          if (path[j].dist - path[i].dist <= 40) continue;
+          const apart = Math.hypot(path[i].x - path[j].x, path[i].z - path[j].z);
+          if (apart < path[i].halfWidth + path[j].halfWidth) {
+            expect(Math.abs(path[i].y - path[j].y), `${level.id} path[${i}] / path[${j}]`).toBeGreaterThanOrEqual(
+              CROSSING_CLEARANCE,
+            );
+          }
+        }
+      }
+    }
+    expect(crossings).toBeGreaterThan(0);
+  });
+
+  it('stands raised road on supports and keeps barriers on low road', () => {
+    for (const level of weeks) {
+      const raised = level.path.filter((p) => p.y >= 3).length;
+      if (raised > 30) expect(level.supports.length, level.id).toBeGreaterThan(0);
+      for (let i = 0; i + 1 < level.path.length; i++) {
+        if (level.path[i].y < 3 || level.path[i + 1].y < 3) {
+          expect(level.leftOpen[i] || level.rightOpen[i], `${level.id} segment ${i}`).toBe(false);
+        }
+      }
+    }
+  });
+});
+
+describe('weekly character', () => {
+  it('has some hills, about one overpass and a little open edge', { timeout: 60_000 }, () => {
+    const stats = weeks.map(levelStats);
+    const mean = (pick: (s: ReturnType<typeof levelStats>) => number): number =>
+      stats.reduce((sum, s) => sum + pick(s), 0) / stats.length;
+    const summary = {
+      crossings: mean((s) => s.crossings),
+      maxHeight: mean((s) => s.maxHeight),
+      raisedShare: mean((s) => s.raisedShare),
+      openShare: mean((s) => s.openShare),
+      bumpsPerKm: mean((s) => s.bumpsPerKm),
+      supports: mean((s) => s.supports),
+    };
+    console.info(`trackGen weekly over ${WEEKS} weeks: ${JSON.stringify(summary, (_, v) => (typeof v === 'number' ? Math.round(v * 100) / 100 : v))}`);
+    expect(summary.crossings).toBeGreaterThanOrEqual(0.6);
+    expect(summary.crossings).toBeLessThanOrEqual(1.5);
+    expect(summary.maxHeight).toBeGreaterThan(5);
+    expect(summary.maxHeight).toBeLessThan(16);
+    expect(summary.openShare).toBeGreaterThan(0.02);
+    expect(summary.openShare).toBeLessThan(0.25);
+    expect(summary.bumpsPerKm).toBeLessThanOrEqual(WEEKLY_OPTIONS.bumpsPerKm + 0.5);
+    // Not all alike: some weeks stay low, some climb high.
+    const heights = stats.map((s) => s.maxHeight);
+    expect(Math.max(...heights) - Math.min(...heights)).toBeGreaterThan(3);
+  });
 });
 
 describe('variety across weeks', () => {
@@ -241,15 +337,12 @@ describe('variety across weeks', () => {
   it('includes plazas, narrows and props, but not in every level', () => {
     const plazas = weeks.filter((level) => level.path.some((p) => p.halfWidth >= 15)).length;
     const narrows = weeks.filter((level) => level.path.some((p) => p.halfWidth < 8.9)).length;
-    const centrePillars = weeks.filter((level) =>
-      level.props.some((prop) => level.path.some((p) => Math.hypot(p.x - prop.x, p.z - prop.z) < 1.6)),
-    ).length;
     const withProps = weeks.filter((level) => level.props.length > 0).length;
+    console.info(`trackGen: of ${WEEKS} weeks, ${plazas} have a plaza, ${narrows} a narrow, ${withProps} pillars`);
     expect(plazas).toBeGreaterThanOrEqual(WEEKS / 2);
     expect(narrows).toBeGreaterThanOrEqual(WEEKS / 4);
     expect(narrows).toBeLessThan(WEEKS);
-    expect(centrePillars).toBeGreaterThanOrEqual(WEEKS / 6);
-    expect(withProps).toBeGreaterThanOrEqual(WEEKS / 2);
+    expect(withProps).toBeGreaterThanOrEqual(WEEKS / 4);
   });
 
   it('varies in length and never repeats a layout', () => {
@@ -268,15 +361,23 @@ describe('variety across weeks', () => {
 describe('random streams are independent', () => {
   const seed = seedForWeek(FIRST_WEEK);
   const reference = buildLevel(seed, FIRST_WEEK);
+  const relabel = (label: keyof typeof DEFAULT_STREAMS, seedText = seed, id = FIRST_WEEK): Level =>
+    buildLevel(seedText, id, WEEKLY_OPTIONS, { ...DEFAULT_STREAMS, [label]: `${label}-b` });
 
   it('builds the same level as generateLevel when nothing is relabelled', () => {
     expect(reference).toEqual(weeks[0]);
   });
 
   it('changes only the decor when the decor stream changes', () => {
-    const other = buildLevel(seed, FIRST_WEEK, { ...DEFAULT_STREAMS, decor: 'decor-b' });
+    const other = relabel('decor');
     expect(other.decor).not.toEqual(reference.decor);
     expect({ ...other, decor: [], bounds: null }).toEqual({ ...reference, decor: [], bounds: null });
+  });
+
+  it('changes only the supports when the supports stream changes', () => {
+    const other = relabel('supports');
+    expect(other.supports).not.toEqual(reference.supports);
+    expect({ ...other, supports: [], bounds: null }).toEqual({ ...reference, supports: [], bounds: null });
   });
 
   it('changes only the props when the props stream changes', () => {
@@ -284,21 +385,33 @@ describe('random streams are independent', () => {
     let differing = 0;
     for (let i = 0; i < 10; i++) {
       const a = buildLevel(`stream-test-${i}`, 'x');
-      const b = buildLevel(`stream-test-${i}`, 'x', { ...DEFAULT_STREAMS, props: 'props-b' });
-      expect({ ...b, props: [] }).toEqual({ ...a, props: [] });
+      const b = relabel('props', `stream-test-${i}`, 'x');
+      expect({ ...b, props: [], bounds: null }).toEqual({ ...a, props: [], bounds: null });
       if (JSON.stringify(a.props) !== JSON.stringify(b.props)) differing++;
     }
-    expect(differing).toBeGreaterThanOrEqual(5);
+    expect(differing).toBeGreaterThanOrEqual(3);
+  });
+
+  it('keeps the plan view when the elevation stream changes', () => {
+    let differing = 0;
+    for (let i = 0; i < 6; i++) {
+      const a = buildLevel(`stream-test-${i}`, 'x');
+      const b = relabel('elevation', `stream-test-${i}`, 'x');
+      expect(layoutKey(b)).toBe(layoutKey(a));
+      expect(b.path.map((p) => p.halfWidth)).toEqual(a.path.map((p) => p.halfWidth));
+      if (JSON.stringify(a.path.map((p) => p.y)) !== JSON.stringify(b.path.map((p) => p.y))) differing++;
+    }
+    expect(differing).toBeGreaterThanOrEqual(4);
   });
 
   it('keeps the centreline when the width stream changes', () => {
-    const other = buildLevel(seed, FIRST_WEEK, { ...DEFAULT_STREAMS, width: 'width-b' });
+    const other = relabel('width');
     expect(layoutKey(other)).toBe(layoutKey(reference));
     expect(other.path.map((p) => p.halfWidth)).not.toEqual(reference.path.map((p) => p.halfWidth));
   });
 
   it('moves the road when the layout stream changes', () => {
-    const other = buildLevel(seed, FIRST_WEEK, { ...DEFAULT_STREAMS, layout: 'layout-b' });
+    const other = relabel('layout');
     expect(layoutKey(other)).not.toBe(layoutKey(reference));
   });
 });

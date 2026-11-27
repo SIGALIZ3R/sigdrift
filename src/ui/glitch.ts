@@ -74,6 +74,8 @@ export const FLICKER_COOLDOWN_MS = 1000;
 export const BURST_SLACK_MS = 34;
 
 const DOUBLE_BURST_CHANCE = 0.35;
+/** Set by scramble.ts while an element's text is being scrambled. */
+const SCRAMBLING_CLASS = 'sd-scr';
 const TARGET_SELECTOR = '[data-glitch]';
 const COVER_ATTR = 'data-glitch-cover';
 const UNDER_ATTR = 'data-glitch-under';
@@ -458,8 +460,10 @@ export function createGlitcher(root: HTMLElement, options: GlitcherOptions = {})
     const pool: HTMLElement[] = [];
     const weights: number[] = [];
     for (const node of root.querySelectorAll<HTMLElement>(TARGET_SELECTOR)) {
-      // An element only ever plays one burst at a time; one being pressed is left alone.
-      if (active.has(node) || node.matches(':active')) continue;
+      // An element only ever plays one burst at a time (including one started by the row flicker or the logo's
+      // signal loss, which mark it with GLITCH_CLASS too), and one being pressed or scrambled is left alone.
+      if (active.has(node) || node.classList.contains(GLITCH_CLASS) || node.classList.contains(SCRAMBLING_CLASS)) continue;
+      if (node.matches(':active')) continue;
       if (covered && node.closest(UNDER_SELECTOR) !== null) continue;
       pool.push(node);
       weights.push(weightOf(node));
@@ -516,5 +520,212 @@ export function createGlitcher(root: HTMLElement, options: GlitcherOptions = {})
       document.removeEventListener('visibilitychange', sync);
       motion?.removeEventListener('change', sync);
     },
+  };
+}
+
+// ---- Screen transitions ---------------------------------------------------------------------------------------
+
+export const TRANSITION_CLASS = 'sd-tx';
+export const MIN_TRANSITION_MS = 180;
+export const MAX_TRANSITION_MS = 260;
+
+export interface TransitionPlan {
+  durationMs: number;
+  /** Largest sideways displacement of the RGB ghosts and the torn band, px. */
+  offsetPx: number;
+  props: Record<string, string>;
+}
+
+/**
+ * The glitch-in every menu screen plays as it appears: an RGB split that settles, one band of the screen torn
+ * sideways, and a single thin scanline sweeping down. It never dims or brightens the whole screen more than once.
+ */
+export function planTransition(random: () => number): TransitionPlan {
+  const duration = between(random, MIN_TRANSITION_MS, MAX_TRANSITION_MS);
+  const offset = between(random, 4, 9);
+  const top = between(random, 8, 70);
+  const height = between(random, 6, 18);
+  return {
+    durationMs: Math.round(duration),
+    offsetPx: offset,
+    props: {
+      '--tx-dur': ms(duration),
+      '--tx-x': px(offset * sign(random)),
+      '--tx-t': percent(top),
+      '--tx-b': percent(Math.max(0, 100 - top - height)),
+    },
+  };
+}
+
+function motionReduced(): boolean {
+  return reducedMotionQuery()?.matches === true;
+}
+
+/**
+ * Plays the transition on `node` (the menu frame). Calm mode gets a plain short fade from the stylesheet instead;
+ * reduced motion gets nothing. Returns a function that ends it early.
+ */
+export function playTransition(node: HTMLElement, random: () => number = Math.random): () => void {
+  node.classList.remove(TRANSITION_CLASS);
+  if (motionReduced()) return () => {};
+  const plan = planTransition(random);
+  for (const name in plan.props) node.style.setProperty(name, plan.props[name]);
+  // Reading layout between the two class changes restarts the animation even when the class was just removed.
+  void node.offsetWidth;
+  node.classList.add(TRANSITION_CLASS);
+  const timer = setTimeout(end, plan.durationMs + BURST_SLACK_MS);
+  function end(): void {
+    clearTimeout(timer);
+    node.classList.remove(TRANSITION_CLASS);
+  }
+  return end;
+}
+
+// ---- Row flicker ----------------------------------------------------------------------------------------------
+
+export const ROW_FLICKER_MIN_MS = 700;
+export const ROW_FLICKER_MAX_MS = 1500;
+
+/** A gentle two-dip flicker for one row of a settings list or table. */
+export function planRowFlicker(random: () => number): BurstPlan {
+  return planFlicker({ level: 'soft', kind: 'panel', hasText: false, canFlicker: true }, random);
+}
+
+/**
+ * Every 0.7-1.5 s one row matching `selector` inside `container` flickers like a failing tube: never the same row
+ * twice in a row, and never a row that flickered within FLICKER_COOLDOWN_MS. Stops by itself when the container
+ * leaves the page; returns a stop function too. Nothing happens in calm mode or with reduced motion.
+ */
+export function startRowFlicker(
+  container: HTMLElement,
+  root: Element,
+  selector: string,
+  random: () => number = Math.random,
+): () => void {
+  const lastAt = new WeakMap<Element, number>();
+  let last: Element | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
+
+  function schedule(): void {
+    timer = setTimeout(fire, between(random, ROW_FLICKER_MIN_MS, ROW_FLICKER_MAX_MS));
+  }
+
+  function fire(): void {
+    timer = null;
+    if (stopped) return;
+    if (!container.isConnected) {
+      stopped = true;
+      return;
+    }
+    if (!document.hidden && !root.classList.contains(CALM_CLASS) && !motionReduced()) {
+      const now = performance.now();
+      const rows = [...container.querySelectorAll<HTMLElement>(selector)].filter(
+        (row) =>
+          row !== last &&
+          !row.classList.contains(GLITCH_CLASS) &&
+          now - (lastAt.get(row) ?? -Infinity) >= FLICKER_COOLDOWN_MS,
+      );
+      if (rows.length > 0) {
+        const row = rows[Math.min(rows.length - 1, Math.floor(random() * rows.length))];
+        const plan = planRowFlicker(random);
+        for (const name in plan.props) row.style.setProperty(name, plan.props[name]);
+        row.classList.add(GLITCH_CLASS, plan.className);
+        last = row;
+        setTimeout(() => {
+          row.classList.remove(GLITCH_CLASS, plan.className);
+          for (const name in plan.props) row.style.removeProperty(name);
+          lastAt.set(row, performance.now());
+        }, plan.durationMs + BURST_SLACK_MS);
+      }
+    }
+    schedule();
+  }
+
+  schedule();
+  return () => {
+    stopped = true;
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+}
+
+// ---- Signal loss (title logo) ---------------------------------------------------------------------------------
+
+export const SIGNAL_LOSS_CLASS = 'sd-sigloss';
+export const SIGNAL_LOSS_MIN_DELAY_MS = 6000;
+export const SIGNAL_LOSS_MAX_DELAY_MS = 10000;
+
+export interface SignalLossPlan {
+  /** Wait before this burst, ms. */
+  delayMs: number;
+  durationMs: number;
+  tearPx: number;
+  props: Record<string, string>;
+}
+
+/** A stronger burst for the title logo: two bands torn far sideways and the colours shifted round the wheel. */
+export function planSignalLoss(random: () => number): SignalLossPlan {
+  const bands = sliceBands(random, 12, 30, 2);
+  const tear = between(random, 10, 22) * sign(random);
+  const duration = between(random, 360, 520);
+  const second = bands[1] ?? bands[0];
+  return {
+    delayMs: Math.round(between(random, SIGNAL_LOSS_MIN_DELAY_MS, SIGNAL_LOSS_MAX_DELAY_MS)),
+    durationMs: Math.round(duration),
+    tearPx: Math.abs(tear),
+    props: {
+      '--sl-dur': ms(duration),
+      '--sl-x': px(tear),
+      '--sl-hue': `${Math.round(between(random, 60, 200) * sign(random))}deg`,
+      '--sl-t1': percent(bands[0].top),
+      '--sl-u1': percent(bands[0].bottom),
+      '--sl-t2': percent(second.top),
+      '--sl-u2': percent(second.bottom),
+    },
+  };
+}
+
+/** Plays a signal-loss burst on `node` every 6-10 s until stopped or until it leaves the page. */
+export function startSignalLoss(node: HTMLElement, root: Element, random: () => number = Math.random): () => void {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
+  let plan = planSignalLoss(random);
+
+  function clear(): void {
+    node.classList.remove(GLITCH_CLASS, SIGNAL_LOSS_CLASS);
+    for (const name in plan.props) node.style.removeProperty(name);
+  }
+
+  function wait(): void {
+    plan = planSignalLoss(random);
+    timer = setTimeout(fire, plan.delayMs);
+  }
+
+  function fire(): void {
+    timer = null;
+    if (stopped) return;
+    if (!node.isConnected) {
+      stopped = true;
+      return;
+    }
+    if (document.hidden || root.classList.contains(CALM_CLASS) || motionReduced() || node.classList.contains(GLITCH_CLASS)) {
+      wait();
+      return;
+    }
+    for (const name in plan.props) node.style.setProperty(name, plan.props[name]);
+    node.classList.add(GLITCH_CLASS, SIGNAL_LOSS_CLASS);
+    timer = setTimeout(() => {
+      clear();
+      wait();
+    }, plan.durationMs + BURST_SLACK_MS);
+  }
+
+  wait();
+  return () => {
+    stopped = true;
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    clear();
   };
 }

@@ -3,7 +3,11 @@ import {
   AMBIENCE_FULL_SPEED,
   CLIP_CEILING,
   CLIP_KNEE,
+  CUE_MIN_GAP,
+  EASE_LEVEL,
   ENGINE_HARMONICS,
+  OUTPUT_TRIM,
+  STRAIN_LEVEL,
   FIRING_HARMONIC,
   FULL_IMPACT,
   MIN_IMPACT,
@@ -14,11 +18,14 @@ import {
   createAmbienceMix,
   createEngineTone,
   createTyreMix,
+  crushCurve,
+  cueReady,
   engineHarmonicLevel,
   engineTone,
   engineWave,
   gritCurve,
   impactStrength,
+  slopeStrain,
   smoothstep,
   tyreMix,
 } from '../../src/audio/mapping';
@@ -419,3 +426,118 @@ describe('helpers', () => {
     expect(impactStrength(-5)).toBe(0);
   });
 });
+
+describe('slopeStrain', () => {
+  it('is zero on the flat, in the air, and for anything that is not a number', () => {
+    expect(slopeStrain(0, 1, false)).toBe(0);
+    expect(slopeStrain(0.1, 1, true)).toBe(0);
+    expect(slopeStrain(-0.1, 0, true)).toBe(0);
+    expect(slopeStrain(Number.NaN, 1, false)).toBe(0);
+    expect(slopeStrain(undefined as unknown as number, 1, false)).toBe(0);
+    expect(Number.isFinite(slopeStrain(0.05, Number.NaN, false))).toBe(true);
+  });
+
+  it('rises with the climb and with the throttle, and reaches 1 on the steepest climb at full throttle', () => {
+    expect(slopeStrain(0.12, 1, false)).toBeCloseTo(1, 9);
+    expect(slopeStrain(0.06, 1, false)).toBeCloseTo(0.5, 9);
+    expect(slopeStrain(0.12, 0, false)).toBeGreaterThan(0);
+    expect(slopeStrain(0.12, 0, false)).toBeLessThan(slopeStrain(0.12, 1, false));
+    let previous = -Infinity;
+    for (let grade = -0.2; grade <= 0.2; grade += 0.01) {
+      const value = slopeStrain(grade, 0.5, false);
+      expect(value).toBeGreaterThanOrEqual(previous);
+      expect(Math.abs(value)).toBeLessThanOrEqual(1);
+      previous = value;
+    }
+    // Steeper than any road the generators build: no further.
+    expect(slopeStrain(5, 1, false)).toBe(slopeStrain(0.12, 1, false));
+  });
+
+  it('goes negative downhill, mostly off the throttle', () => {
+    expect(slopeStrain(-0.12, 0, false)).toBeLessThan(-0.5);
+    expect(slopeStrain(-0.12, 1, false)).toBeGreaterThan(slopeStrain(-0.12, 0, false));
+    expect(slopeStrain(-0.12, 1, false)).toBeLessThanOrEqual(0);
+  });
+});
+
+describe('engineTone under strain', () => {
+  const at = (strain?: number) =>
+    strain === undefined
+      ? engineTone(4500, 1, 1, 0.5, createEngineTone())
+      : engineTone(4500, 1, 1, 0.5, createEngineTone(), strain);
+
+  it('is exactly the old sound with no strain', () => {
+    expect(at(0)).toEqual(at());
+    expect(at(Number.NaN)).toEqual(at());
+  });
+
+  it('labours uphill: louder by STRAIN_LEVEL, more drive and combustion, a little darker', () => {
+    const flat = at(0);
+    const climb = at(1);
+    expect(climb.level / flat.level).toBeCloseTo(1 + STRAIN_LEVEL, 9);
+    expect(climb.drive).toBeGreaterThan(flat.drive);
+    expect(climb.noiseGain).toBeGreaterThan(flat.noiseGain);
+    expect(climb.cutoff).toBeLessThan(flat.cutoff);
+    expect(climb.cutoff).toBeGreaterThan(flat.cutoff * 0.85);
+    // The pitch is the revs': a slope never changes it.
+    expect(climb.cycleHz).toBe(flat.cycleHz);
+    expect(at(3)).toEqual(climb);
+  });
+
+  it('eases off downhill by EASE_LEVEL at most', () => {
+    const flat = at(0);
+    const descent = at(-1);
+    expect(descent.level / flat.level).toBeCloseTo(1 - EASE_LEVEL, 9);
+    expect(descent.noiseGain).toBeLessThan(flat.noiseGain);
+    expect(descent.coastGain).toBeGreaterThan(flat.coastGain);
+  });
+});
+
+describe('master trim', () => {
+  it('is ten percent down', () => {
+    expect(OUTPUT_TRIM).toBe(0.9);
+  });
+});
+
+describe('crushCurve', () => {
+  it.each([1, 2, 3, 4, 8])('quantises each half to %i steps, odd-symmetric and within [-1, 1]', (steps) => {
+    const curve = crushCurve(steps, 513);
+    expect(curve).toHaveLength(513);
+    expect(curve[0]).toBe(-1);
+    expect(curve[512]).toBe(1);
+    expect(curve[256]).toBe(0);
+    for (let i = 0; i < curve.length; i++) {
+      expect(Math.abs(curve[i])).toBeLessThanOrEqual(1);
+      expect(curve[i]).toBeCloseTo(-curve[curve.length - 1 - i], 6);
+      if (i > 0) expect(curve[i]).toBeGreaterThanOrEqual(curve[i - 1]);
+    }
+    expect(new Set(curve).size).toBe(2 * steps + 1);
+  });
+
+  it('survives nonsense', () => {
+    expect(new Set(crushCurve(0)).size).toBe(3);
+    expect(new Set(crushCurve(Number.NaN)).size).toBe(3);
+  });
+});
+
+describe('cue rate limits', () => {
+  it('lets close through at most four times a second', () => {
+    expect(CUE_MIN_GAP.close).toBe(0.25);
+    expect(cueReady('close', 1, -Infinity)).toBe(true);
+    expect(cueReady('close', 1.2, 1)).toBe(false);
+    expect(cueReady('close', 1.25, 1)).toBe(true);
+  });
+
+  it('never limits a cue it has no gap for', () => {
+    expect(cueReady('checkpoint', 1, 1)).toBe(true);
+    expect(cueReady('go', 0, 0)).toBe(true);
+  });
+
+  it('keeps every gap short enough not to swallow a deliberate repeat', () => {
+    for (const gap of Object.values(CUE_MIN_GAP)) {
+      expect(gap).toBeGreaterThan(0);
+      expect(gap).toBeLessThanOrEqual(0.5);
+    }
+  });
+});
+

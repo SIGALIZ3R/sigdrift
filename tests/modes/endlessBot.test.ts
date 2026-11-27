@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { Bump, Difficulty, EndlessGenerator, EndlessMode, InputState, Pose, Prop, TrackChunk } from '../../src/types';
-import { DT, PHYSICS_VERSION, SIM_HZ } from '../../src/types';
+import { DT, GEN_VERSION, PHYSICS_VERSION, SIM_HZ } from '../../src/types';
 import { hashNumbers } from '../../src/core/hash';
 import {
   CHUNKS_AHEAD,
@@ -223,7 +223,7 @@ describe('endless bot', () => {
   ])('passes a pillar %s on its open side', (_where, z, radius) => {
     // One on every chunk after the first, so pillars keep arriving with the road.
     const pillars = (chunk: TrackChunk): void => {
-      const prop: Prop = { kind: 'pillar', x: chunk.path[0].x + 100, z, radius, height: 4, hue: 0 };
+      const prop: Prop = { kind: 'pillar', x: chunk.path[0].x + 100, z, y: 0, radius, height: 4, hue: 0 };
       if (chunk.index > 0) chunk.props.push(prop);
     };
     const { mode, contacts } = drive(createEndlessModeFrom(straightRoad(pillars)), botDriver(), 1500, 120);
@@ -256,9 +256,11 @@ describe('endless bot', () => {
     expect(safe).toBeGreaterThan(6);
     expect(safe).toBeLessThan(20);
     expect(flightAt(safe)).toBe(0);
-    // The margin is real but not wasteful: a tenth faster still holds the road, a third faster flies.
+    // The margin is real but not wasteful: a tenth faster still holds the road, 40% faster flies. (The world's
+    // suspension soaks up the first few centimetres of a crest falling away, so the car leaves the ground from about
+    // 1.35 x this speed, a little later than the 1.2 x the car's own launch threshold alone would give.)
     expect(flightAt(1.1 * safe)).toBe(0);
-    expect(flightAt(1.33 * safe)).toBeGreaterThan(5);
+    expect(flightAt(1.4 * safe)).toBeGreaterThan(5);
   });
 
   it('slows for a bump and keeps its wheels on the ground, where the same driver without the care flies', () => {
@@ -455,16 +457,20 @@ describe('bumps on a gentle road', () => {
     };
     const plain = tally(false);
     const bumpy = tally(true);
-    // The driver is clean on a road with no bumps, and it really is flat out.
-    expect(plain.crashes).toBeLessThanOrEqual(1);
-    expect(plain.airSeconds).toBe(0);
+    // The driver is nearly clean on a road with no bumps, and it really is flat out. (PHYSICS_VERSION 3 / GEN_VERSION
+    // 2: on the hilly road with the looser car it crashes on about one run in thirteen, and twice the wreck is left
+    // nose to the wall, where this driver, who never reverses, sits for the rest of the run. The crests alone throw
+    // it into the air for a few seconds over all forty runs.)
+    expect(plain.crashes).toBeLessThanOrEqual(4);
+    expect(plain.dead).toBe(0);
+    expect(plain.airSeconds).toBeLessThan(SEEDS_HERE / 4);
     expect(plain.top).toBeGreaterThan(40);
     // The bumps are there and it flies over them...
     expect(bumpy.airSeconds).toBeGreaterThan(SEEDS_HERE);
     // ...and they cost it nothing more.
     expect(bumpy.crashes).toBeLessThanOrEqual(plain.crashes + 1);
     expect(bumpy.dead).toBe(0);
-    expect(bumpy.metres).toBeGreaterThanOrEqual(SEEDS_HERE * 2000);
+    expect(bumpy.metres).toBeGreaterThanOrEqual(plain.metres - 1);
   });
 });
 
@@ -539,7 +545,7 @@ describe('the mode can be lost', () => {
   it('is more dangerous on medium than on easy, and on hard than on medium, for the same hands at the same speed', () => {
     // Good hands, no judgement: the bot's steering at one fixed speed, slowing for nothing. How far it gets says
     // how much the road punishes that speed.
-    const speeds = [14, 16, 18, 20, 24];
+    const speeds = [14, 16, 18, 20, 22, 24];
     const cap = 10000;
     const mean = new Map<string, number>();
     const lines: string[] = [];
@@ -548,13 +554,15 @@ describe('the mode can be lost', () => {
       for (const difficulty of DIFFICULTIES) {
         let total = 0;
         let deaths = 0;
+        let falls = 0;
         for (const seed of SEEDS) {
           const { mode } = drive(createEndlessMode(seed, difficulty), botDriver({ constantSpeed: speed }), cap, 1200);
           total += Math.min(mode.state.distance, cap);
           if (mode.state.phase === 'dead') deaths++;
+          if (mode.state.deathCause === 'offTrack') falls++;
         }
         mean.set(`${speed}/${difficulty}`, total / SEEDS.length);
-        cells.push(`${difficulty} ${(total / SEEDS.length).toFixed(0)} m (${deaths}/${SEEDS.length} died)`);
+        cells.push(`${difficulty} ${(total / SEEDS.length).toFixed(0)} m (${deaths}/${SEEDS.length} died, ${falls} off the road)`);
       }
       lines.push(`  ${speed} m/s: ${cells.join(', ')}`);
     }
@@ -565,11 +573,15 @@ describe('the mode can be lost', () => {
       expect(at(14, difficulty)).toBe(cap);
       expect(at(24, difficulty)).toBeLessThan(1500);
     }
-    // In between, the difficulty decides.
-    expect(at(18, 'easy')).toBeGreaterThan(1.5 * at(18, 'medium'));
-    expect(at(18, 'medium')).toBeGreaterThan(at(18, 'hard'));
-    expect(at(20, 'easy')).toBeGreaterThan(1.5 * at(20, 'medium'));
+    // In between, the difficulty decides. (GEN_VERSION 2: easy and medium are closer than they were, about 10-20%
+    // apart at 20-22 m/s; hard is clearly the worst, and the only one whose open edges throw this driver off.)
+    for (const speed of [20, 22, 24]) {
+      expect(at(speed, 'easy'), `${speed} m/s`).toBeGreaterThan(at(speed, 'medium'));
+      expect(at(speed, 'medium'), `${speed} m/s`).toBeGreaterThan(at(speed, 'hard'));
+    }
     expect(at(20, 'easy')).toBeGreaterThan(1.5 * at(20, 'hard'));
+    expect(at(22, 'medium')).toBeGreaterThan(1.5 * at(22, 'hard'));
+    expect(at(24, 'easy')).toBeGreaterThan(1.5 * at(24, 'medium'));
   }, 120_000);
 });
 
@@ -587,11 +599,17 @@ describe('the mode can be lost', () => {
  * - Before release, the review fixes to endless mode moved the pin (907.26 m to 908.36 m): weight transfer under
  *   braking is limited (BRAKE_TRANSFER_LIMIT), a gentle road keeps 45 m of straight between a crest and the bend
  *   ahead (which changes medium's first chunks), and the world's snapshot gained "was above the walls".
+ * - PHYSICS_VERSION 3 / GEN_VERSION 2 (2.5D roads, the drift retune, ScoreState scoring, the bot's hills and crests)
+ *   moved it again; the intent is unchanged.
+ * - Review fixes: open edges keep their landing zone clear (and reserve it from later road), a crest never sits
+ *   where its flight would carry a car over the next bend's barrier, the progress tracker ignores heights while the
+ *   car is airborne, and the score locks out after a crash. The road changed: 973.58 m to 1034.65 m.
  */
 describe('golden endless run', () => {
-  const PINNED_PHYSICS_VERSION = 2;
-  const PINNED_HASH = 'd33286b8d5a3e0c4';
-  const PINNED_DISTANCE = 908.3595396080027;
+  const PINNED_PHYSICS_VERSION = 3;
+  const PINNED_GEN_VERSION = 2;
+  const PINNED_HASH = 'f0c27f81f1b28fe5';
+  const PINNED_DISTANCE = 1034.6478589079409;
   const GOLDEN_TICKS = 60 * SIM_HZ;
 
   function golden(): { hash: string; distance: number; bumps: number; mode: EndlessMode } {
@@ -618,11 +636,14 @@ describe('golden endless run', () => {
           state.intensity,
           state.lastTakeoffTick,
           state.lastLandingTick,
-          state.driftScore,
-          state.chainScore,
-          state.multiplier,
-          state.drifting ? 1 : 0,
-          state.lastChainBreakTick,
+          state.score.points,
+          state.score.multiplier,
+          state.score.peakMultiplier,
+          state.score.drifting ? 1 : 0,
+          state.score.proximity,
+          state.score.combo,
+          state.score.lastMultiplierLossTick,
+          state.score.lastCloseTick,
         );
       }
     }
@@ -644,6 +665,7 @@ describe('golden endless run', () => {
     expect(run.mode.world.chunks[0].index).toBeGreaterThan(0);
     expect(run.bumps).toBeGreaterThan(0);
     expect(PHYSICS_VERSION).toBe(PINNED_PHYSICS_VERSION);
+    expect(GEN_VERSION).toBe(PINNED_GEN_VERSION);
     expect({ hash: run.hash, distance: run.distance }).toEqual({ hash: PINNED_HASH, distance: PINNED_DISTANCE });
   });
 });

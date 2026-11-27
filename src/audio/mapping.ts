@@ -1,3 +1,4 @@
+import { MAX_GRADE } from '../types';
 import { IDLE_RPM, REDLINE_RPM } from './rpm';
 
 /**
@@ -179,13 +180,46 @@ export function createEngineTone(): EngineTone {
  */
 export const ENGINE_LEVEL = 0.3;
 
+/** How much louder (as a share) the engine gets at full strain: pulling up the steepest climb. */
+export const STRAIN_LEVEL = 0.14;
+/** How much quieter it gets at full negative strain: rolling down the steepest descent off the throttle. */
+export const EASE_LEVEL = 0.06;
+
+/**
+ * How hard the road's slope makes the engine work, -1..1: positive pulling uphill (more so on the throttle),
+ * negative running downhill off the throttle (the engine is being pushed, not pushing). 0 in the air, on the flat,
+ * and for anything that is not a number (a car state from before slopes existed).
+ *
+ * @param pitchSlope rise over run along the car's heading (CarState.pitchSlope), + = uphill.
+ * @param throttle 0..1 pedal as applied.
+ */
+export function slopeStrain(pitchSlope: number, throttle: number, airborne: boolean): number {
+  if (airborne || !Number.isFinite(pitchSlope)) return 0;
+  const grade = clamp(pitchSlope / MAX_GRADE, -1, 1);
+  const pedal = Number.isFinite(throttle) ? clamp01(throttle) : 0;
+  if (grade >= 0) return grade * (0.35 + 0.65 * pedal);
+  return grade * 0.6 * (1 - 0.7 * pedal);
+}
+
 /**
  * @param torque 0..1 how hard the engine is working (Powertrain.torque).
  * @param gate 0..1 loudness dip for shifts and the limiter (Powertrain.gate).
  * @param flutter random 0..1, fresh on every call: the unevenness of an engine on the overrun.
+ * @param strain -1..1 from `slopeStrain`: uphill the engine labours (more grit, more combustion noise, a little
+ *   louder); downhill off the throttle it eases off. 0 = flat road, the original sound exactly.
  */
-export function engineTone(rpm: number, torque: number, gate: number, flutter: number, out: EngineTone): EngineTone {
+export function engineTone(
+  rpm: number,
+  torque: number,
+  gate: number,
+  flutter: number,
+  out: EngineTone,
+  strain = 0,
+): EngineTone {
   const t = clamp01(torque);
+  const s = clamp(Number.isFinite(strain) ? strain : 0, -1, 1);
+  const up = s > 0 ? s : 0;
+  const down = s < 0 ? -s : 0;
   const rev = clamp01((rpm - IDLE_RPM) / (REDLINE_RPM - IDLE_RPM));
   // Off the throttle with the revs up, the engine pops and burbles instead of pulling.
   const overrun = (1 - t) * (1 - t) * smoothstep(1500, 3200, rpm);
@@ -193,16 +227,22 @@ export function engineTone(rpm: number, torque: number, gate: number, flutter: n
 
   out.cycleHz = rpm / 120;
   out.firingHz = rpm / 30;
-  out.loadGain = 0.1 + 0.9 * t;
-  out.coastGain = 0.75 - 0.6 * t;
-  out.noiseGain = 0.35 + 0.95 * t + 0.4 * rev + 1.1 * burble * burble;
-  out.drive = 0.36 + 0.22 * t + 0.06 * rev;
-  out.cutoff = 600 + 1300 * t + 2200 * rev + 1500 * t * rev;
+  out.loadGain = 0.1 + 0.9 * t + 0.12 * up;
+  out.coastGain = 0.75 - 0.6 * t + 0.1 * down;
+  out.noiseGain = (0.35 + 0.95 * t + 0.4 * rev + 1.1 * burble * burble) * (1 + 0.35 * up - 0.2 * down);
+  out.drive = 0.36 + 0.22 * t + 0.06 * rev + 0.1 * up;
+  // Labouring is darker than revving: the extra load comes with the low-pass closing a little.
+  out.cutoff = (600 + 1300 * t + 2200 * rev + 1500 * t * rev) * (1 - 0.08 * up);
   out.sawGain = 0.018 + 0.05 * t + 0.02 * rev;
   out.sawCutoff = 320 + 1300 * t + 800 * rev;
   // Near idle nearly everything the engine produces is below the exhaust resonances; make up for it.
   const idle = 1 - smoothstep(IDLE_RPM, 2200, rpm);
-  out.level = ENGINE_LEVEL * (0.9 + 0.1 * t + 0.7 * idle) * clamp01(gate) * (1 - 0.3 * burble);
+  out.level =
+    ENGINE_LEVEL *
+    (0.9 + 0.1 * t + 0.7 * idle) *
+    clamp01(gate) *
+    (1 - 0.3 * burble) *
+    (1 + STRAIN_LEVEL * up - EASE_LEVEL * down);
   return out;
 }
 
@@ -286,6 +326,55 @@ export function ambienceMix(speed: number, airborne: boolean, out: AmbienceMix):
   out.roadGain = airborne ? 0 : 0.22 * s;
   out.roadHz = 70 + 130 * s;
   return out;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Master output
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * Fixed trim on everything the game plays, after the limiter and clipper: "the sound is great, make it ten percent
+ * quieter". Applied last so the mix and the limiter's behaviour are exactly as before, only 10 % lower.
+ */
+export const OUTPUT_TRIM = 0.9;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Cues
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * A bit-crusher's transfer curve: each half of [-1, 1] quantised to `steps` levels above zero (steps >= 1), the
+ * grainy sound of a signal squeezed through too few bits. Odd symmetric, and never outside [-1, 1].
+ */
+export function crushCurve(steps: number, samples = 512): Float32Array<ArrayBuffer> {
+  const n = Math.max(1, Math.floor(Number.isFinite(steps) ? steps : 1));
+  const curve = new Float32Array(samples);
+  for (let i = 0; i < samples; i++) {
+    const x = (2 * i) / (samples - 1) - 1;
+    const q = Math.round(Math.abs(x) * n) / n;
+    curve[i] = x < 0 ? -q : q;
+  }
+  return curve;
+}
+
+/**
+ * Minimum time between two plays of the same cue, s. A cue asked for again sooner is dropped. Cues not listed here
+ * always play. 'close' (a close-to-the-wall moment starting) is at most four a second so it never turns into a
+ * rattle; the interface ticks are thinned out only when something calls them every frame.
+ */
+export const CUE_MIN_GAP: Readonly<Partial<Record<string, number>>> = {
+  close: 0.25,
+  multiplier: 0.08,
+  comboLost: 0.2,
+  fall: 0.5,
+  uiMove: 0.03,
+  uiGlitch: 0.05,
+};
+
+/** True when a cue last played at `last` (s, -Infinity for never) may play again at `now`. */
+export function cueReady(kind: string, now: number, last: number): boolean {
+  const gap = CUE_MIN_GAP[kind];
+  return gap === undefined || !(now - last < gap);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

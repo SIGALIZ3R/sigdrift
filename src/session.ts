@@ -1,32 +1,35 @@
 /**
  * One run in progress, whichever mode it belongs to. The game drives a `Session` without knowing the rules behind
  * it: it steps it, restarts it, asks which phase it is in and lets it report its own ending. Everything that
- * differs between a weekly run and an endless one lives in the two implementations below.
+ * differs between a track run (this week's or one of the five levels) and an endless one lives in the two
+ * implementations below.
  */
 import type { GameAudio } from './audio/mixer';
+import { DriveCues } from './cues';
 import { createEndlessMode } from './modes/endless';
 import { createRunMode } from './modes/run';
 import { createWorld } from './sim/world';
 import { PHYSICS_VERSION, SIM_HZ } from './types';
 import type {
-  BestRecord,
   CarParams,
   Difficulty,
-  EndlessBest,
   EndlessMode,
+  EndlessRecords,
   EndlessState,
   GameRenderer,
   InputState,
   Level,
   RunMode,
+  RunRecords,
   RunState,
+  ScoreState,
   SimBase,
 } from './types';
 import type { EndlessHudInfo, Hud, HudInfo } from './ui/hud';
 import type { FinishResult, GameOverResult, Menu } from './ui/menu';
-import { loadBest, loadEndlessBest, saveBest, saveEndlessBest } from './ui/storage';
+import { loadEndlessRecords, loadRunRecords, saveEndlessRecord, saveRunRecord } from './ui/storage';
 
-/** `over` covers a finished weekly run and a dead endless one: no more player input, no pausing. */
+/** `over` covers a finished track run and a dead endless one: no more player input, no pausing. */
 export type SessionPhase = 'countdown' | 'running' | 'over';
 
 export interface SessionDeps {
@@ -44,6 +47,7 @@ interface SessionBase {
   /** What the renderer is told about the run: exactly one of these two is non-null. */
   readonly run: RunState | null;
   readonly endless: EndlessState | null;
+  readonly score: ScoreState;
   /** False once the engine should fall silent although the car may still be rolling. */
   readonly engineRunning: boolean;
   /** How long the car is left on screen after the run ends before its result screen covers it. */
@@ -62,10 +66,22 @@ interface SessionBase {
   updateHud(hud: Hud): void;
 }
 
-export interface WeeklySession extends SessionBase {
-  readonly kind: 'weekly';
+/** What a track session needs to know about the track besides the level itself. */
+export interface TrackInfo {
+  kind: 'weekly' | 'level';
+  /** Week id or level id: the storage key for records. */
+  trackId: string;
+  /** Level name, or the week id. */
+  trackName: string;
+  /** The level after this one (L1..L4), or null. */
+  nextLevelId: string | null;
+}
+
+export interface TrackSession extends SessionBase {
+  readonly kind: 'weekly' | 'level';
   readonly mode: RunMode;
   readonly level: Level;
+  readonly info: TrackInfo;
 }
 
 export interface EndlessSession extends SessionBase {
@@ -75,34 +91,43 @@ export interface EndlessSession extends SessionBase {
   readonly seed: string;
 }
 
-export type Session = WeeklySession | EndlessSession;
+export type Session = TrackSession | EndlessSession;
 
 const FINISH_SCREEN_DELAY_TICKS = Math.round(1.2 * SIM_HZ);
 /** A little longer than a finish: the crash or the fall has to be seen before the screen covers it. */
-const GAME_OVER_SCREEN_DELAY_TICKS = Math.round(1.4 * SIM_HZ);
+const GAME_OVER_SCREEN_DELAY_TICKS = Math.round(1.6 * SIM_HZ);
 
-// ---- Weekly run -------------------------------------------------------------------------------------------------
+/** Records keep whole points. */
+function wholePoints(points: number): number {
+  return Number.isFinite(points) && points > 0 ? Math.floor(points) : 0;
+}
 
-class WeeklyRun implements WeeklySession {
-  readonly kind = 'weekly';
+// ---- Weekly run or level ------------------------------------------------------------------------------------------
+
+class TrackRun implements TrackSession {
+  readonly kind: 'weekly' | 'level';
   readonly mode: RunMode;
   readonly level: Level;
+  readonly info: TrackInfo;
   readonly endless = null;
   readonly engineRunning = true;
   readonly endScreenDelayTicks = FINISH_SCREEN_DELAY_TICKS;
 
   private readonly audio: GameAudio;
+  private readonly cues: DriveCues;
   private readonly hudInfo: HudInfo;
-  /** Best time for this level, kept current when a run beats it. */
-  private best: BestRecord | null;
+  private records: RunRecords;
   private result: FinishResult | null = null;
 
-  constructor(level: Level, deps: SessionDeps) {
+  constructor(level: Level, info: TrackInfo, deps: SessionDeps) {
+    this.kind = info.kind;
     this.level = level;
+    this.info = info;
     this.audio = deps.audio;
+    this.cues = new DriveCues(deps.audio);
     this.mode = createRunMode(createWorld(level, deps.params));
-    this.best = loadBest(level.id);
-    this.hudInfo = { levelId: level.id, best: this.best };
+    this.records = loadRunRecords(info.trackId);
+    this.hudInfo = { trackName: info.trackName, records: this.records };
   }
 
   get world(): SimBase {
@@ -122,42 +147,68 @@ class WeeklyRun implements WeeklySession {
     return this.mode.state;
   }
 
+  get score(): ScoreState {
+    return this.mode.state.score;
+  }
+
   step(input: InputState): boolean {
     const state = this.mode.state;
+    const world = this.mode.world;
     const resetsBefore = state.resets;
     const checkpointBefore = state.lastCheckpointTick;
+    const fallBefore = state.lastFallTick;
+    const waitingBefore = state.respawnInTicks;
+    const worldTickBefore = world.tick;
+    this.cues.before(state.score);
     this.mode.step(input);
+    this.cues.after(world, state.score, world.tick !== worldTickBefore);
 
-    const respawned = state.resets !== resetsBefore;
-    if (respawned) this.audio.blip('reset');
+    if (state.lastFallTick !== fallBefore && state.lastFallTick >= 0) this.cues.modeFall();
+    const reset = state.resets !== resetsBefore;
+    if (reset) this.audio.blip('reset');
     if (state.phase !== 'finished' && state.lastCheckpointTick !== checkpointBefore && state.lastCheckpointTick >= 0) {
       this.audio.blip('checkpoint');
     }
-    return respawned;
+    // Put back after a fall: the wait ran out this tick.
+    const putBack = waitingBefore > 0 && state.respawnInTicks <= 0;
+    if (reset || putBack) this.cues.reset();
+    return reset || putBack;
   }
 
   restart(): void {
     this.result = null;
+    this.cues.reset();
     this.mode.restart();
   }
 
   end(tuned: boolean): void {
     const state = this.mode.state;
-    const previous = this.best;
-    const record: BestRecord = { ticks: state.ticks, driftScore: state.driftScore, physicsVersion: PHYSICS_VERSION };
-    const isNewBest = !tuned && (previous === null || record.ticks < previous.ticks);
-    if (!tuned) saveBest(this.level.id, record);
-    if (isNewBest) {
-      this.best = record;
-      this.hudInfo.best = record;
-    }
+    const trackId = this.info.trackId;
+    const previousBest = this.records.bestTime;
+    const score = wholePoints(state.score.points);
+    const saved = tuned
+      ? null
+      : saveRunRecord(trackId, {
+          ticks: state.ticks,
+          score,
+          date: new Date().toISOString(),
+          physicsVersion: PHYSICS_VERSION,
+        });
+    this.records = loadRunRecords(trackId);
+    this.hudInfo.records = this.records;
     this.result = {
-      levelId: this.level.id,
-      ticks: record.ticks,
-      driftScore: record.driftScore,
+      mode: this.kind,
+      trackId,
+      trackName: this.info.trackName,
+      ticks: state.ticks,
+      score,
+      peakMultiplier: state.score.peakMultiplier,
+      falls: state.falls,
       resets: state.resets,
-      best: previous,
-      isNewBest,
+      previousBest,
+      saved,
+      highScores: this.records.highScores,
+      nextLevelId: this.info.nextLevelId,
       tuned,
     };
     this.audio.blip('finish');
@@ -172,7 +223,7 @@ class WeeklyRun implements WeeklySession {
   }
 }
 
-// ---- Endless run ------------------------------------------------------------------------------------------------
+// ---- Endless run --------------------------------------------------------------------------------------------------
 
 class EndlessRun implements EndlessSession {
   readonly kind = 'endless';
@@ -184,9 +235,9 @@ class EndlessRun implements EndlessSession {
 
   private readonly audio: GameAudio;
   private readonly renderer: GameRenderer;
+  private readonly cues: DriveCues;
   private readonly hudInfo: EndlessHudInfo;
-  /** Longest run on this difficulty, kept current when a run beats it. */
-  private best: EndlessBest | null;
+  private records: EndlessRecords;
   private result: GameOverResult | null = null;
   /**
    * The chunks the renderer has been given. Live chunks are consecutive, so an inclusive range of indices says
@@ -200,9 +251,10 @@ class EndlessRun implements EndlessSession {
     this.difficulty = difficulty;
     this.audio = deps.audio;
     this.renderer = deps.renderer;
+    this.cues = new DriveCues(deps.audio);
     this.mode = createEndlessMode(seed, difficulty, deps.params);
-    this.best = loadEndlessBest(difficulty);
-    this.hudInfo = { best: this.best };
+    this.records = loadEndlessRecords(difficulty);
+    this.hudInfo = { records: this.records };
     this.renderer.beginEndless();
     this.syncChunks();
   }
@@ -224,24 +276,33 @@ class EndlessRun implements EndlessSession {
     return this.mode.state;
   }
 
+  get score(): ScoreState {
+    return this.mode.state.score;
+  }
+
   get engineRunning(): boolean {
     return this.mode.state.phase !== 'dead';
   }
 
   step(input: InputState): boolean {
-    const crashBefore = this.mode.state.lastCrashTick;
-    const landingBefore = this.mode.state.lastLandingTick;
+    const state = this.mode.state;
+    const world = this.mode.world;
+    const crashBefore = state.lastCrashTick;
+    const phaseBefore = state.phase;
+    const worldTickBefore = world.tick;
+    this.cues.before(state.score);
     this.mode.step(input);
     this.syncChunks();
+    this.cues.after(world, state.score, world.tick !== worldTickBefore);
 
-    const state = this.mode.state;
     if (state.lastCrashTick !== crashBefore && state.lastCrashTick >= 0) this.audio.blip('crash');
-    if (state.lastLandingTick !== landingBefore && state.lastLandingTick >= 0) this.audio.blip('land');
+    if (phaseBefore !== 'dead' && state.phase === 'dead' && state.deathCause === 'offTrack') this.cues.modeFall();
     return false;
   }
 
   restart(): void {
     this.result = null;
+    this.cues.reset();
     this.mode.restart();
     // The same seed gives the same road, so chunks still on screen from the first stretch stay as they are.
     this.syncChunks();
@@ -249,26 +310,32 @@ class EndlessRun implements EndlessSession {
 
   end(tuned: boolean): void {
     const state = this.mode.state;
-    const previous = this.best;
-    const record: EndlessBest = {
-      distance: state.distance,
-      driftScore: state.driftScore,
-      physicsVersion: PHYSICS_VERSION,
-    };
-    const isNewBest = !tuned && record.distance > 0 && (previous === null || record.distance > previous.distance);
-    if (!tuned) saveEndlessBest(this.difficulty, record);
-    if (isNewBest) {
-      this.best = record;
-      this.hudInfo.best = record;
-    }
+    const previousBest = this.records.bestDistance;
+    const score = wholePoints(state.score.points);
+    // A run that went nowhere and scored nothing (straight off the start) would only clutter the table.
+    const empty = state.distance <= 0 && score === 0;
+    const saved =
+      tuned || empty
+        ? null
+        : saveEndlessRecord(this.difficulty, {
+          distance: state.distance,
+          score,
+          ticks: state.ticks,
+          date: new Date().toISOString(),
+          physicsVersion: PHYSICS_VERSION,
+        });
+    this.records = loadEndlessRecords(this.difficulty);
+    this.hudInfo.records = this.records;
     this.result = {
       difficulty: this.difficulty,
-      distance: record.distance,
-      driftScore: record.driftScore,
+      distance: state.distance,
+      score,
+      peakMultiplier: state.score.peakMultiplier,
       ticks: state.ticks,
       cause: state.deathCause ?? 'crashes',
-      best: previous,
-      isNewBest,
+      previousBest,
+      saved,
+      highScores: this.records.highScores,
       tuned,
     };
     this.audio.blip('death');
@@ -307,10 +374,11 @@ class EndlessRun implements EndlessSession {
   }
 }
 
-// ---- Factories --------------------------------------------------------------------------------------------------
+// ---- Factories ----------------------------------------------------------------------------------------------------
 
-export function createWeeklySession(level: Level, deps: SessionDeps): WeeklySession {
-  return new WeeklyRun(level, deps);
+/** A weekly run or a level on `level`, which the caller has already put on screen. */
+export function createTrackSession(level: Level, info: TrackInfo, deps: SessionDeps): TrackSession {
+  return new TrackRun(level, info, deps);
 }
 
 /**

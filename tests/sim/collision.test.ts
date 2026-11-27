@@ -14,7 +14,7 @@ import {
   removeSolids,
   resolveCollisions,
 } from '../../src/sim/collision';
-import { DEFAULT_CAR_PARAMS } from '../../src/sim/params';
+import { PLANTED_PARAMS as DEFAULT_CAR_PARAMS, plantedParams } from '../helpers/testCar';
 import { createWorld } from '../../src/sim/world';
 import { makeOpenLevel, makeStraightLevel } from '../helpers/handLevel';
 
@@ -27,7 +27,7 @@ const DEGREES = Math.PI / 180;
 
 /** A world with the car placed at a pose and already moving at `speed` in the direction `travel`. */
 function launch(level: Level, x: number, z: number, heading: number, speed: number, travel = heading): World {
-  const world = createWorld(level);
+  const world = createWorld(level, plantedParams());
   world.placeCar({ x, z, heading });
   world.car.vx = speed * cos(travel);
   world.car.vz = speed * sin(travel);
@@ -252,9 +252,11 @@ describe('road edges made of many short walls', () => {
   });
 
   it('keep a flat-out car on the road from end to end', () => {
-    const world = createWorld(ROAD);
+    const world = createWorld(ROAD, plantedParams());
     for (let i = 0; i < 30 / DT; i++) {
-      world.step({ ...IDLE, throttle: 1, steer: i % 240 < 120 ? 0.2 : -0.2 });
+      // Held straight down the middle (the handling has its own tests): this is about the walls at the far end.
+      const car = world.car;
+      world.step({ ...IDLE, throttle: 1, steer: Math.max(-1, Math.min(1, -2 * car.heading - 0.1 * car.z - 0.3 * car.yawRate)) });
       expect(Math.abs(world.car.z)).toBeLessThan(HALF_WIDTH);
       expect(world.car.x).toBeGreaterThan(ROAD.bounds.minX);
       expect(world.car.x).toBeLessThan(ROAD.bounds.maxX);
@@ -265,7 +267,7 @@ describe('road edges made of many short walls', () => {
 });
 
 describe('a long diagonal wall', () => {
-  const level: Level = { ...ARENA, walls: [...ARENA.walls, { ax: -HALF, az: -HALF, bx: HALF, bz: HALF }] };
+  const level: Level = { ...ARENA, walls: [...ARENA.walls, { ax: -HALF, az: -HALF, bx: HALF, bz: HALF, ya: 0, yb: 0 }] };
 
   it('stops the car anywhere along its length', () => {
     for (const along of [-80, -35, 0, 20, 70]) {
@@ -284,7 +286,7 @@ describe('a long diagonal wall', () => {
 });
 
 describe('pillars', () => {
-  const pillar: Prop = { kind: 'pillar', x: 40, z: 0, radius: 1.5, height: 4, hue: 0 };
+  const pillar: Prop = { kind: 'pillar', x: 40, z: 0, y: 0, radius: 1.5, height: 4, hue: 0 };
   const level: Level = { ...ARENA, props: [pillar] };
 
   function clearance(world: World): number {
@@ -340,7 +342,7 @@ describe('pillars', () => {
 
 describe('a collider that changes while the car drives', () => {
   const wallAt = (x: number): Segment => ({ ax: x, az: -40, bx: x, bz: 40 });
-  const pillarAt = (x: number, z = 0): Prop => ({ kind: 'pillar', x, z, radius: 1.5, height: 4, hue: 0 });
+  const pillarAt = (x: number, z = 0): Prop => ({ kind: 'pillar', x, z, y: 0, radius: 1.5, height: 4, hue: 0 });
 
   /** Drives a car along +x from `fromX` at 30 m/s for `seconds` and returns it. */
   function run(collider: Collider, fromX: number, seconds: number, walls = true, z = 0): { car: CarState; hits: number } {

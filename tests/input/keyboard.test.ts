@@ -206,4 +206,114 @@ describe('keyboard', () => {
     send('keydown', 'KeyW');
     expect(keyboard.held.throttle).toBe(0);
   });
+
+  describe('menu navigation', () => {
+    it.each([
+      ['ArrowUp', 'navUp'],
+      ['KeyW', 'navUp'],
+      ['ArrowDown', 'navDown'],
+      ['KeyS', 'navDown'],
+      ['ArrowLeft', 'navLeft'],
+      ['KeyA', 'navLeft'],
+      ['ArrowRight', 'navRight'],
+      ['KeyD', 'navRight'],
+    ] as const)('%s raises %s and still drives the car', (code, flag) => {
+      const { keyboard, send, activity } = setup();
+      send('keydown', code);
+      expect(keyboard.pressed[flag]).toBe(true);
+      const others = (['navUp', 'navDown', 'navLeft', 'navRight', 'back'] as const).filter((f) => f !== flag);
+      for (const other of others) expect(keyboard.pressed[other]).toBe(false);
+      const held = keyboard.held;
+      expect(Math.abs(held.steer) + held.throttle + held.brake).toBe(1);
+      expect(activity()).toBe(1);
+      send('keyup', code);
+      expect(Math.abs(keyboard.held.steer) + keyboard.held.throttle + keyboard.held.brake).toBe(0);
+    });
+
+    it('repeats a nav key while it is held (auto-repeat), unlike confirm or back', () => {
+      const { keyboard, send } = setup();
+      send('keydown', 'ArrowDown');
+      keyboard.pressed.navDown = false;
+      send('keydown', 'ArrowDown', { repeat: true });
+      expect(keyboard.pressed.navDown).toBe(true);
+      send('keydown', 'Escape');
+      keyboard.pressed.back = false;
+      send('keydown', 'Escape', { repeat: true });
+      expect(keyboard.pressed.back).toBe(false);
+    });
+
+    it('Escape raises pause and back; Backspace raises restart and back; P only pauses', () => {
+      const { keyboard, send } = setup();
+      send('keydown', 'Escape');
+      expect(keyboard.pressed).toMatchObject({ pause: true, back: true, restart: false });
+      keyboard.pressed.pause = false;
+      keyboard.pressed.back = false;
+      expect(send('keydown', 'Backspace').prevented).toBe(true);
+      expect(keyboard.pressed).toMatchObject({ pause: false, back: true, restart: true });
+      keyboard.pressed.restart = false;
+      keyboard.pressed.back = false;
+      send('keydown', 'KeyP');
+      expect(keyboard.pressed).toMatchObject({ pause: true, back: false });
+    });
+
+    it('takes only Escape (as pause and back) from a text field: Backspace edits the text', () => {
+      const { keyboard, send } = setup();
+      expect(send('keydown', 'Backspace', { target: TEXT }).prevented).toBe(false);
+      send('keydown', 'ArrowUp', { target: TEXT });
+      send('keydown', 'KeyS', { target: TEXT });
+      expect(keyboard.pressed).toMatchObject({ back: false, restart: false, navUp: false, navDown: false });
+      send('keydown', 'Escape', { target: TEXT });
+      expect(keyboard.pressed).toMatchObject({ back: true, pause: true });
+    });
+
+    it('leaves the arrows to a focused slider but still navigates with W/A/S/D around it', () => {
+      const { keyboard, send } = setup();
+      expect(send('keydown', 'ArrowLeft', { target: RANGE }).prevented).toBe(false);
+      expect(keyboard.pressed.navLeft).toBe(false);
+      send('keydown', 'KeyS', { target: RANGE });
+      expect(keyboard.pressed.navDown).toBe(true);
+      // ...without driving.
+      expect(keyboard.held.brake).toBe(0);
+      send('keydown', 'Backspace', { target: CHECKBOX });
+      expect(keyboard.pressed.back).toBe(true);
+    });
+
+    it('moves focus off a switch with any arrow, and off a slider with Up/Down', () => {
+      for (const [code, flag] of [
+        ['ArrowUp', 'navUp'],
+        ['ArrowDown', 'navDown'],
+        ['ArrowLeft', 'navLeft'],
+        ['ArrowRight', 'navRight'],
+      ] as const) {
+        const { keyboard, send } = setup();
+        send('keydown', code, { target: CHECKBOX });
+        expect(keyboard.pressed[flag]).toBe(true);
+        expect(keyboard.held).toMatchObject({ steer: 0, throttle: 0, brake: 0 });
+      }
+      for (const [code, flag] of [
+        ['ArrowUp', 'navUp'],
+        ['ArrowDown', 'navDown'],
+      ] as const) {
+        const { keyboard, send } = setup();
+        send('keydown', code, { target: RANGE });
+        expect(keyboard.pressed[flag]).toBe(true);
+        expect(keyboard.held).toMatchObject({ throttle: 0, brake: 0 });
+      }
+      const { keyboard, send } = setup();
+      send('keydown', 'ArrowRight', { target: RANGE });
+      expect(keyboard.pressed.navRight).toBe(false);
+    });
+
+    it('navigates from a focused button', () => {
+      const { keyboard, send } = setup();
+      expect(send('keydown', 'ArrowDown', { target: BUTTON }).prevented).toBe(true);
+      expect(keyboard.pressed.navDown).toBe(true);
+    });
+
+    it('leaves Cmd+Arrow and Alt+Arrow to the browser', () => {
+      const { keyboard, send } = setup();
+      send('keydown', 'ArrowLeft', { metaKey: true });
+      expect(keyboard.pressed.navLeft).toBe(false);
+    });
+  });
 });

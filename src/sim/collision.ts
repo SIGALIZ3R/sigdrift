@@ -8,9 +8,16 @@
  *
  * Walls and props live in an unbounded hash grid and belong to an owner (a level, or one chunk of endless road),
  * so an owner's geometry can be added and removed without touching anyone else's.
+ *
+ * HEIGHTS. Roads pass over and under each other, so every solid only exists for a car at its own level:
+ *  - a wall (a road barrier, see Wall) for a car whose wheels are within [base - 1, top] at the wall's closest
+ *    point, where base is the wall's height there and top is WALL_HEIGHT + 0.1 above the road (above the bump the
+ *    car stands on, if it stands on its own road): roads above and below never block each other, and a car that
+ *    flies higher than the barrier passes over it;
+ *  - a prop for a car whose wheels are within [prop.y - 1, prop.y + prop.height].
  */
-import type { CarParams, CarState, CollisionEvent, Level, Prop, Segment } from '../types';
-import { DT } from '../types';
+import type { CarParams, CarState, CollisionEvent, Level, Prop, Segment, Wall } from '../types';
+import { DT, WALL_HEIGHT } from '../types';
 import { cos, sin } from '../core/fixedMath';
 import { MAX_YAW_RATE, settleVelocity, updateKinematics } from './car';
 
@@ -21,11 +28,14 @@ export interface Collider {
   readonly [colliderBrand]: true;
 }
 
-/**
- * Walls are 0.7 m high. A car whose wheels are more than this far above the ground under it passes over them;
- * props (pillars) are tall and always solid. The caller decides: see `resolveCollisions`.
- */
-export const WALL_CLEAR_HEIGHT = 0.8;
+/** A car whose wheels are more than this above the road a wall stands on passes over the wall, m. */
+export const WALL_CLEAR_HEIGHT = WALL_HEIGHT + 0.1;
+/** A car whose wheels are more than this below a solid's base passes under it, m. */
+export const UNDER_CLEARANCE = 1;
+/** The ground under the car counts as the wall's own road (a bump on it) when within this of the wall's base, m. */
+const SAME_ROAD = 1.5;
+/** `nearestSolidDistance` looks this far, m. Beyond it the answer is Infinity. */
+export const WALL_DISTANCE_RANGE = 8;
 
 /** What one owner put into the grid, so that it can be taken out again. */
 interface Owned {
@@ -39,11 +49,11 @@ interface Owned {
  */
 interface Grid {
   cells: Map<number, number[]>;
-  /** ax, az, bx, bz per wall slot. */
+  /** ax, az, bx, bz, ya, yb per wall slot. */
   walls: Float64Array;
   wallSlots: number;
   freeWalls: number[];
-  /** x, z, radius per prop slot. */
+  /** x, z, radius, y, height per prop slot. */
   props: Float64Array;
   propSlots: number;
   freeProps: number[];
@@ -55,6 +65,15 @@ interface Grid {
   /** Scratch: whether this tick has touched anything, and its hardest contact so far. */
   touched: boolean;
   event: CollisionEvent;
+  /** Height filter of the current query: the car's wheels now and last tick, and the road under it (NaN: none). */
+  carY: number;
+  prevY: number;
+  groundY: number;
+  /** Where the car's centre is, for walls it was not at the height of last tick. */
+  centreX: number;
+  centreZ: number;
+  /** Scratch of the segment-segment distance: parameter along the wall of the closest point. */
+  closestT: number;
 }
 
 const CELL_SIZE = 8;
@@ -77,6 +96,8 @@ const YAW_KICK = 0.5;
 /** Most yaw rate (rad/s) one impact may add, however hard. */
 const MAX_YAW_KICK = 2.5;
 const TOUCHING_EPSILON = 1e-9;
+const WALL_STRIDE = 6;
+const PROP_STRIDE = 5;
 /** Slack on a wall's ends for the went-through test, so a path through the joint of two walls is caught by both. */
 const JOINT_SLACK = 1e-9;
 
@@ -115,10 +136,10 @@ function markBox(grid: Grid, item: number, add: boolean, x0: number, z0: number,
 
 /** A long diagonal wall is marked piece by piece so it only lands in the cells near it, not its whole bounding box. */
 function markWall(grid: Grid, slot: number, add: boolean): void {
-  const ax = grid.walls[slot * 4];
-  const az = grid.walls[slot * 4 + 1];
-  const dx = grid.walls[slot * 4 + 2] - ax;
-  const dz = grid.walls[slot * 4 + 3] - az;
+  const ax = grid.walls[slot * WALL_STRIDE];
+  const az = grid.walls[slot * WALL_STRIDE + 1];
+  const dx = grid.walls[slot * WALL_STRIDE + 2] - ax;
+  const dz = grid.walls[slot * WALL_STRIDE + 3] - az;
   const length = Math.sqrt(dx * dx + dz * dz);
   // A wall with a coordinate that is not a number, or of absurd length, is left out: it could never be hit anyway.
   if (!(length < 1e7)) return;
@@ -131,9 +152,9 @@ function markWall(grid: Grid, slot: number, add: boolean): void {
 }
 
 function markProp(grid: Grid, slot: number, add: boolean): void {
-  const x = grid.props[slot * 3];
-  const z = grid.props[slot * 3 + 1];
-  const radius = grid.props[slot * 3 + 2];
+  const x = grid.props[slot * PROP_STRIDE];
+  const z = grid.props[slot * PROP_STRIDE + 1];
+  const radius = grid.props[slot * PROP_STRIDE + 2];
   if (!(radius >= 0 && radius < 500 && Math.abs(x) < Infinity && Math.abs(z) < Infinity)) return;
   markBox(grid, -1 - slot, add, x - radius, z - radius, x + radius, z + radius);
 }
@@ -154,15 +175,26 @@ export function createCollider(): Collider {
     depth: 0,
     touched: false,
     event: { x: 0, z: 0, nx: 0, nz: 0, impact: 0 },
+    carY: 0,
+    prevY: 0,
+    groundY: NaN,
+    centreX: 0,
+    centreZ: 0,
+    closestT: 0,
   };
   return grid as unknown as Collider;
 }
 
+function heightOr0(value: number | undefined): number {
+  return value !== undefined && Math.abs(value) < 1e9 ? value : 0;
+}
+
 /**
  * Adds walls and props under an owner id (for endless road, the chunk index). An owner may be added to more than
- * once; `removeSolids` takes out everything it ever added. Costs time in proportion to what is added.
+ * once; `removeSolids` takes out everything it ever added. Costs time in proportion to what is added. A plain
+ * Segment (no ya / yb) is a wall on a road at height 0.
  */
-export function addSolids(collider: Collider, owner: number, walls: readonly Segment[], props: readonly Prop[]): void {
+export function addSolids(collider: Collider, owner: number, walls: readonly (Segment | Wall)[], props: readonly Prop[]): void {
   const grid = collider as unknown as Grid;
   let owned = grid.owners.get(owner);
   if (!owned) {
@@ -170,23 +202,30 @@ export function addSolids(collider: Collider, owner: number, walls: readonly Seg
     grid.owners.set(owner, owned);
   }
   for (let i = 0; i < walls.length; i++) {
-    const wall = walls[i];
+    const wall = walls[i] as Partial<Wall> & Segment;
     const slot = grid.freeWalls.length > 0 ? (grid.freeWalls.pop() as number) : grid.wallSlots++;
-    grid.walls = grown(grid.walls, grid.wallSlots * 4);
-    grid.walls[slot * 4] = wall.ax;
-    grid.walls[slot * 4 + 1] = wall.az;
-    grid.walls[slot * 4 + 2] = wall.bx;
-    grid.walls[slot * 4 + 3] = wall.bz;
+    grid.walls = grown(grid.walls, grid.wallSlots * WALL_STRIDE);
+    const o = slot * WALL_STRIDE;
+    grid.walls[o] = wall.ax;
+    grid.walls[o + 1] = wall.az;
+    grid.walls[o + 2] = wall.bx;
+    grid.walls[o + 3] = wall.bz;
+    grid.walls[o + 4] = heightOr0(wall.ya);
+    grid.walls[o + 5] = heightOr0(wall.yb);
     owned.walls.push(slot);
     markWall(grid, slot, true);
   }
   for (let i = 0; i < props.length; i++) {
-    const prop = props[i];
+    const prop = props[i] as Partial<Prop> & Prop;
     const slot = grid.freeProps.length > 0 ? (grid.freeProps.pop() as number) : grid.propSlots++;
-    grid.props = grown(grid.props, grid.propSlots * 3);
-    grid.props[slot * 3] = prop.x;
-    grid.props[slot * 3 + 1] = prop.z;
-    grid.props[slot * 3 + 2] = prop.radius;
+    grid.props = grown(grid.props, grid.propSlots * PROP_STRIDE);
+    const o = slot * PROP_STRIDE;
+    grid.props[o] = prop.x;
+    grid.props[o + 1] = prop.z;
+    grid.props[o + 2] = prop.radius;
+    grid.props[o + 3] = heightOr0(prop.y);
+    // A prop with no height given is a pillar of any height.
+    grid.props[o + 4] = prop.height >= 0 ? prop.height : Infinity;
     owned.props.push(slot);
     markProp(grid, slot, true);
   }
@@ -226,9 +265,20 @@ export function buildCollider(level: Level): Collider {
   return collider;
 }
 
+/** Whether a wall whose road is at `base` (here) is solid for wheels at height `y`. */
+function wallSolidFor(grid: Grid, base: number, y: number): boolean {
+  const ground = grid.groundY;
+  const road = ground > base && ground - base < SAME_ROAD ? ground : base;
+  return y >= base - UNDER_CLEARANCE && y <= road + WALL_CLEAR_HEIGHT;
+}
+
 /**
  * Circle against one wall. `(prevX, prevZ)` is where the circle's centre was before this tick's move.
  * On contact, leaves the push-out normal and depth in the grid's scratch fields.
+ *
+ * A wall the car was not at the height of last tick (it was flying over it, or coming down onto it from above) has
+ * no "before" side for the circle: the car's centre stands in for it, so whichever circle is across the wall from
+ * the centre is brought over to the centre's side and the car comes down whole, on one side.
  */
 function hitWall(
   grid: Grid,
@@ -239,11 +289,22 @@ function hitWall(
   prevZ: number,
   radius: number,
 ): boolean {
-  const ax = grid.walls[wall * 4];
-  const az = grid.walls[wall * 4 + 1];
-  const dx = grid.walls[wall * 4 + 2] - ax;
-  const dz = grid.walls[wall * 4 + 3] - az;
+  const o = wall * WALL_STRIDE;
+  const ax = grid.walls[o];
+  const az = grid.walls[o + 1];
+  const dx = grid.walls[o + 2] - ax;
+  const dz = grid.walls[o + 3] - az;
   const lengthSq = dx * dx + dz * dz;
+  let along = lengthSq > 0 ? ((cx - ax) * dx + (cz - az) * dz) / lengthSq : 0;
+  along = along < 0 ? 0 : along > 1 ? 1 : along;
+  const ya = grid.walls[o + 4];
+  const base = ya + (grid.walls[o + 5] - ya) * along;
+  if (!wallSolidFor(grid, base, grid.carY)) return false;
+  if (!wallSolidFor(grid, base, grid.prevY)) {
+    prevX = grid.centreX;
+    prevZ = grid.centreZ;
+  }
+
   const invLength = lengthSq > 0 ? 1 / Math.sqrt(lengthSq) : 0;
   // Twice the signed area of (a, b, point): its sign says which side of the wall the point is on.
   const sideNow = dx * (cz - az) - dz * (cx - ax);
@@ -252,8 +313,8 @@ function hitWall(
 
   if (sideNow * sideBefore < 0) {
     const t = sideBefore / (sideBefore - sideNow);
-    const along = ((prevX + (cx - prevX) * t - ax) * dx + (prevZ + (cz - prevZ) * t - az) * dz) / lengthSq;
-    if (along >= -JOINT_SLACK && along <= 1 + JOINT_SLACK) {
+    const crossing = ((prevX + (cx - prevX) * t - ax) * dx + (prevZ + (cz - prevZ) * t - az) * dz) / lengthSq;
+    if (crossing >= -JOINT_SLACK && crossing <= 1 + JOINT_SLACK) {
       grid.nx = -dz * towardsBefore;
       grid.nz = dx * towardsBefore;
       grid.depth = radius + Math.abs(sideNow) * invLength;
@@ -261,8 +322,6 @@ function hitWall(
     }
   }
 
-  let along = lengthSq > 0 ? ((cx - ax) * dx + (cz - az) * dz) / lengthSq : 0;
-  along = along < 0 ? 0 : along > 1 ? 1 : along;
   const offX = cx - (ax + dx * along);
   const offZ = cz - (az + dz * along);
   const distSq = offX * offX + offZ * offZ;
@@ -282,13 +341,21 @@ function hitWall(
   return true;
 }
 
+/** Whether a prop is solid for wheels at height `y`. */
+function propSolidFor(grid: Grid, prop: number, y: number): boolean {
+  const base = grid.props[prop * PROP_STRIDE + 3];
+  return y >= base - UNDER_CLEARANCE && y <= base + grid.props[prop * PROP_STRIDE + 4];
+}
+
 /** Circle against one round prop. */
 function hitProp(grid: Grid, prop: number, cx: number, cz: number, radius: number): boolean {
-  const offX = cx - grid.props[prop * 3];
-  const offZ = cz - grid.props[prop * 3 + 1];
-  const reach = radius + grid.props[prop * 3 + 2];
+  const o = prop * PROP_STRIDE;
+  const offX = cx - grid.props[o];
+  const offZ = cz - grid.props[o + 1];
+  const reach = radius + grid.props[o + 2];
   const distSq = offX * offX + offZ * offZ;
   if (distSq >= reach * reach || distSq <= TOUCHING_EPSILON) return false;
+  if (!propSolidFor(grid, prop, grid.carY)) return false;
   const dist = Math.sqrt(distSq);
   grid.nx = offX / dist;
   grid.nz = offZ / dist;
@@ -412,6 +479,8 @@ function resolveCircle(
   const radius = params.collisionRadius;
   let touched = false;
   for (let contact = 0; contact < MAX_CONTACTS; contact++) {
+    grid.centreX = car.x;
+    grid.centreZ = car.z;
     if (!deepestHit(grid, car.x + offset * cosH, car.z + offset * sinH, prevX, prevZ, radius, walls)) break;
     respond(grid, car, params, offset, cosH, sinH, radius);
     touched = true;
@@ -423,14 +492,16 @@ function resolveCircle(
  * Call once per tick, after `stepCar`. Returns the hardest contact of the tick, or null if the car touched nothing.
  * The returned object belongs to the collider and is overwritten by the next call: copy it to keep it.
  *
- * Pass `walls = false` while the car is flying higher than WALL_CLEAR_HEIGHT above the ground: it then passes over
- * walls and only props stop it.
+ * Heights (see the top of this file): `car.y` is where the wheels are now, `prevY` where they were before the
+ * step (default: the same), and `groundY` the road surface under the car (NaN when it is over no road), which lets
+ * a car on a bump next to a wall still meet it.
  *
- * Pass `regroup = true` on the first tick the walls are solid again after such a flight. While they were not, the
- * car may have turned so that its nose and tail are on opposite sides of a wall, and each circle on its own would
- * then be held on the side it happens to be on, pinning the car across the wall for good. On this one tick the
- * front and rear circles are instead taken to have come from where the car's centre is, so whichever of them is
- * across a wall from the centre is brought over to the centre's side: the car comes down whole, on one side.
+ * A wall the car was not at the height of last tick (by `prevY`) has no "before" side: see `hitWall`. Without that
+ * a car that turned while flying over a wall could come down with its nose and tail on opposite sides, each held on
+ * the side it happens to be on, pinned across the wall for good.
+ *
+ * Legacy switches: `walls = false` ignores every wall; `regroup = true` takes the front and rear circles to have
+ * come from the car's centre for every wall.
  */
 export function resolveCollisions(
   car: CarState,
@@ -438,10 +509,15 @@ export function resolveCollisions(
   collider: Collider,
   walls = true,
   regroup = false,
+  prevY: number = car.y,
+  groundY = NaN,
 ): CollisionEvent | null {
   const grid = collider as unknown as Grid;
   // A body with no size, or a nonsense one from a half-typed tuning value, touches nothing.
   if (!(params.collisionRadius > 0 && params.collisionRadius < Infinity)) return null;
+  grid.carY = car.y;
+  grid.prevY = prevY;
+  grid.groundY = groundY;
   const reach = Math.max(0, params.halfLength - params.collisionRadius);
   const cosH = cos(car.heading);
   const sinH = sin(car.heading);
@@ -468,4 +544,130 @@ export function resolveCollisions(
   settleVelocity(car, false);
   updateKinematics(car);
   return grid.event;
+}
+
+/**
+ * Squared distance between segments p0..p1 and a0..a1 (Ericson, Real-Time Collision Detection 5.1.9). Leaves the
+ * parameter of the closest point along a0..a1 in `grid.closestT`.
+ */
+function segmentDistanceSq(
+  grid: Grid,
+  p0x: number,
+  p0z: number,
+  p1x: number,
+  p1z: number,
+  a0x: number,
+  a0z: number,
+  a1x: number,
+  a1z: number,
+): number {
+  const d1x = p1x - p0x;
+  const d1z = p1z - p0z;
+  const d2x = a1x - a0x;
+  const d2z = a1z - a0z;
+  const rx = p0x - a0x;
+  const rz = p0z - a0z;
+  const a = d1x * d1x + d1z * d1z;
+  const e = d2x * d2x + d2z * d2z;
+  const f = d2x * rx + d2z * rz;
+  let s = 0;
+  let t = 0;
+  if (a <= 1e-12 && e <= 1e-12) {
+    s = 0;
+    t = 0;
+  } else if (a <= 1e-12) {
+    t = f / e;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+  } else {
+    const c = d1x * rx + d1z * rz;
+    if (e <= 1e-12) {
+      s = -c / a;
+      s = s < 0 ? 0 : s > 1 ? 1 : s;
+    } else {
+      const b = d1x * d2x + d1z * d2z;
+      const denom = a * e - b * b;
+      if (denom > 1e-12) {
+        s = (b * f - c * e) / denom;
+        s = s < 0 ? 0 : s > 1 ? 1 : s;
+      }
+      t = (b * s + f) / e;
+      if (t < 0) {
+        t = 0;
+        s = -c / a;
+        s = s < 0 ? 0 : s > 1 ? 1 : s;
+      } else if (t > 1) {
+        t = 1;
+        s = (b - c) / a;
+        s = s < 0 ? 0 : s > 1 ? 1 : s;
+      }
+    }
+  }
+  grid.closestT = t;
+  const ox = p0x + d1x * s - (a0x + d2x * t);
+  const oz = p0z + d1z * s - (a0z + d2z * t);
+  return ox * ox + oz * oz;
+}
+
+/**
+ * Gap between the car's body (its collision circles, taken as the capsule through them) and the nearest wall or prop
+ * that is solid for it at its height (see the top of this file), m: 0 when touching, Infinity beyond
+ * WALL_DISTANCE_RANGE. `groundY` as in `resolveCollisions`. Allocates nothing.
+ */
+export function nearestSolidDistance(car: CarState, params: CarParams, collider: Collider, groundY = NaN): number {
+  const grid = collider as unknown as Grid;
+  const radius = params.collisionRadius;
+  if (!(radius >= 0 && radius < Infinity) || !(Math.abs(car.x) < 1e9 && Math.abs(car.z) < 1e9)) return Infinity;
+  grid.carY = car.y;
+  grid.groundY = groundY;
+  const reach = Math.max(0, params.halfLength - radius);
+  const cosH = cos(car.heading);
+  const sinH = sin(car.heading);
+  const p0x = car.x - reach * cosH;
+  const p0z = car.z - reach * sinH;
+  const p1x = car.x + reach * cosH;
+  const p1z = car.z + reach * sinH;
+  const look = reach + radius + WALL_DISTANCE_RANGE;
+  const colFrom = Math.floor((car.x - look) * INV_CELL);
+  const rowFrom = Math.floor((car.z - look) * INV_CELL);
+  const cols = Math.floor((car.x + look) * INV_CELL) - colFrom;
+  const rows = Math.floor((car.z + look) * INV_CELL) - rowFrom;
+  const limit = WALL_DISTANCE_RANGE + radius;
+  let best = limit * limit;
+  let found = false;
+  for (let r = 0; r <= rows; r++) {
+    for (let c = 0; c <= cols; c++) {
+      const list = grid.cells.get(cellKey(colFrom + c, rowFrom + r));
+      if (list === undefined) continue;
+      for (let i = 0; i < list.length; i++) {
+        const item = list[i];
+        if (item >= 0) {
+          const o = item * WALL_STRIDE;
+          const ax = grid.walls[o];
+          const az = grid.walls[o + 1];
+          const bx = grid.walls[o + 2];
+          const bz = grid.walls[o + 3];
+          const distSq = segmentDistanceSq(grid, p0x, p0z, p1x, p1z, ax, az, bx, bz);
+          if (!(distSq < best)) continue;
+          const ya = grid.walls[o + 4];
+          if (!wallSolidFor(grid, ya + (grid.walls[o + 5] - ya) * grid.closestT, car.y)) continue;
+          best = distSq;
+          found = true;
+        } else {
+          const prop = -1 - item;
+          const o = prop * PROP_STRIDE;
+          const px = grid.props[o];
+          const pz = grid.props[o + 1];
+          const distSq = segmentDistanceSq(grid, px, pz, px, pz, p0x, p0z, p1x, p1z);
+          const dist = Math.sqrt(distSq) - grid.props[o + 2];
+          const clear = dist > 0 ? dist * dist : 0;
+          if (!(clear < best) || !propSolidFor(grid, prop, car.y)) continue;
+          best = clear;
+          found = true;
+        }
+      }
+    }
+  }
+  if (!found) return Infinity;
+  const gap = Math.sqrt(best) - radius;
+  return gap > 0 ? gap : 0;
 }

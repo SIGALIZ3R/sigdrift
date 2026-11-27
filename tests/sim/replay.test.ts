@@ -3,7 +3,8 @@ import type { InputState, Level, World } from '../../src/types';
 import { DT } from '../../src/types';
 import { hashNumbers } from '../../src/core/hash';
 import { Rng } from '../../src/core/rng';
-import { DEFAULT_CAR_PARAMS, cloneParams } from '../../src/sim/params';
+import { cloneParams } from '../../src/sim/params';
+import { PLANTED_PARAMS as DEFAULT_CAR_PARAMS, plantedParams } from '../helpers/testCar';
 import {
   BRAKE_STEPS,
   STEER_STEPS,
@@ -20,9 +21,9 @@ import { makeOpenLevel } from '../helpers/handLevel';
 const LEVEL: Level = {
   ...makeOpenLevel(160),
   props: [
-    { kind: 'pillar', x: 30, z: 6, radius: 1.5, height: 4, hue: 0 },
-    { kind: 'pillar', x: -20, z: -25, radius: 2.5, height: 4, hue: 1 },
-    { kind: 'pillar', x: 10, z: 40, radius: 1, height: 4, hue: 2 },
+    { kind: 'pillar', x: 30, z: 6, y: 0, radius: 1.5, height: 4, hue: 0 },
+    { kind: 'pillar', x: -20, z: -25, y: 0, radius: 2.5, height: 4, hue: 1 },
+    { kind: 'pillar', x: 10, z: 40, y: 0, radius: 1, height: 4, hue: 2 },
   ],
 };
 
@@ -51,7 +52,7 @@ function randomInputs(seed: string, ticks: number): InputState[] {
 }
 
 function drive(inputs: readonly InputState[]): { world: World; contacts: number } {
-  const world = createWorld(LEVEL);
+  const world = createWorld(LEVEL, plantedParams());
   let contacts = 0;
   for (const raw of inputs) {
     world.step(quantizeInput(raw));
@@ -163,7 +164,7 @@ describe('determinism', () => {
   });
 
   it('reproduces a recorded run from its codes', () => {
-    const live = createWorld(LEVEL);
+    const live = createWorld(LEVEL, plantedParams());
     const codes: number[] = [];
     const hashes: string[] = [];
     for (const raw of inputs) {

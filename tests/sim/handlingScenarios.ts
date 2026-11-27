@@ -1,18 +1,38 @@
 /**
- * Scripted drivers that pin down how the car feels. Each `measure*` function drives one manoeuvre on a huge empty
- * arena and returns numbers; tests/sim/handling.test.ts holds those numbers inside the bands the handling is tuned
- * for. Every function takes the car's params, so the same drivers can be pointed at a trial tune.
+ * Scripted drivers that pin down how the car feels. Each `measure*` function drives one manoeuvre on open, flat
+ * ground (the bare car, `stepCar` with ground height 0: no level, no walls) and returns numbers;
+ * tests/sim/handling.test.ts holds those numbers inside the bands the handling is tuned for. Every function takes the
+ * car's params, so the same drivers can be pointed at a trial tune. The drift feel targets proper are in
+ * tests/sim/drift.test.ts (drivers in handlingDrivers.ts).
  */
-import type { CarParams, CarState, InputState, World } from '../../src/types';
+import type { CarParams, CarState, InputState, Pose } from '../../src/types';
 import { DT } from '../../src/types';
-import { HALF_PI, atan2, clamp, cos, sin, wrapAngle } from '../../src/core/fixedMath';
+import { HALF_PI, atan2, cos, sin, wrapAngle } from '../../src/core/fixedMath';
 import { Rng } from '../../src/core/rng';
+import { createCarState, stepCar } from '../../src/sim/car';
 import { ASSIST_STRENGTH, DEFAULT_CAR_PARAMS, cloneParams } from '../../src/sim/params';
-import { createWorld } from '../../src/sim/world';
-import { makeOpenLevel } from '../helpers/handLevel';
+import { holder } from './handlingDrivers';
 
-export const ARENA = makeOpenLevel(6000);
-export const SMALL_ARENA = makeOpenLevel(160);
+/** The bare car on endless flat ground: what the handling scenarios drive. */
+export interface FlatWorld {
+  params: CarParams;
+  readonly car: CarState;
+  readonly start: Pose;
+  step(input: InputState): void;
+}
+
+export function createFlatWorld(params: CarParams, start: Pose = { x: 0, z: 0, heading: 0 }): FlatWorld {
+  const car = createCarState(start);
+  const world: FlatWorld = {
+    params,
+    car,
+    start,
+    step(input) {
+      stepCar(car, world.params, input, DT);
+    },
+  };
+  return world;
+}
 
 export type Driver = (car: CarState, time: number) => Partial<InputState>;
 export type Observer = (car: CarState, time: number) => void;
@@ -20,7 +40,7 @@ export type Observer = (car: CarState, time: number) => void;
 export const IDLE: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
 
 /** Steps the world for `seconds`, asking `driver` for input before each tick and calling `observe` after it. */
-export function drive(world: World, seconds: number, driver: Driver, observe?: Observer): void {
+export function drive(world: FlatWorld, seconds: number, driver: Driver, observe?: Observer): void {
   const ticks = Math.round(seconds / DT);
   for (let i = 0; i < ticks; i++) {
     world.step({ ...IDLE, ...driver(world.car, i * DT) });
@@ -29,8 +49,8 @@ export function drive(world: World, seconds: number, driver: Driver, observe?: O
 }
 
 /** A world whose car is already rolling straight along +x at `speed`. */
-export function rolling(speed: number, base: CarParams = DEFAULT_CAR_PARAMS): World {
-  const world = createWorld(ARENA, cloneParams(base));
+export function rolling(speed: number, base: CarParams = DEFAULT_CAR_PARAMS): FlatWorld {
+  const world = createFlatWorld(cloneParams(base));
   world.car.vx = speed;
   return world;
 }
@@ -45,26 +65,28 @@ export function assistedParams(base: CarParams = DEFAULT_CAR_PARAMS): CarParams 
 const HANDBRAKE_TAP = 0.35;
 
 /** Turn in to the right and tap the handbrake, the beginner's way into a drift. */
-function handbrakeEntry(world: World, observe?: Observer): void {
+function handbrakeEntry(world: FlatWorld, observe?: Observer): void {
   drive(world, HANDBRAKE_TAP, () => ({ steer: 1, handbrake: true }), observe);
 }
 
 /**
- * A simple drift-holding driver for a right-hand drift. It countersteers in proportion to the drift angle, steers
- * (and feeds throttle) towards the target angle on top of that, and backs off when the angle is growing fast.
- * Being proportional it settles a little short of the target.
+ * The keyboard drift-holding driver for a right-hand drift (see handlingDrivers.ts): steer into the drift when the
+ * angle is short of `target`, let go when it is there, countersteer only when it is well past. It uses the driver
+ * that suits the car: the ordinary one with the assist on, the skilled one with it off.
  */
-function holdDrift(target: number, maxSteer: number): Driver {
-  let previous = -1;
+function holdDrift(target: number, params: CarParams): Driver {
+  const travel = { angle: 0, rate: 0, primed: false };
+  const hold = holder(params);
   return (car) => {
-    const angle = Math.abs(car.driftAngle);
-    const growth = previous < 0 ? 0 : (angle - previous) / DT;
-    previous = angle;
-    const error = target - angle;
-    return {
-      steer: clamp(2 * error - 0.3 * growth - angle / maxSteer, -1, 1),
-      throttle: clamp(0.7 + 0.8 * error, 0.5, 0.9),
-    };
+    const angle = atan2(car.vz, car.vx);
+    if (!travel.primed) {
+      travel.angle = angle;
+      travel.primed = true;
+    }
+    const delta = wrapAngle(angle - travel.angle);
+    travel.angle = angle;
+    travel.rate = delta / DT;
+    return hold(car, car.yawRate - travel.rate, target);
   };
 }
 
@@ -118,8 +140,8 @@ export function measureCoast(base: CarParams = DEFAULT_CAR_PARAMS, speed = 30, s
   return { lost: speed - world.car.speed };
 }
 
-export function measureGripCorner(base: CarParams = DEFAULT_CAR_PARAMS) {
-  const world = rolling(12, base);
+export function measureGripCorner(base: CarParams = DEFAULT_CAR_PARAMS, steer = 0.25, speed = 12) {
+  const world = rolling(speed, base);
   let maxDrift = 0;
   let maxRearSlide = 0;
   let minYaw = Infinity;
@@ -127,7 +149,7 @@ export function measureGripCorner(base: CarParams = DEFAULT_CAR_PARAMS) {
   drive(
     world,
     5,
-    () => ({ steer: 0.5, throttle: 0.25 }),
+    () => ({ steer, throttle: 0.25 }),
     (car, time) => {
       maxDrift = Math.max(maxDrift, Math.abs(car.driftAngle));
       maxRearSlide = Math.max(maxRearSlide, car.rearSlide);
@@ -186,7 +208,7 @@ export function measureSustainedDrift(target = 0.7, seconds = 6, base: CarParams
   let maxDrift = 0;
   let minSpeedWhileHeld = Infinity;
   let minSpeedOfLongest = Infinity;
-  drive(world, seconds, holdDrift(target, base.maxSteer), (car) => {
+  drive(world, seconds, holdDrift(target, world.params), (car) => {
     const angle = Math.abs(car.driftAngle);
     maxDrift = Math.max(maxDrift, angle);
     if (angle > 0.35 && angle < 1.2) {
@@ -216,7 +238,7 @@ export function measureDriftSpeed(target = 0.65, base: CarParams = DEFAULT_CAR_P
   let sum = 0;
   let samples = 0;
   let minSpeed = Infinity;
-  drive(world, 3, holdDrift(target, base.maxSteer), (car, time) => {
+  drive(world, 3, holdDrift(target, world.params), (car, time) => {
     minSpeed = Math.min(minSpeed, car.speed);
     if (time > 1) {
       sum += Math.abs(car.driftAngle);
@@ -229,7 +251,7 @@ export function measureDriftSpeed(target = 0.65, base: CarParams = DEFAULT_CAR_P
 export function measureRecovery(base: CarParams = DEFAULT_CAR_PARAMS) {
   const world = rolling(22, base);
   handbrakeEntry(world);
-  drive(world, 2.15, holdDrift(0.85, base.maxSteer));
+  drive(world, 2.15, holdDrift(0.85, world.params));
   const startDrift = world.car.driftAngle;
   let settleTime = 0;
   let overshoot = 0;
@@ -407,38 +429,38 @@ export function measureFlicks(hold: number, assisted = true, base: CarParams = D
  * Lift-off oversteer: a steady corner near the limit at about 24 m/s with the throttle holding the speed, then the
  * driver snaps the throttle shut and keeps the wheel where it was.
  */
-export function measureLiftOff(base: CarParams = DEFAULT_CAR_PARAMS, assisted = false) {
+export function measureLiftOff(base: CarParams = DEFAULT_CAR_PARAMS, assisted = false, steer = 0.07) {
   const world = rolling(24, assisted ? assistedParams(base) : base);
   let before = 0;
   drive(
     world,
     3,
-    (car) => ({ steer: 0.45, throttle: car.speed < 24 ? 0.6 : 0.2 }),
+    (car) => ({ steer, throttle: car.speed < 24 ? 0.6 : 0.2 }),
     (car, time) => {
       if (time > 2) before = Math.max(before, Math.abs(car.driftAngle));
     },
   );
   let after = 0;
   let maxYawRate = 0;
-  drive(world, 3, () => ({ steer: 0.45 }), (car) => {
+  drive(world, 3, () => ({ steer }), (car) => {
     after = Math.max(after, Math.abs(car.driftAngle));
     maxYawRate = Math.max(maxYawRate, Math.abs(car.yawRate));
   });
   return { before, after, maxYawRate, speed: world.car.speed };
 }
 
-/** Mistakes: flooring it in a slide with the wheel straight, and holding full opposite lock for too long. */
+/** Mistakes (no assist): flooring it in a slide with the key still held into it, and holding opposite lock too long. */
 export function measureMistakes(base: CarParams = DEFAULT_CAR_PARAMS) {
   const floored = rolling(22, base);
   handbrakeEntry(floored);
   let flooredMaxDrift = 0;
-  drive(floored, 4, () => ({ throttle: 1 }), (car) => {
+  drive(floored, 4, () => ({ throttle: 1, steer: 1 }), (car) => {
     flooredMaxDrift = Math.max(flooredMaxDrift, Math.abs(car.driftAngle));
   });
 
   const corrected = rolling(22, base);
   handbrakeEntry(corrected);
-  drive(corrected, 2, holdDrift(0.7, base.maxSteer));
+  drive(corrected, 2, holdDrift(0.7, corrected.params));
   const before = corrected.car.driftAngle;
   let swungTo = 0;
   drive(corrected, 2.5, () => ({ steer: -1, throttle: 0.5 }), (car) => {
@@ -470,14 +492,12 @@ export function isFiniteState(car: CarState): boolean {
 
 /** A minute of a driver who mostly keeps the throttle down and changes their mind twice a second. */
 export function measureRandomDriving(seed: string, seconds = 60, base: CarParams = DEFAULT_CAR_PARAMS) {
-  const world = createWorld(SMALL_ARENA, cloneParams(base));
+  const world = createFlatWorld(cloneParams(base));
   const rng = new Rng(seed);
   let held: Partial<InputState> = {};
   let finite = true;
   let maxSpeed = 0;
   let maxYawRate = 0;
-  let wallHits = 0;
-  let maxOutside = -Infinity;
   let airborne = false;
   drive(
     world,
@@ -498,11 +518,8 @@ export function measureRandomDriving(seed: string, seconds = 60, base: CarParams
       finite = finite && isFiniteState(car);
       maxSpeed = Math.max(maxSpeed, car.speed);
       maxYawRate = Math.max(maxYawRate, Math.abs(car.yawRate));
-      const { maxX, maxZ } = SMALL_ARENA.bounds;
-      maxOutside = Math.max(maxOutside, Math.abs(car.x) - maxX, Math.abs(car.z) - maxZ);
-      if (world.lastCollision) wallHits++;
       airborne = airborne || car.airborne || car.y !== 0 || car.vy !== 0;
     },
   );
-  return { finite, maxSpeed, maxYawRate, wallHits, maxOutside, airborne };
+  return { finite, maxSpeed, maxYawRate, airborne };
 }

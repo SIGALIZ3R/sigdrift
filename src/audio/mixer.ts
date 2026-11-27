@@ -3,11 +3,47 @@ import { createAmbienceVoice } from './ambience';
 import type { AmbienceVoice } from './ambience';
 import { createEngineVoice } from './engine';
 import type { EngineVoice } from './engine';
-import { clipCurve, impactStrength } from './mapping';
+import { OUTPUT_TRIM, clipCurve, crushCurve, cueReady, impactStrength } from './mapping';
 import { createNoiseBuffer, createTireVoice } from './tires';
 import type { TireVoice } from './tires';
 
-export type BlipKind = 'countdown' | 'go' | 'checkpoint' | 'finish' | 'reset' | 'crash' | 'death' | 'land';
+export type BlipKind =
+  | 'countdown'
+  | 'go'
+  | 'checkpoint'
+  | 'finish'
+  | 'reset'
+  | 'crash'
+  | 'death'
+  | 'land'
+  | 'fall'
+  | 'close'
+  | 'multiplier'
+  | 'comboLost'
+  | 'uiMove'
+  | 'uiSelect'
+  | 'uiBack'
+  | 'uiGlitch';
+
+/** Every cue, in a fixed order (for menus of sounds, tests, preloading). */
+export const BLIP_KINDS: readonly BlipKind[] = [
+  'countdown',
+  'go',
+  'checkpoint',
+  'finish',
+  'reset',
+  'crash',
+  'death',
+  'land',
+  'fall',
+  'close',
+  'multiplier',
+  'comboLost',
+  'uiMove',
+  'uiSelect',
+  'uiBack',
+  'uiGlitch',
+];
 
 export interface GameAudio {
   /**
@@ -20,8 +56,14 @@ export interface GameAudio {
   /** `impact` is the closing speed in m/s. */
   collision(impact: number): void;
   /**
-   * One-shot cues. 'crash' = a life lost, 'death' = the run is over, 'land' = the car came back down from a jump;
-   * the rest are the interface chimes.
+   * One-shot cues.
+   * - Driving: 'crash' = a life lost, 'death' = the run is over, 'land' = the car came back down from a jump,
+   *   'fall' = the car went over an edge (a falling whoosh, then the thud of the floor about 0.75 s later).
+   * - Scoring: 'close' = a close-to-the-wall moment starts (quiet; at most four a second, extra calls are dropped),
+   *   'multiplier' = the multiplier crossed a whole number, 'comboLost' = the multiplier was lost.
+   * - Interface: 'uiMove' = the selection moved, 'uiSelect' = confirm, 'uiBack' = back out, 'uiGlitch' = a tiny
+   *   crushed burst for screen transitions; plus the race chimes 'countdown', 'go', 'checkpoint', 'finish', 'reset'.
+   * Nothing plays while muted. Calling a cue every frame is safe: the frequent ones are rate-limited.
    */
   blip(kind: BlipKind): void;
   /** 0..1 */
@@ -47,6 +89,12 @@ interface Tone {
   hold?: number;
   wave?: OscillatorType;
   level?: number;
+  /**
+   * Instead of a glide: jump through these frequencies, one every `stepGap` seconds (a sample-and-hold glitch).
+   * `freq` is ignored when set.
+   */
+  steps?: readonly number[];
+  stepGap?: number;
 }
 
 /** One burst of filtered noise in a cue. */
@@ -58,6 +106,10 @@ interface Burst {
   at: number;
   dur: number;
   level: number;
+  /** Time at full level before the fade starts, s. */
+  hold?: number;
+  /** Bit-crush the filtered noise to this many levels each side of zero (1..8): grainy, broken, digital. */
+  crush?: number;
 }
 
 interface Cue {
@@ -123,6 +175,61 @@ const CUES: Record<BlipKind, Cue> = {
       { filter: 'bandpass', freq: 400, to: 470, q: 9, at: 0.115, dur: 0.09, level: 1.5 },
     ],
   },
+  // Over the edge: air rushing past as a band of noise sweeping down, a whistle falling with it, and the floor.
+  fall: {
+    tones: [
+      { freq: 880, to: 110, at: 0, dur: 0.75, hold: 0.25, wave: 'triangle', level: 0.09 },
+      { freq: 92, to: 34, at: 0.74, dur: 0.3, wave: 'sine', level: 0.42 },
+    ],
+    bursts: [
+      { filter: 'bandpass', freq: 2600, to: 240, q: 1.1, at: 0, dur: 0.78, hold: 0.32, level: 0.85 },
+      { filter: 'lowpass', freq: 520, to: 140, q: 0, at: 0.74, dur: 0.14, level: 0.7 },
+    ],
+  },
+  // Brushing a wall: a glint, not a bell. Quiet and very short, because it can come four times a second.
+  close: {
+    tones: [
+      { freq: 2349.32, at: 0, dur: 0.06, wave: 'sine', level: 0.07 },
+      { freq: 3520, at: 0.022, dur: 0.09, wave: 'sine', level: 0.055 },
+    ],
+  },
+  // Multiplier up: one small upward flick and the octave above it.
+  multiplier: {
+    tones: [
+      { freq: 659.25, to: 1318.51, at: 0, dur: 0.09, level: 0.12 },
+      { freq: 1318.51, at: 0.07, dur: 0.13, wave: 'sine', level: 0.08 },
+    ],
+  },
+  // Multiplier lost: the combo breaks up on the way down, in steps, with a crackle of crushed noise on top.
+  comboLost: {
+    tones: [
+      {
+        freq: 740,
+        steps: [740, 523.25, 622.25, 369.99, 415.3, 233.08, 261.63, 146.83],
+        stepGap: 0.028,
+        at: 0,
+        dur: 0.25,
+        wave: 'square',
+        level: 0.07,
+      },
+      { freq: 369.99, to: 46.25, at: 0, dur: 0.26, wave: 'sawtooth', level: 0.06 },
+    ],
+    bursts: [{ filter: 'bandpass', freq: 2400, to: 500, q: 0.9, at: 0, dur: 0.12, level: 0.55, crush: 2 }],
+  },
+  uiMove: { tones: [{ freq: 1567.98, at: 0, dur: 0.035, wave: 'sine', level: 0.08 }] },
+  uiSelect: {
+    tones: [
+      { freq: 1046.5, at: 0, dur: 0.06, level: 0.15 },
+      { freq: 1567.98, at: 0.045, dur: 0.14, level: 0.13 },
+    ],
+  },
+  uiBack: { tones: [{ freq: 587.33, to: 392, at: 0, dur: 0.1, level: 0.14 }] },
+  uiGlitch: {
+    tones: [
+      { freq: 1900, steps: [1900, 620, 2780, 410, 1340], stepGap: 0.012, at: 0, dur: 0.06, wave: 'square', level: 0.06 },
+    ],
+    bursts: [{ filter: 'highpass', freq: 1800, q: 0.7, at: 0, dur: 0.05, level: 0.3, crush: 3 }],
+  },
 };
 
 /** Length of the shared noise loop: long enough that no voice reading it is heard to repeat. */
@@ -147,6 +254,8 @@ interface Graph {
   master: GainNode;
   /** 1 or 0: the mute switch, after the volume so the two never fight over one parameter. */
   mute: GainNode;
+  /** OUTPUT_TRIM, after the clipper: the overall level of the game. */
+  trim: GainNode;
   noise: AudioBuffer;
   engine: EngineVoice;
   tires: TireVoice;
@@ -189,19 +298,22 @@ function createClipper(ctx: AudioContext): WaveShaperNode {
   return clipper;
 }
 
-/** voices -> master (volume) -> mute -> limiter -> clipper -> speakers */
+/** voices -> master (volume) -> mute -> limiter -> clipper -> trim -> speakers */
 function buildGraph(Context: ContextConstructor, volume: number, muted: boolean): Graph {
   const ctx = new Context({ latencyHint: 'interactive' });
   const master = ctx.createGain();
   master.gain.value = volume;
   const mute = ctx.createGain();
   mute.gain.value = muted ? 0 : 1;
-  master.connect(mute).connect(createLimiter(ctx)).connect(createClipper(ctx)).connect(ctx.destination);
+  const trim = ctx.createGain();
+  trim.gain.value = OUTPUT_TRIM;
+  master.connect(mute).connect(createLimiter(ctx)).connect(createClipper(ctx)).connect(trim).connect(ctx.destination);
   const noise = createNoiseBuffer(ctx, NOISE_SECONDS);
   return {
     ctx,
     master,
     mute,
+    trim,
     noise,
     engine: createEngineVoice(ctx, noise, master),
     tires: createTireVoice(ctx, noise, master),
@@ -239,12 +351,28 @@ function playTone(graph: Graph, tone: Tone, now: number): void {
   const start = now + tone.at;
   const oscillator = graph.ctx.createOscillator();
   oscillator.type = tone.wave ?? 'triangle';
-  oscillator.frequency.setValueAtTime(tone.freq, start);
-  if (tone.to !== undefined) oscillator.frequency.exponentialRampToValueAtTime(tone.to, start + tone.dur);
+  if (tone.steps !== undefined && tone.steps.length > 0) {
+    const gap = tone.stepGap ?? tone.dur / tone.steps.length;
+    for (let i = 0; i < tone.steps.length; i++) oscillator.frequency.setValueAtTime(tone.steps[i], start + i * gap);
+  } else {
+    oscillator.frequency.setValueAtTime(tone.freq, start);
+    if (tone.to !== undefined) oscillator.frequency.exponentialRampToValueAtTime(tone.to, start + tone.dur);
+  }
   oscillator.connect(decayingGain(graph, oscillator, tone.level ?? BLIP_LEVEL, start, tone.dur, tone.hold));
 }
 
-/** noise -> filter -> decaying gain -> master */
+const crushCurves = new Map<number, Float32Array<ArrayBuffer>>();
+
+function cachedCrushCurve(steps: number): Float32Array<ArrayBuffer> {
+  let curve = crushCurves.get(steps);
+  if (!curve) {
+    curve = crushCurve(steps);
+    crushCurves.set(steps, curve);
+  }
+  return curve;
+}
+
+/** noise -> filter -> (bit-crusher) -> decaying gain -> master */
 function playBurst(graph: Graph, burst: Burst, now: number): void {
   const start = now + burst.at;
   const source = graph.ctx.createBufferSource();
@@ -255,7 +383,14 @@ function playBurst(graph: Graph, burst: Burst, now: number): void {
   filter.Q.value = burst.q;
   filter.frequency.setValueAtTime(burst.freq, start);
   if (burst.to !== undefined) filter.frequency.exponentialRampToValueAtTime(burst.to, start + burst.dur);
-  source.connect(filter).connect(decayingGain(graph, source, burst.level, start, burst.dur));
+  source.connect(filter);
+  let last: AudioNode = filter;
+  if (burst.crush !== undefined) {
+    const crusher = graph.ctx.createWaveShaper();
+    crusher.curve = cachedCrushCurve(Math.round(burst.crush));
+    last = last.connect(crusher);
+  }
+  last.connect(decayingGain(graph, source, burst.level, start, burst.dur, burst.hold));
 }
 
 function playCue(graph: Graph, kind: BlipKind): void {
@@ -302,6 +437,8 @@ export function createAudio(): GameAudio {
   let lastThump = -Infinity;
   let queuedBlip: BlipKind | null = null;
   let queuedBlipMs = 0;
+  /** Context time each cue last played, for the rate limits. */
+  const lastCue = new Map<BlipKind, number>();
 
   function start(): void {
     const Context = contextConstructor();
@@ -351,7 +488,7 @@ export function createAudio(): GameAudio {
       graph.ambience.update(car, active, now);
     },
     collision(impact) {
-      if (!graph || graph.ctx.state !== 'running') return;
+      if (!graph || graph.ctx.state !== 'running' || muted) return;
       const strength = impactStrength(impact);
       if (strength <= 0) return;
       const now = graph.ctx.currentTime;
@@ -360,8 +497,11 @@ export function createAudio(): GameAudio {
       playThump(graph, strength, now);
     },
     blip(kind) {
-      if (!graph) return;
+      if (!graph || muted || CUES[kind] === undefined) return;
       if (graph.ctx.state === 'running') {
+        const now = graph.ctx.currentTime;
+        if (!cueReady(kind, now, lastCue.get(kind) ?? -Infinity)) return;
+        lastCue.set(kind, now);
         playCue(graph, kind);
         return;
       }

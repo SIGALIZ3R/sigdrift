@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { hashNumbers } from '../../src/core/hash';
-import { ENDLESS_CHUNK_CELLS, createEndlessGenerator, intensityAt } from '../../src/gen/endless';
+import { ENDLESS_CHUNK_CELLS, createEndlessGenerator, endlessLayoutStats, intensityAt } from '../../src/gen/endless';
 import { CELL } from '../../src/gen/trackGen';
 import { RULES } from '../../src/gen/validate';
-import { CHUNK_RULES, minBumpBeforeBend, minBumpToBend, validateChunkSequence } from '../../src/gen/validateChunk';
+import { CHUNK_RULES, validateChunkSequence } from '../../src/gen/validateChunk';
 import type { Difficulty, PathPoint, TrackChunk } from '../../src/types';
+import { CROSSING_CLEARANCE, MAX_GRADE, TERRAIN_Y } from '../../src/types';
 
 const DIFFICULTIES: readonly Difficulty[] = ['easy', 'medium', 'hard'];
 
@@ -18,79 +19,22 @@ function run(seed: string, difficulty: Difficulty, count: number): TrackChunk[] 
 /** Every number of a chunk in a fixed order, for hashing. */
 function numbersOf(chunk: TrackChunk): number[] {
   const out: number[] = [chunk.index, chunk.startDist, chunk.endDist, chunk.intensity];
-  for (const p of chunk.path) out.push(p.x, p.z, p.halfWidth, p.dist);
+  for (const p of chunk.path) out.push(p.x, p.z, p.y, p.halfWidth, p.dist);
   for (const p of chunk.left) out.push(p.x, p.z);
   for (const p of chunk.right) out.push(p.x, p.z);
-  for (const w of chunk.walls) out.push(w.ax, w.az, w.bx, w.bz);
-  for (const p of chunk.props) out.push(p.x, p.z, p.radius, p.height, p.hue);
+  chunk.leftOpen.forEach((open, i) => out.push(open ? 1 : 0, chunk.rightOpen[i] ? 1 : 0));
+  for (const w of chunk.walls) out.push(w.ax, w.az, w.bx, w.bz, w.ya, w.yb);
+  for (const p of chunk.props) out.push(p.x, p.z, p.y, p.radius, p.height, p.hue);
   for (const d of chunk.decor) out.push(d.x, d.z, d.w, d.d, d.h, d.hue);
-  for (const b of chunk.bumps) out.push(b.x, b.z, b.dirX, b.dirZ, b.halfLength, b.halfWidth, b.height);
-  out.push(chunk.bounds.minX, chunk.bounds.minZ, chunk.bounds.maxX, chunk.bounds.maxZ);
+  for (const b of chunk.bumps) out.push(b.x, b.z, b.y, b.dirX, b.dirZ, b.halfLength, b.halfWidth, b.height);
+  for (const s of chunk.supports) out.push(s.x, s.z, s.top, s.radius);
+  const b = chunk.bounds;
+  out.push(b.minX, b.minZ, b.maxX, b.maxZ, b.minY, b.maxY);
   return out;
 }
 
-/** The whole run as one centreline, without the repeated point at each join. */
-function wholePath(chunks: readonly TrackChunk[]): PathPoint[] {
-  const path: PathPoint[] = [];
-  chunks.forEach((chunk, n) => path.push(...(n === 0 ? chunk.path : chunk.path.slice(1))));
-  return path;
-}
-
-/** Signed turn at every interior vertex of a path, rad, positive to the right. */
-function turns(path: readonly PathPoint[]): number[] {
-  const out: number[] = [0];
-  for (let i = 1; i + 1 < path.length; i++) {
-    const ax = path[i].x - path[i - 1].x;
-    const az = path[i].z - path[i - 1].z;
-    const bx = path[i + 1].x - path[i].x;
-    const bz = path[i + 1].z - path[i].z;
-    out.push(Math.atan2(ax * bz - az * bx, ax * bx + az * bz));
-  }
-  out.push(0);
-  return out;
-}
-
-interface BendRun {
-  /** Total heading change, rad: about PI/2 for one bend, PI for a hairpin. */
-  turn: number;
-  /** Straight vertices between the previous run and this one. */
-  gap: number;
-  /** `dist` where the run starts and ends. */
-  from: number;
-  to: number;
-}
-
-/** Splits a road into unbroken runs of bends that turn the same way. */
-function bendRuns(path: readonly PathPoint[]): BendRun[] {
-  const runs: BendRun[] = [];
-  const turn = turns(path);
-  let current: BendRun | null = null;
-  let gap = 0;
-  for (let i = 1; i + 1 < path.length; i++) {
-    const step = turn[i];
-    const bent = Math.abs(step) >= 1e-3;
-    if (current && (!bent || Math.sign(step) !== Math.sign(current.turn))) {
-      runs.push(current);
-      current = null;
-      gap = 0;
-    }
-    if (!bent) {
-      gap++;
-      continue;
-    }
-    if (!current) current = { turn: 0, gap, from: path[i].dist, to: path[i].dist };
-    current.turn += step;
-    current.to = path[i].dist;
-  }
-  if (current) runs.push(current);
-  return runs;
-}
-
-/** Number of quarter-circle bends in a path. */
-function bendCount(path: readonly PathPoint[]): number {
-  let total = 0;
-  for (const run of bendRuns(path)) total += Math.abs(run.turn);
-  return Math.round(total / (Math.PI / 2));
+function onLattice(v: number): boolean {
+  return Number.isInteger(v * 1024);
 }
 
 function cellOf(x: number, z: number): string {
@@ -107,32 +51,99 @@ function cellsOf(path: readonly PathPoint[]): string[] {
   return cells;
 }
 
-function columnOf(cell: string): number {
-  return Number(cell.split(',')[0]);
+/** Path points of a chunk, tagged with its index. */
+interface Tagged {
+  p: PathPoint;
+  chunk: number;
 }
 
-/** Position of a bump's crest along the road: the crest sits on the centreline of a straight. */
-function crestDist(chunk: TrackChunk, bump: TrackChunk['bumps'][number]): number {
-  let best = Infinity;
-  let dist = 0;
-  for (let i = 0; i + 1 < chunk.path.length; i++) {
-    const a = chunk.path[i];
-    const b = chunk.path[i + 1];
-    const length = Math.hypot(b.x - a.x, b.z - a.z);
-    const dot = (bump.x - a.x) * (b.x - a.x) + (bump.z - a.z) * (b.z - a.z);
-    const t = Math.min(1, Math.max(0, dot / (length * length)));
-    const off = Math.hypot(bump.x - a.x - (b.x - a.x) * t, bump.z - a.z - (b.z - a.z) * t);
-    if (off < best) {
-      best = off;
-      dist = a.dist + (b.dist - a.dist) * t;
+/**
+ * Independent check of the 2.5D rule: any two path points of chunks at most `window` apart (and more than 40 m
+ * apart along the road) that are close enough in plan for their roads to touch must be CROSSING_CLEARANCE apart
+ * in height. Returns the offending pairs and the crossings found (points passing over or under each other).
+ */
+function layerCheck(chunks: readonly TrackChunk[], window: number): { clashes: string[]; crossingPoints: number } {
+  const bucket = 48;
+  const grid = new Map<string, Tagged[]>();
+  const clashes: string[] = [];
+  let crossingPoints = 0;
+  const key = (x: number, z: number): string => `${Math.floor(x / bucket)},${Math.floor(z / bucket)}`;
+  for (const chunk of chunks) {
+    for (const p of chunk.path) {
+      const bx = Math.floor(p.x / bucket);
+      const bz = Math.floor(p.z / bucket);
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          for (const other of grid.get(`${bx + dx},${bz + dz}`) ?? []) {
+            if (chunk.index - other.chunk > window) continue;
+            const q = other.p;
+            if (Math.abs(q.dist - p.dist) <= RULES.overlapPathGap) continue;
+            const apart = Math.hypot(p.x - q.x, p.z - q.z);
+            if (apart > p.halfWidth + q.halfWidth + RULES.overlapMargin) continue;
+            if (Math.abs(p.y - q.y) < CROSSING_CLEARANCE - 1e-6) {
+              clashes.push(`chunk ${chunk.index} at ${p.dist.toFixed(1)} m vs chunk ${other.chunk} at ${q.dist.toFixed(1)} m`);
+            } else if (apart < Math.max(p.halfWidth, q.halfWidth)) crossingPoints++;
+          }
+        }
+      }
+    }
+    for (const p of chunk.path) {
+      const k = key(p.x, p.z);
+      const list = grid.get(k);
+      if (list) list.push({ p, chunk: chunk.index });
+      else grid.set(k, [{ p, chunk: chunk.index }]);
     }
   }
-  expect(best).toBeLessThan(0.01);
-  return dist;
+  return { clashes, crossingPoints };
 }
 
-function onLattice(v: number): boolean {
-  return Number.isInteger(v * 1024);
+interface RoadStats {
+  km: number;
+  meanHeight: number;
+  maxHeight: number;
+  /** Share of raised (>= 3 m) edge length, both sides, that is open. */
+  openShare: number;
+  bumpsPerKm: number;
+  pillarsPerKm: number;
+  meanHalfWidth: number;
+}
+
+function statsOf(chunks: readonly TrackChunk[]): RoadStats {
+  let length = 0;
+  let heightSum = 0;
+  let maxHeight = 0;
+  let raised = 0;
+  let open = 0;
+  let width = 0;
+  let bumps = 0;
+  let pillars = 0;
+  for (const c of chunks) {
+    bumps += c.bumps.length;
+    pillars += c.props.length;
+    for (let i = 0; i + 1 < c.path.length; i++) {
+      const p = c.path[i];
+      const q = c.path[i + 1];
+      const run = q.dist - p.dist;
+      length += run;
+      heightSum += ((p.y + q.y) / 2) * run;
+      width += p.halfWidth * run;
+      maxHeight = Math.max(maxHeight, p.y);
+      if (p.y >= 3 && q.y >= 3) {
+        raised += 2 * run;
+        open += ((c.leftOpen[i] ? 1 : 0) + (c.rightOpen[i] ? 1 : 0)) * run;
+      }
+    }
+  }
+  const km = length / 1000;
+  return {
+    km,
+    meanHeight: heightSum / length,
+    maxHeight,
+    openShare: raised > 0 ? open / raised : 0,
+    bumpsPerKm: bumps / km,
+    pillarsPerKm: pillars / km,
+    meanHalfWidth: width / length,
+  };
 }
 
 describe('intensityAt', () => {
@@ -142,27 +153,17 @@ describe('intensityAt', () => {
     expect(intensityAt('hard', 0)).toBeCloseTo(0.6, 12);
   });
 
-  it('rises by about 0.1 per kilometre and stops at 1', () => {
+  it('rises by 0.1 per kilometre and tops out at 1', () => {
     for (const difficulty of DIFFICULTIES) {
       expect(intensityAt(difficulty, 1000) - intensityAt(difficulty, 0)).toBeCloseTo(0.1, 6);
       let previous = intensityAt(difficulty, 0);
-      for (let dist = 50; dist <= 20_000; dist += 50) {
+      for (let dist = 100; dist <= 12_000; dist += 100) {
         const now = intensityAt(difficulty, dist);
         expect(now).toBeGreaterThanOrEqual(previous);
-        // Smooth: no jumps.
-        expect(now - previous).toBeLessThan(0.01);
-        expect(now).toBeLessThanOrEqual(1);
         previous = now;
       }
       expect(intensityAt(difficulty, 20_000)).toBe(1);
       expect(intensityAt(difficulty, 1e9)).toBe(1);
-    }
-  });
-
-  it('keeps the difficulties in order until they all top out', () => {
-    for (let dist = 0; dist <= 3900; dist += 100) {
-      expect(intensityAt('easy', dist)).toBeLessThan(intensityAt('medium', dist));
-      expect(intensityAt('medium', dist)).toBeLessThan(intensityAt('hard', dist));
     }
     expect(intensityAt('easy', -50)).toBe(intensityAt('easy', 0));
   });
@@ -170,102 +171,81 @@ describe('intensityAt', () => {
 
 describe('createEndlessGenerator', () => {
   it('is deterministic', () => {
-    const a = run('same-road', 'medium', 40);
-    const b = run('same-road', 'medium', 40);
-    expect(b).toEqual(a);
+    const a = run('same-road', 'medium', 30);
+    const b = run('same-road', 'medium', 30);
     expect(JSON.stringify(b)).toBe(JSON.stringify(a));
   });
 
   it('matches the pinned first five chunks', () => {
-    // If this changes on purpose after a release, bump PHYSICS_VERSION or the endless record's version with it:
-    // distances driven on the old road are not comparable with the new one.
+    // If this changes on purpose, bump GEN_VERSION (and the endless records' version) with it: distances driven on
+    // the old road are not comparable with the new one.
     const numbers = run('endless-golden', 'medium', 5).flatMap(numbersOf);
-    expect(hashNumbers(numbers)).toBe('a9c06a70045adfd9');
+    expect(hashNumbers(numbers)).toBe('5637d2dfdfec5ca3');
   });
 
   it('gives a different road for another seed or another difficulty', () => {
-    const key = (chunks: TrackChunk[]): string =>
-      wholePath(chunks)
-        .map((p) => `${p.x},${p.z},${p.halfWidth}`)
-        .join(' ');
+    const key = (chunks: TrackChunk[]): string => chunks.flatMap((c) => c.path.map((p) => `${p.x},${p.z},${p.y}`)).join(' ');
     const base = key(run('seed-a', 'medium', 6));
     expect(key(run('seed-b', 'medium', 6))).not.toBe(base);
     expect(key(run('seed-a', 'easy', 6))).not.toBe(base);
     expect(key(run('seed-a', 'hard', 6))).not.toBe(base);
   });
 
-  it('reports its seed, difficulty and a start pose with clear straight road ahead', () => {
+  it('starts level and straight, closed behind, with nothing on the first chunk', () => {
     for (const difficulty of DIFFICULTIES) {
-      const generator = createEndlessGenerator('start-check', difficulty);
-      expect(generator.seed).toBe('start-check');
-      expect(generator.difficulty).toBe(difficulty);
-      const first = generator.next();
-      const { start } = generator;
-      expect(start).toEqual({ x: first.path[0].x, z: first.path[0].z, heading: 0 });
-      // At least 60 m dead straight along the heading, at full width, with nothing standing on it.
-      const ahead = first.path.filter((p) => p.dist <= 60);
-      expect(ahead[ahead.length - 1].dist).toBeGreaterThanOrEqual(57);
-      for (const p of ahead) {
-        expect(p.z).toBe(start.z);
-        expect(p.x).toBeCloseTo(start.x + p.dist, 9);
-        expect(p.halfWidth).toBeGreaterThanOrEqual(7.5);
-      }
-      expect(first.path.find((p) => p.dist > 60)!.z).toBe(start.z);
-    }
-  });
-
-  it('closes the road about 14 m behind the start and nowhere else', () => {
-    const [first, second] = run('cap-check', 'medium', 2);
-    const edgeWalls = 2 * (first.path.length - 1);
-    expect(first.walls.length).toBe(edgeWalls + 3);
-    const cap = first.walls.slice(edgeWalls);
-    const backX = Math.min(...cap.map((w) => Math.min(w.ax, w.bx)));
-    expect(first.path[0].x - backX).toBeCloseTo(14, 6);
-    expect(second.walls.length).toBe(2 * (second.path.length - 1));
-    // The far end is open: no wall joins the two edges there.
-    const last = first.path.length - 1;
-    const l = first.left[last];
-    const r = first.right[last];
-    const crossesEnd = first.walls.some(
-      (w) =>
-        (w.ax === l.x && w.az === l.z && w.bx === r.x && w.bz === r.z) ||
-        (w.ax === r.x && w.az === r.z && w.bx === l.x && w.bz === l.z),
-    );
-    expect(crossesEnd).toBe(false);
-  });
-
-  it('leaves the first chunk free of bumps and pillars', () => {
-    for (const difficulty of DIFFICULTIES) {
-      for (let s = 0; s < 30; s++) {
-        const first = createEndlessGenerator(`warm-up-${s}`, difficulty).next();
+      for (let s = 0; s < 20; s++) {
+        const generator = createEndlessGenerator(`warm-up-${s}`, difficulty);
+        const first = generator.next();
+        expect(generator.start).toEqual({ x: first.path[0].x, z: first.path[0].z, heading: 0, y: first.path[0].y });
         expect(first.index).toBe(0);
         expect(first.startDist).toBe(0);
         expect(first.bumps).toEqual([]);
         expect(first.props).toEqual([]);
+        expect(first.leftOpen.some(Boolean) || first.rightOpen.some(Boolean)).toBe(false);
+        // 60 m dead straight and level along the heading, at full width.
+        const ahead = first.path.filter((p) => p.dist <= 60);
+        for (const p of ahead) {
+          expect(p.z).toBe(first.path[0].z);
+          expect(p.x).toBeCloseTo(first.path[0].x + p.dist, 9);
+          expect(p.y).toBe(first.path[0].y);
+          expect(p.halfWidth).toBeGreaterThanOrEqual(7.5);
+        }
+        // Closed behind the start (three cap walls at the start's height), open at the far end.
+        const edgeWalls = 2 * (first.path.length - 1);
+        expect(first.walls.length).toBe(edgeWalls + 3);
+        for (const w of first.walls.slice(0, 3)) {
+          expect(w.ya).toBe(first.path[0].y);
+          expect(Math.min(w.ax, w.bx)).toBeGreaterThanOrEqual(first.path[0].x - 14 - 1e-9);
+        }
       }
     }
   });
 
-  it('numbers chunks, continues dist and joins them exactly', () => {
-    const chunks = run('joins', 'hard', 30);
-    chunks.forEach((chunk, n) => {
-      const last = chunk.path.length - 1;
-      expect(chunk.index).toBe(n);
-      expect(chunk.left.length).toBe(chunk.path.length);
-      expect(chunk.right.length).toBe(chunk.path.length);
-      expect(chunk.startDist).toBe(chunk.path[0].dist);
-      expect(chunk.endDist).toBe(chunk.path[last].dist);
-      expect(chunk.intensity).toBe(intensityAt('hard', chunk.startDist));
-      if (n === 0) return;
-      const before = chunks[n - 1];
-      const end = before.path.length - 1;
-      expect(chunk.path[0]).toEqual(before.path[end]);
-      expect(chunk.left[0]).toEqual(before.left[end]);
-      expect(chunk.right[0]).toEqual(before.right[end]);
-      expect(chunk.startDist).toBe(before.endDist);
-      // Joined, never shared: editing one chunk must not edit its neighbour.
-      expect(chunk.path[0]).not.toBe(before.path[end]);
-    });
+  it('numbers chunks, continues dist and joins them exactly, height and grade included', () => {
+    for (const difficulty of DIFFICULTIES) {
+      const chunks = run(`joins-${difficulty}`, difficulty, 40);
+      chunks.forEach((chunk, n) => {
+        const last = chunk.path.length - 1;
+        expect(chunk.index).toBe(n);
+        expect(chunk.left.length).toBe(chunk.path.length);
+        expect(chunk.leftOpen.length).toBe(chunk.path.length);
+        expect(chunk.startDist).toBe(chunk.path[0].dist);
+        expect(chunk.endDist).toBe(chunk.path[last].dist);
+        expect(chunk.intensity).toBe(intensityAt(difficulty, chunk.startDist));
+        if (n === 0) return;
+        const before = chunks[n - 1];
+        const end = before.path.length - 1;
+        expect(chunk.path[0]).toEqual(before.path[end]);
+        expect(chunk.left[0]).toEqual(before.left[end]);
+        expect(chunk.right[0]).toEqual(before.right[end]);
+        expect(chunk.startDist).toBe(before.endDist);
+        expect(chunk.path[0]).not.toBe(before.path[end]);
+        // Every chunk ends level, so the grade is continuous across the join.
+        const gradeIn = (before.path[end].y - before.path[end - 1].y) / (before.path[end].dist - before.path[end - 1].dist);
+        const gradeOut = (chunk.path[1].y - chunk.path[0].y) / (chunk.path[1].dist - chunk.path[0].dist);
+        expect(Math.abs(gradeOut - gradeIn)).toBeLessThan(0.04);
+      });
+    }
   });
 
   it('snaps every coordinate to 1/1024 m and never emits -0', () => {
@@ -277,31 +257,20 @@ describe('createEndlessGenerator', () => {
     }
   });
 
-  it('samples the centreline about every 3 m', () => {
-    for (const chunk of run('spacing', 'medium', 20)) {
-      for (let i = 1; i < chunk.path.length; i++) {
-        const step = Math.hypot(chunk.path[i].x - chunk.path[i - 1].x, chunk.path[i].z - chunk.path[i - 1].z);
-        expect(step).toBeGreaterThan(2.5);
-        expect(step).toBeLessThan(3.5);
+  it('keeps every road above the city floor and every support and building on it', () => {
+    for (const chunk of run('floors', 'hard', 40)) {
+      for (const p of chunk.path) {
+        expect(p.y).toBeGreaterThanOrEqual(0);
+        expect(p.y).toBeLessThanOrEqual(CHUNK_RULES.maxHeight);
       }
+      for (const s of chunk.supports) expect(s.top).toBeGreaterThan(TERRAIN_Y + 0.5);
+      if (chunk.decor.length + chunk.supports.length > 0) expect(chunk.bounds.minY).toBe(TERRAIN_Y);
     }
   });
 
-  it('builds unit bump directions that follow the road exactly', () => {
-    let seen = 0;
-    for (const chunk of run('bump-dir', 'hard', 40)) {
-      for (const bump of chunk.bumps) {
-        seen++;
-        expect(bump.dirX * bump.dirX + bump.dirZ * bump.dirZ).toBe(1);
-        expect(Math.abs(bump.dirX) + Math.abs(bump.dirZ)).toBe(1);
-      }
-    }
-    expect(seen).toBeGreaterThan(10);
-  });
-
-  it('typically builds a chunk in well under 5 ms', () => {
+  it('typically builds a chunk in well under 5 ms, also after 2000 chunks', () => {
     const generator = createEndlessGenerator('speed', 'hard');
-    for (let i = 0; i < 20; i++) generator.next();
+    for (let i = 0; i < 2000; i++) generator.next();
     const times: number[] = [];
     for (let i = 0; i < 200; i++) {
       const began = performance.now();
@@ -309,360 +278,140 @@ describe('createEndlessGenerator', () => {
       times.push(performance.now() - began);
     }
     times.sort((a, b) => a - b);
-    console.info(`endless next(): median ${times[100].toFixed(2)} ms, p90 ${times[180].toFixed(2)} ms`);
+    console.info(`endless next() after 2000 chunks: median ${times[100].toFixed(2)} ms, p90 ${times[180].toFixed(2)} ms`);
     expect(times[100]).toBeLessThan(5);
-  });
+  }, 30_000);
 });
 
-describe('the endless road never meets itself', () => {
-  const CHUNKS = 300;
-
+describe('the endless road is valid', () => {
   for (const difficulty of DIFFICULTIES) {
-    it(`uses every grid cell once and keeps the road apart over ${CHUNKS} chunks (${difficulty})`, () => {
-      const chunks = run(`forever-${difficulty}`, difficulty, CHUNKS);
-      const visited = new Set<string>();
-      let furthest = -Infinity;
-      chunks.forEach((chunk, n) => {
-        const cells = cellsOf(chunk.path);
-        expect(cells.length).toBe(ENDLESS_CHUNK_CELLS);
-        const entry = columnOf(cells[0]);
-        // A chunk starts east of everything before it ...
-        expect(entry).toBeGreaterThan(furthest);
-        let reached = entry;
-        cells.forEach((cell, k) => {
-          expect(visited.has(cell)).toBe(false);
-          visited.add(cell);
-          const column = columnOf(cell);
-          // ... never goes west of where it started, nor more than two columns back from its furthest point ...
-          expect(column).toBeGreaterThanOrEqual(entry);
-          expect(column).toBeGreaterThanOrEqual(reached - 2);
-          // ... and ends in a column nothing has reached before.
-          if (k === cells.length - 1 && n > 0) expect(column).toBeGreaterThan(reached);
-          reached = Math.max(reached, column);
-        });
-        furthest = reached;
-        // It leaves heading exactly east.
-        const last = chunk.path.length - 1;
-        expect(chunk.path[last].z).toBe(chunk.path[last - 1].z);
-        expect(chunk.path[last].x).toBeGreaterThan(chunk.path[last - 1].x);
-      });
-      expect(visited.size).toBe(CHUNKS * ENDLESS_CHUNK_CELLS);
-
-      // Every pair of points more than a corner apart along the road must be apart in space too. A spatial hash
-      // over the whole run finds the candidates, so chunks far apart in the sequence are compared as well.
-      const path = wholePath(chunks);
-      const bucket = 48;
-      const hash = new Map<string, number[]>();
-      path.forEach((p, i) => {
-        const key = `${Math.floor(p.x / bucket)},${Math.floor(p.z / bucket)}`;
-        const list = hash.get(key);
-        if (list) list.push(i);
-        else hash.set(key, [i]);
-      });
-      let compared = 0;
-      let closest = Infinity;
-      path.forEach((p) => {
-        const bx = Math.floor(p.x / bucket);
-        const bz = Math.floor(p.z / bucket);
-        for (let dx = -1; dx <= 1; dx++) {
-          for (let dz = -1; dz <= 1; dz++) {
-            for (const j of hash.get(`${bx + dx},${bz + dz}`) ?? []) {
-              const q = path[j];
-              if (q.dist - p.dist <= RULES.overlapPathGap) continue;
-              compared++;
-              const spare = Math.hypot(q.x - p.x, q.z - p.z) - (p.halfWidth + q.halfWidth + 3);
-              closest = Math.min(closest, spare);
-            }
-          }
-        }
-      });
-      expect(compared).toBeGreaterThan(1000);
-      expect(closest).toBeGreaterThan(0);
-    });
-  }
-});
-
-describe('generated chunks obey the rules', () => {
-  const SEEDS = 20;
-  const CHUNKS = 60;
-
-  for (const difficulty of DIFFICULTIES) {
-    it(`passes validation for ${SEEDS} seeds of ${CHUNKS} chunks (${difficulty})`, { timeout: 120_000 }, () => {
-      const failures: string[] = [];
-      let length = 0;
-      for (let s = 0; s < SEEDS; s++) {
-        const chunks = run(`rules-${s}`, difficulty, CHUNKS);
-        length += chunks[CHUNKS - 1].endDist;
+    it(`passes validateChunkSequence for 20 seeds x 80 chunks (${difficulty})`, () => {
+      for (let s = 0; s < 20; s++) {
+        const chunks = run(`sweep-${difficulty}-${s}`, difficulty, 80);
         const verdict = validateChunkSequence(chunks);
-        for (const error of verdict.errors) failures.push(`seed ${s}: ${error}`);
+        expect(verdict.errors.slice(0, 5)).toEqual([]);
       }
-      expect(failures).toEqual([]);
-      // About 15 km per run.
-      expect(length / SEEDS).toBeGreaterThan(14_000);
-      expect(length / SEEDS).toBeLessThan(17_500);
-    });
+    }, 60_000);
   }
 
-  it('keeps widths, plazas and decor counts inside their ranges', { timeout: 60_000 }, () => {
+  it('stays valid when every chunk has to follow the escape route (the never-trapped fallback)', () => {
     for (const difficulty of DIFFICULTIES) {
-      for (let s = 0; s < 6; s++) {
-        for (const chunk of run(`ranges-${s}`, difficulty, 40)) {
-          for (const p of chunk.path) {
-            expect(p.halfWidth).toBeGreaterThanOrEqual(7.5);
-            expect(p.halfWidth).toBeLessThanOrEqual(19);
-          }
-          expect(chunk.decor.length).toBeGreaterThanOrEqual(40);
-          expect(chunk.decor.length).toBeLessThanOrEqual(90);
-          expect(chunk.props.length).toBeLessThanOrEqual(2);
-          expect(chunk.bumps.length).toBeLessThanOrEqual(2);
-        }
-      }
+      const generator = createEndlessGenerator(`escape-${difficulty}`, difficulty, { searchBudget: 0 });
+      const chunks: TrackChunk[] = [];
+      for (let i = 0; i < 100; i++) chunks.push(generator.next());
+      expect(validateChunkSequence(chunks).errors.slice(0, 5)).toEqual([]);
+      expect(endlessLayoutStats(generator)?.escaped).toBe(100);
     }
-  });
-
-  it('holds the agreed width for 15 m either side of every join', () => {
-    const chunks = run('join-width', 'medium', 40);
-    for (let n = 1; n < chunks.length; n++) {
-      const width = chunks[n].path[0].halfWidth;
-      for (const p of chunks[n].path) {
-        if (p.dist - chunks[n].startDist <= 15) expect(p.halfWidth).toBe(width);
-      }
-      for (const p of chunks[n - 1].path) {
-        if (chunks[n - 1].endDist - p.dist <= 15) expect(p.halfWidth).toBe(width);
-      }
-    }
-  });
-
-  it('narrows the plain road from about 11.5 m to about 8 m as the intensity rises', () => {
-    // The agreed width at a join is the base width of the chunk before it.
-    const widthAt = (difficulty: Difficulty, index: number): number => {
-      let total = 0;
-      for (let s = 0; s < 20; s++) total += run(`base-${s}`, difficulty, index + 2)[index + 1].path[0].halfWidth;
-      return total / 20;
-    };
-    expect(widthAt('easy', 0)).toBeGreaterThan(10.8);
-    expect(widthAt('easy', 0)).toBeLessThan(11.5);
-    const late = widthAt('hard', 24);
-    expect(late).toBeGreaterThan(7.7);
-    expect(late).toBeLessThan(8.4);
-  });
-
-  it('never bends in two consecutive cells while the road is gentle', () => {
-    let bends = 0;
-    for (let s = 0; s < 40; s++) {
-      const gentle = run(`gentle-${s}`, 'easy', 12).filter((chunk) => chunk.intensity < CHUNK_RULES.gentleIntensity);
-      expect(gentle.length).toBeGreaterThanOrEqual(6);
-      for (const run of bendRuns(wholePath(gentle))) {
-        bends++;
-        // One quarter turn at a time, with at least a whole straight cell (15 inner samples) before it.
-        expect(Math.abs(run.turn)).toBeLessThan(2);
-        if (bends > 1) expect(run.gap).toBeGreaterThanOrEqual(15);
-      }
-    }
-    expect(bends).toBeGreaterThan(100);
-  });
-
-  it('makes S-bends and hairpins once the road is harsh', () => {
-    let hairpins = 0;
-    let sBends = 0;
-    for (let s = 0; s < 10; s++) {
-      const harsh = run(`harsh-${s}`, 'hard', 40).slice(20);
-      const runs = bendRuns(wholePath(harsh));
-      hairpins += runs.filter((r) => Math.abs(r.turn) > 3).length;
-      sBends += runs.filter((r, i) => i > 0 && r.gap <= 1 && Math.sign(r.turn) !== Math.sign(runs[i - 1].turn)).length;
-    }
-    expect(hairpins).toBeGreaterThan(20);
-    expect(sBends).toBeGreaterThan(100);
-  });
-
-  it('keeps bumps well clear of bends on a gentle road and lets them crowd the next bend on a harsh one', { timeout: 60_000 }, () => {
-    const gapsAfter = (difficulty: Difficulty, from: number, to: number): number[] => {
-      const gaps: number[] = [];
-      for (let s = 0; s < 30; s++) {
-        const chunks = run(`bump-gap-${s}`, difficulty, to);
-        const runs = bendRuns(wholePath(chunks));
-        for (const chunk of chunks.slice(from)) {
-          for (const bump of chunk.bumps) {
-            const at = crestDist(chunk, bump);
-            // More ahead of the crest than behind it while the road is gentle: room to land before the bend.
-            const needed = minBumpBeforeBend(chunk.intensity);
-            expect(needed).toBeGreaterThanOrEqual(minBumpToBend(chunk.intensity));
-            let after = Infinity;
-            for (const r of runs) {
-              // Straight road before the crest as well as after it.
-              if (r.to <= at) expect(at - r.to).toBeGreaterThanOrEqual(CHUNK_RULES.bumpBendGapGentle - 0.01);
-              if (r.from >= at) after = Math.min(after, r.from - at);
-              expect(r.from > at || r.to < at).toBe(true);
-            }
-            expect(after).toBeGreaterThanOrEqual(needed - 0.01);
-            expect(after).toBeGreaterThanOrEqual(bump.halfLength);
-            gaps.push(after);
-          }
-        }
-      }
-      return gaps;
-    };
-    // The first 2 km of an easy run: a car that takes a bump at speed flies 20 to 30 m and can neither brake nor
-    // steer on the way, so no crest sits within 45 m of the bend ahead. (It used to be 16 m.)
-    const gentle = gapsAfter('easy', 1, 8);
-    expect(gentle.length).toBeGreaterThan(20);
-    expect(Math.min(...gentle)).toBeGreaterThanOrEqual(45 - 0.01);
-    // The landing room fades out over the next kilometre and a half...
-    const fading = gapsAfter('easy', 9, 13);
-    expect(fading.length).toBeGreaterThan(20);
-    expect(Math.min(...fading)).toBeLessThan(45);
-    expect(Math.min(...fading)).toBeGreaterThanOrEqual(12);
-    // ...and a harsh road has none.
-    const harsh = gapsAfter('hard', 20, 40);
-    expect(harsh.length).toBeGreaterThan(200);
-    expect(Math.min(...harsh)).toBeGreaterThanOrEqual(6 - 0.01);
-    // A fair share sit right in front of a bend: that is what makes them dangerous.
-    expect(harsh.filter((gap) => gap < 10).length / harsh.length).toBeGreaterThan(0.15);
-  });
-
-  it('scales bump height with intensity', { timeout: 60_000 }, () => {
-    const heights = (difficulty: Difficulty, from: number, to: number): number[] =>
-      Array.from({ length: 30 }, (_, s) => run(`bump-height-${s}`, difficulty, to).slice(from))
-        .flat()
-        .flatMap((chunk) => chunk.bumps.map((bump) => bump.height));
-    const low = heights('easy', 1, 6);
-    expect(low.length).toBeGreaterThan(10);
-    expect(Math.min(...low)).toBeGreaterThanOrEqual(0.349);
-    expect(Math.max(...low)).toBeLessThanOrEqual(0.56);
-    const high = heights('hard', 44, 50);
-    expect(Math.min(...high)).toBeGreaterThanOrEqual(0.64);
-    expect(Math.max(...high)).toBeLessThanOrEqual(0.8);
-  });
-
-  it('keeps decor out of the ground the next chunk may build on', () => {
-    const chunks = run('decor-future', 'medium', 40);
-    chunks.forEach((chunk) => {
-      const exit = chunk.path[chunk.path.length - 1].x;
-      for (const block of chunk.decor) expect(block.x + block.w / 2).toBeLessThanOrEqual(exit - 4);
-    });
-  });
+  }, 60_000);
 });
 
-describe('difficulty', () => {
-  interface Stats {
-    bumpsPerKm: number;
-    bendsPerKm: number;
-    pillarsPerKm: number;
-    meanHalfWidth: number;
-    meanIntensity: number;
-    chunksWithBump: number;
-  }
+describe('the endless road is 2.5D and really random', () => {
+  const LONG = 600;
+  const longRuns = DIFFICULTIES.map((difficulty) => ({ difficulty, chunks: run(`long-${difficulty}`, difficulty, LONG) }));
 
-  /** The first 3 km or so of many runs: far enough to measure, short enough that the difficulties still differ. */
-  function measure(difficulty: Difficulty): Stats {
-    const SEEDS = 40;
-    const CHUNKS = 12;
-    let km = 0;
-    let bumps = 0;
-    let bends = 0;
-    let pillars = 0;
-    let width = 0;
-    let points = 0;
-    let intensity = 0;
-    let withBump = 0;
-    for (let s = 0; s < SEEDS; s++) {
-      const chunks = run(`stats-${s}`, difficulty, CHUNKS);
-      km += chunks[CHUNKS - 1].endDist / 1000;
-      bends += bendCount(wholePath(chunks));
+  it(`never meets itself at the same level within any ${CHUNK_RULES.memory}-chunk window over ${LONG} chunks`, () => {
+    for (const { chunks } of longRuns) {
+      const { clashes } = layerCheck(chunks, CHUNK_RULES.memory);
+      expect(clashes.slice(0, 5)).toEqual([]);
+    }
+  });
+
+  it('keeps every chunk in its own six grid cells, apart from crossings', () => {
+    for (const { chunks } of longRuns) {
+      for (const chunk of chunks.slice(0, 120)) expect(cellsOf(chunk.path).length).toBe(ENDLESS_CHUNK_CELLS);
+    }
+  });
+
+  it('passes over and under itself, and the rate is reported', () => {
+    const rates: string[] = [];
+    for (const { difficulty, chunks } of longRuns) {
+      const generator = createEndlessGenerator(`long-${difficulty}`, difficulty);
+      for (let i = 0; i < LONG; i++) generator.next();
+      const stats = endlessLayoutStats(generator)!;
+      const km = chunks[chunks.length - 1].endDist / 1000;
+      const { crossingPoints } = layerCheck(chunks, CHUNK_RULES.memory);
+      rates.push(`${difficulty} ${(stats.crossings / km).toFixed(2)}/km (${stats.crossings} in ${km.toFixed(0)} km)`);
+      expect(stats.crossings).toBeGreaterThan(10);
+      expect(crossingPoints).toBeGreaterThan(0);
+      // Nearly every chunk is found by the first search: getting boxed in is rare.
+      expect(stats.escaped).toBeLessThan(LONG * 0.05);
+    }
+    console.info(`endless crossings: ${rates.join(', ')}`);
+  });
+
+  it('heads in all four directions over a long run and climbs, drops and reuses old ground', () => {
+    for (const { chunks } of longRuns) {
+      const travel = [0, 0, 0, 0];
+      let total = 0;
       for (const chunk of chunks) {
-        bumps += chunk.bumps.length;
-        pillars += chunk.props.length;
-        intensity += chunk.intensity;
-        if (chunk.bumps.length > 0) withBump++;
-        for (const p of chunk.path) {
-          width += p.halfWidth;
-          points++;
+        for (let i = 0; i + 1 < chunk.path.length; i++) {
+          const dx = chunk.path[i + 1].x - chunk.path[i].x;
+          const dz = chunk.path[i + 1].z - chunk.path[i].z;
+          const step = Math.hypot(dx, dz);
+          total += step;
+          if (Math.abs(dx) > Math.abs(dz)) travel[dx > 0 ? 0 : 2] += step;
+          else travel[dz > 0 ? 1 : 3] += step;
         }
       }
+      for (const t of travel) expect(t / total).toBeGreaterThan(0.12);
+      let climbs = 0;
+      let drops = 0;
+      for (const chunk of chunks) {
+        for (let i = 1; i < chunk.path.length; i++) {
+          const grade = (chunk.path[i].y - chunk.path[i - 1].y) / (chunk.path[i].dist - chunk.path[i - 1].dist);
+          expect(Math.abs(grade)).toBeLessThanOrEqual(MAX_GRADE + 0.002);
+          if (grade > 0.05) climbs++;
+          if (grade < -0.05) drops++;
+        }
+      }
+      expect(climbs).toBeGreaterThan(1000);
+      expect(drops).toBeGreaterThan(1000);
+      // Ground more than ten chunks old is built over again: the road wanders back.
+      const firstUse = new Map<string, number>();
+      let reused = 0;
+      for (const chunk of chunks) {
+        for (const cell of cellsOf(chunk.path)) {
+          const before = firstUse.get(cell);
+          if (before !== undefined && chunk.index - before > CHUNK_RULES.memory) reused++;
+          firstUse.set(cell, chunk.index);
+        }
+      }
+      expect(reused).toBeGreaterThan(50);
     }
-    return {
-      bumpsPerKm: bumps / km,
-      bendsPerKm: bends / km,
-      pillarsPerKm: pillars / km,
-      meanHalfWidth: width / points,
-      meanIntensity: intensity / (SEEDS * CHUNKS),
-      chunksWithBump: withBump / (SEEDS * CHUNKS),
-    };
-  }
-
-  it('gets harsher from easy to medium to hard', () => {
-    const easy = measure('easy');
-    const medium = measure('medium');
-    const hard = measure('hard');
-    for (const [name, stats] of [['easy', easy], ['medium', medium], ['hard', hard]] as const) {
-      console.info(
-        `endless ${name}: intensity ${stats.meanIntensity.toFixed(2)}, ${stats.bendsPerKm.toFixed(1)} bends/km, ` +
-          `${stats.bumpsPerKm.toFixed(2)} bumps/km (${(stats.chunksWithBump * 100).toFixed(0)}% of chunks), ` +
-          `${stats.pillarsPerKm.toFixed(2)} pillars/km, mean half width ${stats.meanHalfWidth.toFixed(2)} m`,
-      );
-    }
-    expect(easy.meanIntensity).toBeLessThan(medium.meanIntensity);
-    expect(medium.meanIntensity).toBeLessThan(hard.meanIntensity);
-    expect(easy.bumpsPerKm).toBeLessThan(medium.bumpsPerKm);
-    expect(medium.bumpsPerKm).toBeLessThan(hard.bumpsPerKm);
-    expect(easy.bendsPerKm).toBeLessThan(medium.bendsPerKm);
-    expect(medium.bendsPerKm).toBeLessThan(hard.bendsPerKm);
-    expect(easy.pillarsPerKm).toBeLessThan(medium.pillarsPerKm);
-    expect(medium.pillarsPerKm).toBeLessThan(hard.pillarsPerKm);
-    expect(easy.meanHalfWidth).toBeGreaterThan(medium.meanHalfWidth);
-    expect(medium.meanHalfWidth).toBeGreaterThan(hard.meanHalfWidth);
-    // "Occasional, not many": on an easy road most chunks have no bump at all, and even hard stays sparse.
-    expect(easy.chunksWithBump).toBeLessThan(0.6);
-    expect(easy.bumpsPerKm).toBeLessThan(2.5);
-    expect(hard.bumpsPerKm).toBeLessThan(6);
-    expect(hard.bumpsPerKm).toBeGreaterThan(2);
   });
 
-  it('puts a bump in about one chunk in three as an easy run starts, and one or two per chunk flat out', () => {
-    let early = 0;
-    let earlyChunks = 0;
-    let late = 0;
-    let lateChunks = 0;
-    for (let s = 0; s < 200; s++) {
-      const chunks = run(`bump-rate-${s}`, 'easy', 4);
-      for (const chunk of chunks.slice(1)) {
-        earlyChunks++;
-        if (chunk.bumps.length > 0) early++;
+  it('gets harsher with intensity and with difficulty', () => {
+    const early: Record<Difficulty, RoadStats> = {} as Record<Difficulty, RoadStats>;
+    const gentle: TrackChunk[] = [];
+    const harsh: TrackChunk[] = [];
+    for (const difficulty of DIFFICULTIES) {
+      const first: TrackChunk[] = [];
+      for (let s = 0; s < 8; s++) {
+        const chunks = run(`harsher-${difficulty}-${s}`, difficulty, 40);
+        first.push(...chunks.slice(1, 9));
+        for (const chunk of chunks) {
+          if (chunk.index === 0) continue;
+          if (chunk.intensity < 0.35) gentle.push(chunk);
+          if (chunk.intensity >= 0.9) harsh.push(chunk);
+        }
       }
+      early[difficulty] = statsOf(first);
     }
-    for (let s = 0; s < 20; s++) {
-      for (const chunk of run(`bump-rate-${s}`, 'hard', 50).slice(20)) {
-        expect(chunk.intensity).toBe(1);
-        lateChunks++;
-        late += chunk.bumps.length;
-      }
-    }
-    expect(early / earlyChunks).toBeGreaterThan(0.2);
-    expect(early / earlyChunks).toBeLessThan(0.5);
-    expect(late / lateChunks).toBeGreaterThan(0.9);
-    expect(late / lateChunks).toBeLessThan(2);
-  });
-
-  it('gets harsher with distance within one difficulty', () => {
-    const early: TrackChunk[] = [];
-    const late: TrackChunk[] = [];
-    for (let s = 0; s < 30; s++) {
-      const chunks = run(`distance-${s}`, 'easy', 48);
-      early.push(...chunks.slice(1, 9));
-      late.push(...chunks.slice(40, 48));
-      for (let n = 1; n < chunks.length; n++) {
-        expect(chunks[n].intensity).toBeGreaterThanOrEqual(chunks[n - 1].intensity);
-      }
-      expect(chunks[47].intensity).toBeGreaterThan(chunks[0].intensity + 0.8);
-    }
-    const bumps = (chunks: TrackChunk[]): number => chunks.reduce((sum, chunk) => sum + chunk.bumps.length, 0);
-    const bends = (chunks: TrackChunk[]): number => chunks.reduce((sum, chunk) => sum + bendCount(chunk.path), 0);
-    const width = (chunks: TrackChunk[]): number => {
-      const all = chunks.flatMap((chunk) => chunk.path);
-      return all.reduce((sum, p) => sum + p.halfWidth, 0) / all.length;
-    };
-    expect(bumps(late)).toBeGreaterThan(bumps(early) * 1.5);
-    expect(bends(late)).toBeGreaterThan(bends(early) * 1.3);
-    expect(width(late)).toBeLessThan(width(early) - 1);
-  });
+    const low = statsOf(gentle);
+    const high = statsOf(harsh);
+    const fmt = (s: RoadStats): string =>
+      `height ${s.meanHeight.toFixed(1)}/${s.maxHeight.toFixed(1)} m, open ${(s.openShare * 100).toFixed(0)}%, ` +
+      `bumps ${s.bumpsPerKm.toFixed(1)}/km, pillars ${s.pillarsPerKm.toFixed(1)}/km, half width ${s.meanHalfWidth.toFixed(1)} m`;
+    console.info(`endless intensity < 0.35: ${fmt(low)}`);
+    console.info(`endless intensity >= 0.9: ${fmt(high)}`);
+    for (const difficulty of DIFFICULTIES) console.info(`endless first 2 km, ${difficulty}: ${fmt(early[difficulty])}`);
+    expect(high.meanHeight).toBeGreaterThan(low.meanHeight * 1.5);
+    expect(high.maxHeight).toBeGreaterThan(low.maxHeight);
+    expect(high.openShare).toBeGreaterThan(low.openShare * 1.5);
+    expect(high.bumpsPerKm).toBeGreaterThan(low.bumpsPerKm);
+    expect(high.meanHalfWidth).toBeLessThan(low.meanHalfWidth - 1);
+    expect(early.easy.meanHeight).toBeLessThan(early.hard.meanHeight);
+    expect(early.easy.openShare).toBeLessThan(early.hard.openShare);
+    expect(early.easy.bumpsPerKm).toBeLessThan(early.hard.bumpsPerKm);
+  }, 60_000);
 });

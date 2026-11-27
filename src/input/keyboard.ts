@@ -1,5 +1,21 @@
 import type { InputState, MetaInput } from '../types';
 
+/** A MetaInput with every flag down. */
+export function createMetaInput(): MetaInput {
+  return {
+    pause: false,
+    restart: false,
+    toggleTuning: false,
+    confirm: false,
+    toggleMute: false,
+    navUp: false,
+    navDown: false,
+    navLeft: false,
+    navRight: false,
+    back: false,
+  };
+}
+
 export interface KeyboardDevice {
   /** Current held state, kept up to date by key events. */
   readonly held: InputState;
@@ -21,13 +37,35 @@ const DRIVE_CODES: ReadonlySet<string> = new Set([
   'KeyR',
 ]);
 
-const META_CODES: ReadonlyMap<string, keyof MetaInput> = new Map([
-  ['Escape', 'pause'],
-  ['KeyP', 'pause'],
-  ['Backspace', 'restart'],
-  ['Enter', 'confirm'],
-  ['Backquote', 'toggleTuning'],
-  ['KeyM', 'toggleMute'],
+type MetaFlag = keyof MetaInput;
+
+/**
+ * Menu and game keys. Escape and Backspace raise two flags at once: Escape is `pause` while driving and `back` in a
+ * menu, Backspace is `restart` while driving and `back` in a menu. The game reads whichever fits its current screen.
+ */
+const META_CODES: ReadonlyMap<string, readonly MetaFlag[]> = new Map<string, readonly MetaFlag[]>([
+  ['Escape', ['pause', 'back']],
+  ['KeyP', ['pause']],
+  ['Backspace', ['restart', 'back']],
+  ['Enter', ['confirm']],
+  ['Backquote', ['toggleTuning']],
+  ['KeyM', ['toggleMute']],
+]);
+
+/**
+ * Menu navigation. These keys also drive the car (see `held`); the game uses one or the other depending on whether a
+ * menu is open. Unlike the other meta keys, a nav key's auto-repeat counts as another press, so holding an arrow
+ * scrolls through a list the way holding the d-pad does.
+ */
+const NAV_CODES: ReadonlyMap<string, MetaFlag> = new Map<string, MetaFlag>([
+  ['ArrowUp', 'navUp'],
+  ['KeyW', 'navUp'],
+  ['ArrowDown', 'navDown'],
+  ['KeyS', 'navDown'],
+  ['ArrowLeft', 'navLeft'],
+  ['KeyA', 'navLeft'],
+  ['ArrowRight', 'navRight'],
+  ['KeyD', 'navRight'],
 ]);
 
 /** Keys whose browser default would scroll the page or navigate back. */
@@ -74,11 +112,18 @@ function targetKind(target: EventTarget | null): TargetKind {
   return CONTROL_INPUT_TYPES.has(type) ? 'control' : 'text';
 }
 
+/** Whether the target is a slider (`<input type="range">`), the one control that keeps Left/Right for itself. */
+function isRange(target: EventTarget | null): boolean {
+  const element = target as Partial<HTMLInputElement> | null;
+  if (!element || typeof element.tagName !== 'string' || element.tagName.toUpperCase() !== 'INPUT') return false;
+  return typeof element.type === 'string' && element.type.toLowerCase() === 'range';
+}
+
 /** `onActivity` fires for every fresh press of a key the game uses. */
 export function createKeyboard(target: Window, onActivity: () => void): KeyboardDevice {
   const down = new Set<string>();
   const held: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
-  const pressed: MetaInput = { pause: false, restart: false, toggleTuning: false, confirm: false, toggleMute: false };
+  const pressed: MetaInput = createMetaInput();
 
   function either(a: string, b: string): number {
     return down.has(a) || down.has(b) ? 1 : 0;
@@ -104,12 +149,17 @@ export function createKeyboard(target: Window, onActivity: () => void): Keyboard
     const kind = targetKind(event.target);
     // Escape still works from a form field: the pause menu must stay closable from the keyboard.
     if (kind === 'text' && code !== 'Escape') return;
-    const metaFlag = META_CODES.get(code);
+    const metaFlags = META_CODES.get(code);
     // A slider or switch keeps the driving keys for itself, and a focused button keeps Space: cancelling that
     // keydown would stop the browser from clicking the button on release.
     const drives = DRIVE_CODES.has(code) && kind !== 'control' && !(kind === 'button' && code === 'Space');
-    if (!drives && metaFlag === undefined) return;
+    // A slider keeps Left/Right (they move it); Up/Down and W/A/S/D still navigate the menu around it, and a switch
+    // (checkbox) has no use for the arrows at all, so every arrow navigates away from it.
+    const navFlag = isRange(event.target) && (code === 'ArrowLeft' || code === 'ArrowRight') ? undefined : NAV_CODES.get(code);
+    if (!drives && metaFlags === undefined && navFlag === undefined) return;
     if (BLOCKED_DEFAULTS.has(code)) event.preventDefault();
+    // Before the repeat check: holding a nav key keeps stepping through the menu.
+    if (navFlag !== undefined) pressed[navFlag] = true;
     // Auto-repeat counts for held keys: a key that is still physically down after its state was dropped (window
     // blur, the Command key on macOS) comes back with its next repeat instead of staying dead until re-pressed.
     if (drives && !down.has(code)) {
@@ -117,7 +167,7 @@ export function createKeyboard(target: Window, onActivity: () => void): Keyboard
       refreshHeld();
     }
     if (event.repeat) return;
-    if (metaFlag !== undefined) pressed[metaFlag] = true;
+    if (metaFlags !== undefined) for (const flag of metaFlags) pressed[flag] = true;
     onActivity();
   }
 

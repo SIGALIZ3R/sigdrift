@@ -1,5 +1,5 @@
 import type { CarParams, CarState } from '../types';
-import { createEngineTone, engineTone, engineWave, gritCurve } from './mapping';
+import { createEngineTone, engineTone, engineWave, gritCurve, slopeStrain } from './mapping';
 import type { EngineWaveKind } from './mapping';
 import { createGlide } from './param';
 import { IDLE_RPM, createDriveInput, createPowertrain, readDrive, stepPowertrain } from './rpm';
@@ -51,6 +51,8 @@ const FLUTTER_SPREAD = 0.045;
  * as vibrato and enough to stop a steady note from sounding like a test tone.
  */
 const PITCH_WANDER = 0.005;
+/** How quickly the engine's strain follows a change of slope, 1/s: a crest is felt over a few tenths of a second. */
+const STRAIN_RATE = 6;
 
 function periodicWave(ctx: BaseAudioContext, kind: EngineWaveKind): PeriodicWave {
   const table = engineWave(kind);
@@ -181,17 +183,24 @@ export function createEngineVoice(ctx: BaseAudioContext, noise: AudioBuffer, des
   let lastNow = -1;
   let flutter = 0;
   let flutterUntil = 0;
+  let strain = 0;
 
   return {
     update(car, params, active, now) {
       const dt = lastNow < 0 ? 0 : Math.min(Math.max(now - lastNow, 0), MAX_STEP);
       lastNow = now;
-      if (active) stepPowertrain(powertrain, readDrive(car, params, driveInput), dt);
+      if (active) {
+        stepPowertrain(powertrain, readDrive(car, params, driveInput), dt);
+        // The road's slope only changes the engine's load, not its revs: those come from the road speed.
+        const target = slopeStrain(car.pitchSlope, car.throttle, car.airborne === true);
+        strain += (target - strain) * Math.min(1, STRAIN_RATE * dt);
+        if (Math.abs(target - strain) < 1e-4) strain = target;
+      }
       if (now >= flutterUntil) {
         flutter = Math.random();
         flutterUntil = now + FLUTTER_MIN + FLUTTER_SPREAD * Math.random();
       }
-      engineTone(powertrain.rpm, powertrain.torque, powertrain.gate, flutter, mix);
+      engineTone(powertrain.rpm, powertrain.torque, powertrain.gate, flutter, mix, strain);
 
       const wander = active ? 1 + PITCH_WANDER * (flutter - 0.5) : 1;
       const cycleHz = mix.cycleHz * wander;

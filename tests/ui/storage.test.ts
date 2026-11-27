@@ -1,17 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PHYSICS_VERSION } from '../../src/types';
-import type { BestRecord, Difficulty, EndlessBest, Settings } from '../../src/types';
+import type { Difficulty, EndlessRecord, RunRecord, Settings } from '../../src/types';
 import {
   DEFAULT_DIFFICULTY,
   DEFAULT_SETTINGS,
   DIFFICULTIES,
-  loadBest,
-  loadEndlessBest,
+  HIGH_SCORE_SLOTS,
+  bestEndlessOverall,
+  countCompleted,
+  insertionIndex,
   loadEndlessDifficulty,
+  loadEndlessRecords,
+  loadHowToSeen,
+  loadRunRecords,
   loadSettings,
-  saveBest,
-  saveEndlessBest,
   saveEndlessDifficulty,
+  saveEndlessRecord,
+  saveHowToSeen,
+  saveRunRecord,
   saveSettings,
 } from '../../src/ui/storage';
 
@@ -37,17 +43,18 @@ const brokenStorage = {
 };
 
 const SETTINGS_KEY = 'sigdrift:settings';
-const LEVEL = '2026-W48';
-const BEST_KEY = `sigdrift:best:${LEVEL}`;
-const ENDLESS_KEY = 'sigdrift:endlessBest:hard';
+const TRACK = '2026-W48';
+const RUN_KEY = `sigdrift:run:${TRACK}`;
+const ENDLESS_KEY = 'sigdrift:endless:hard';
 const DIFFICULTY_KEY = 'sigdrift:endlessDifficulty';
+const DATE = '2026-11-27T12:00:00.000Z';
 
-function record(ticks: number, driftScore = 100): BestRecord {
-  return { ticks, driftScore, physicsVersion: PHYSICS_VERSION };
+function run(ticks: number, score = 100, date = DATE): RunRecord {
+  return { ticks, score, date, physicsVersion: PHYSICS_VERSION };
 }
 
-function endlessRecord(distance: number, driftScore = 100): EndlessBest {
-  return { distance, driftScore, physicsVersion: PHYSICS_VERSION };
+function endless(distance: number, score = 100, ticks = 1200): EndlessRecord {
+  return { distance, score, ticks, date: DATE, physicsVersion: PHYSICS_VERSION };
 }
 
 let storage: FakeStorage;
@@ -139,166 +146,208 @@ describe('settings', () => {
   });
 });
 
-describe('best records', () => {
-  it('returns null when nothing is stored', () => {
-    expect(loadBest(LEVEL)).toBeNull();
+describe('run records', () => {
+  it('is empty when nothing is stored', () => {
+    expect(loadRunRecords(TRACK)).toEqual({ bestTime: null, highScores: [] });
   });
 
-  it('stores the first record under a prefixed per-level key', () => {
-    expect(saveBest(LEVEL, record(9000))).toBe(true);
-    expect(loadBest(LEVEL)).toEqual(record(9000));
-    expect([...storage.items.keys()]).toEqual([BEST_KEY]);
-    expect(loadBest('2026-W47')).toBeNull();
+  it('stores the first run as best time, high score and rank 1 under a prefixed per-track key', () => {
+    expect(saveRunRecord(TRACK, run(900, 500))).toEqual({ newBestTime: true, newHighScore: true, rank: 1 });
+    expect(loadRunRecords(TRACK)).toEqual({ bestTime: run(900, 500), highScores: [run(900, 500)] });
+    expect([...storage.items.keys()]).toEqual([RUN_KEY]);
   });
 
-  it('only replaces a record with a strictly faster time', () => {
-    saveBest(LEVEL, record(9000, 100));
-    expect(saveBest(LEVEL, record(9000, 999))).toBe(false);
-    expect(saveBest(LEVEL, record(9500, 999))).toBe(false);
-    expect(loadBest(LEVEL)).toEqual(record(9000, 100));
-    expect(saveBest(LEVEL, record(8999, 5))).toBe(true);
-    expect(loadBest(LEVEL)).toEqual(record(8999, 5));
+  it('keeps tracks apart', () => {
+    saveRunRecord('L1', run(900));
+    expect(loadRunRecords('L2')).toEqual({ bestTime: null, highScores: [] });
+    expect(loadRunRecords('L1').bestTime).toEqual(run(900));
   });
 
-  it('ignores a record stored under another physics version and lets a new one replace it', () => {
-    storage.setItem(BEST_KEY, JSON.stringify({ ...record(100), physicsVersion: PHYSICS_VERSION + 1 }));
-    expect(loadBest(LEVEL)).toBeNull();
-    expect(saveBest(LEVEL, record(9000))).toBe(true);
-    expect(loadBest(LEVEL)).toEqual(record(9000));
+  it('replaces the best time only with a strictly faster run', () => {
+    saveRunRecord(TRACK, run(900, 10));
+    expect(saveRunRecord(TRACK, run(900, 5)).newBestTime).toBe(false);
+    expect(saveRunRecord(TRACK, run(950, 5)).newBestTime).toBe(false);
+    expect(loadRunRecords(TRACK).bestTime).toEqual(run(900, 10));
+    expect(saveRunRecord(TRACK, run(880, 5)).newBestTime).toBe(true);
+    expect(loadRunRecords(TRACK).bestTime).toEqual(run(880, 5));
   });
 
-  it('refuses to store a record from another physics version', () => {
-    saveBest(LEVEL, record(9000));
-    expect(saveBest(LEVEL, { ...record(10), physicsVersion: PHYSICS_VERSION + 1 })).toBe(false);
-    expect(loadBest(LEVEL)).toEqual(record(9000));
+  it('keeps the top five scores, highest first, and reports each new entry\'s rank', () => {
+    expect(saveRunRecord(TRACK, run(1000, 300)).rank).toBe(1);
+    expect(saveRunRecord(TRACK, run(1000, 500)).rank).toBe(1);
+    expect(saveRunRecord(TRACK, run(1000, 100)).rank).toBe(3);
+    expect(saveRunRecord(TRACK, run(1000, 400)).rank).toBe(2);
+    expect(saveRunRecord(TRACK, run(1000, 200)).rank).toBe(4);
+    expect(loadRunRecords(TRACK).highScores.map((r) => r.score)).toEqual([500, 400, 300, 200, 100]);
+    // A sixth that beats the lowest pushes it out ...
+    expect(saveRunRecord(TRACK, run(1000, 150)).rank).toBe(5);
+    expect(loadRunRecords(TRACK).highScores.map((r) => r.score)).toEqual([500, 400, 300, 200, 150]);
+    // ... and one that does not, does not make the table.
+    expect(saveRunRecord(TRACK, run(1000, 120))).toEqual({ newBestTime: false, newHighScore: false, rank: null });
+    expect(loadRunRecords(TRACK).highScores).toHaveLength(HIGH_SCORE_SLOTS);
   });
 
-  it('rejects malformed stored data', () => {
-    const malformed = [
-      '{not json',
-      'null',
-      '[]',
-      JSON.stringify({ ticks: '9000', driftScore: 1, physicsVersion: PHYSICS_VERSION }),
-      JSON.stringify({ ticks: -5, driftScore: 1, physicsVersion: PHYSICS_VERSION }),
-      JSON.stringify({ ticks: 12.5, driftScore: 1, physicsVersion: PHYSICS_VERSION }),
-      JSON.stringify({ ticks: 9000, physicsVersion: PHYSICS_VERSION }),
-      JSON.stringify({ ticks: 9000, driftScore: 1 }),
-    ];
-    for (const raw of malformed) {
-      storage.setItem(BEST_KEY, raw);
-      expect(loadBest(LEVEL)).toBeNull();
-    }
+  it('places an equal score after the one set earlier', () => {
+    saveRunRecord(TRACK, run(1000, 300, '2026-11-01T00:00:00Z'));
+    expect(saveRunRecord(TRACK, run(1000, 300, '2026-11-02T00:00:00Z')).rank).toBe(2);
+    expect(loadRunRecords(TRACK).highScores.map((r) => r.date)).toEqual(['2026-11-01T00:00:00Z', '2026-11-02T00:00:00Z']);
   });
 
-  it('refuses to store an invalid record', () => {
-    expect(saveBest(LEVEL, record(0))).toBe(false);
-    expect(saveBest(LEVEL, record(NaN))).toBe(false);
-    expect(saveBest(LEVEL, record(9000, Infinity))).toBe(false);
+  it('flags a new high score only when the top score is beaten', () => {
+    saveRunRecord(TRACK, run(1000, 300));
+    expect(saveRunRecord(TRACK, run(1000, 300)).newHighScore).toBe(false);
+    expect(saveRunRecord(TRACK, run(1000, 200)).newHighScore).toBe(false);
+    expect(saveRunRecord(TRACK, run(1000, 301)).newHighScore).toBe(true);
+  });
+
+  it('never calls a zero score a high score, but still ranks it', () => {
+    expect(saveRunRecord(TRACK, run(1000, 0))).toEqual({ newBestTime: true, newHighScore: false, rank: 1 });
+  });
+
+  it('ignores records from another physics version and lets new ones replace them', () => {
+    const old = { ticks: 500, score: 9999, date: DATE, physicsVersion: PHYSICS_VERSION - 1 };
+    storage.setItem(RUN_KEY, JSON.stringify({ bestTime: old, highScores: [old, run(800, 50)] }));
+    expect(loadRunRecords(TRACK)).toEqual({ bestTime: null, highScores: [run(800, 50)] });
+    expect(saveRunRecord(TRACK, run(900, 60))).toEqual({ newBestTime: true, newHighScore: true, rank: 1 });
+    const stored = JSON.parse(storage.getItem(RUN_KEY) ?? '{}');
+    expect(stored.bestTime).toEqual(run(900, 60));
+    expect(stored.highScores).toEqual([run(900, 60), run(800, 50)]);
+  });
+
+  it('refuses to store a record from another physics version or with bad fields', () => {
+    const none = { newBestTime: false, newHighScore: false, rank: null };
+    expect(saveRunRecord(TRACK, { ...run(900), physicsVersion: PHYSICS_VERSION + 1 })).toEqual(none);
+    expect(saveRunRecord(TRACK, run(0))).toEqual(none);
+    expect(saveRunRecord(TRACK, run(10.5))).toEqual(none);
+    expect(saveRunRecord(TRACK, run(900, -1))).toEqual(none);
+    expect(saveRunRecord(TRACK, run(900, NaN))).toEqual(none);
+    expect(saveRunRecord(TRACK, { ...run(900), date: 5 } as unknown as RunRecord)).toEqual(none);
     expect(storage.items.size).toBe(0);
   });
 
-  it('drops fields that are not part of a record', () => {
-    saveBest(LEVEL, { ...record(9000), note: 'x' } as BestRecord);
-    expect(JSON.parse(storage.getItem(BEST_KEY) ?? '')).toEqual(record(9000));
+  it('survives corrupted data', () => {
+    for (const raw of ['{not json', 'null', '[1,2]', '"text"', '42', '{"bestTime":7,"highScores":"x"}']) {
+      storage.setItem(RUN_KEY, raw);
+      expect(loadRunRecords(TRACK)).toEqual({ bestTime: null, highScores: [] });
+    }
+    storage.setItem(RUN_KEY, JSON.stringify({ bestTime: run(900), highScores: [null, 3, { score: 5 }, run(700, 40), run(800, 90)] }));
+    expect(loadRunRecords(TRACK)).toEqual({ bestTime: run(900), highScores: [run(800, 90), run(700, 40)] });
   });
 
-  it('reports failure when storage throws or is missing', () => {
+  it('sorts and trims a stored table that is out of order or too long', () => {
+    const table = [10, 70, 30, 90, 50, 20, 80].map((score) => run(1000, score));
+    storage.setItem(RUN_KEY, JSON.stringify({ bestTime: null, highScores: table }));
+    expect(loadRunRecords(TRACK).highScores.map((r) => r.score)).toEqual([90, 80, 70, 50, 30]);
+  });
+
+  it('drops fields that are not part of a record', () => {
+    saveRunRecord(TRACK, { ...run(900), extra: 'x' } as RunRecord);
+    expect(loadRunRecords(TRACK).bestTime).toEqual(run(900));
+  });
+
+  it('reports nothing saved when storage throws or is missing', () => {
     vi.stubGlobal('localStorage', brokenStorage);
-    expect(loadBest(LEVEL)).toBeNull();
-    expect(saveBest(LEVEL, record(9000))).toBe(false);
+    expect(loadRunRecords(TRACK)).toEqual({ bestTime: null, highScores: [] });
+    expect(saveRunRecord(TRACK, run(900))).toStrictEqual({ newBestTime: false, newHighScore: false, rank: null, failed: true });
     vi.stubGlobal('localStorage', undefined);
-    expect(loadBest(LEVEL)).toBeNull();
-    expect(saveBest(LEVEL, record(9000))).toBe(false);
+    expect(saveRunRecord(TRACK, run(900)).rank).toBeNull();
+    expect(saveRunRecord(TRACK, run(900)).failed).toBe(true);
+  });
+
+  it('ignores keys from earlier versions', () => {
+    storage.setItem(`sigdrift:best:${TRACK}`, JSON.stringify({ ticks: 900, driftScore: 5, physicsVersion: PHYSICS_VERSION }));
+    expect(loadRunRecords(TRACK)).toEqual({ bestTime: null, highScores: [] });
+  });
+
+  it('counts completed tracks', () => {
+    saveRunRecord('L1', run(900));
+    saveRunRecord('L3', run(900));
+    expect(countCompleted(['L1', 'L2', 'L3', 'L4', 'L5'])).toBe(2);
   });
 });
 
-describe('endless best records', () => {
-  it('returns null when nothing is stored', () => {
-    for (const difficulty of DIFFICULTIES) expect(loadEndlessBest(difficulty)).toBeNull();
+describe('insertionIndex', () => {
+  it('finds the slot after every score it does not beat', () => {
+    const table = [{ score: 50 }, { score: 30 }, { score: 30 }, { score: 10 }];
+    expect(insertionIndex(table, 60)).toBe(0);
+    expect(insertionIndex(table, 50)).toBe(1);
+    expect(insertionIndex(table, 30)).toBe(3);
+    expect(insertionIndex(table, 5)).toBe(4);
+    expect(insertionIndex([], 0)).toBe(0);
+  });
+});
+
+describe('endless records', () => {
+  it('is empty when nothing is stored', () => {
+    expect(loadEndlessRecords('hard')).toEqual({ bestDistance: null, highScores: [] });
   });
 
-  it('stores the first record under a prefixed per-difficulty key', () => {
-    expect(saveEndlessBest('hard', endlessRecord(842.5))).toBe(true);
-    expect(loadEndlessBest('hard')).toEqual(endlessRecord(842.5));
+  it('stores the first run under a prefixed per-difficulty key', () => {
+    expect(saveEndlessRecord('hard', endless(842, 300))).toEqual({ newBestDistance: true, newHighScore: true, rank: 1 });
+    expect(loadEndlessRecords('hard')).toEqual({ bestDistance: endless(842, 300), highScores: [endless(842, 300)] });
     expect([...storage.items.keys()]).toEqual([ENDLESS_KEY]);
-    expect(ENDLESS_KEY.startsWith('sigdrift:')).toBe(true);
   });
 
-  it('keeps each difficulty apart, and apart from the weekly records', () => {
-    saveEndlessBest('easy', endlessRecord(3000));
-    saveEndlessBest('hard', endlessRecord(400));
-    saveBest('hard', record(9000));
-    expect(loadEndlessBest('easy')).toEqual(endlessRecord(3000));
-    expect(loadEndlessBest('medium')).toBeNull();
-    expect(loadEndlessBest('hard')).toEqual(endlessRecord(400));
-    expect(loadBest('hard')).toEqual(record(9000));
-    expect(storage.items.size).toBe(3);
+  it('keeps each difficulty apart', () => {
+    saveEndlessRecord('easy', endless(100));
+    expect(loadEndlessRecords('hard').bestDistance).toBeNull();
+    expect(loadEndlessRecords('easy').bestDistance).toEqual(endless(100));
   });
 
-  it('only replaces a record with a strictly longer distance', () => {
-    saveEndlessBest('hard', endlessRecord(1500, 100));
-    expect(saveEndlessBest('hard', endlessRecord(1500, 999))).toBe(false);
-    expect(saveEndlessBest('hard', endlessRecord(1499.9, 999))).toBe(false);
-    expect(loadEndlessBest('hard')).toEqual(endlessRecord(1500, 100));
-    expect(saveEndlessBest('hard', endlessRecord(1500.1, 5))).toBe(true);
-    expect(loadEndlessBest('hard')).toEqual(endlessRecord(1500.1, 5));
+  it('replaces the best distance only with a strictly longer one, and ranks scores independently', () => {
+    saveEndlessRecord('hard', endless(800, 100));
+    expect(saveEndlessRecord('hard', endless(800, 900))).toEqual({ newBestDistance: false, newHighScore: true, rank: 1 });
+    expect(saveEndlessRecord('hard', endless(1200, 50))).toEqual({ newBestDistance: true, newHighScore: false, rank: 3 });
+    expect(loadEndlessRecords('hard').bestDistance).toEqual(endless(1200, 50));
   });
 
-  it('ignores a record stored under another physics version and lets a new one replace it', () => {
-    storage.setItem(ENDLESS_KEY, JSON.stringify({ ...endlessRecord(99999), physicsVersion: PHYSICS_VERSION + 1 }));
-    expect(loadEndlessBest('hard')).toBeNull();
-    expect(saveEndlessBest('hard', endlessRecord(120))).toBe(true);
-    expect(loadEndlessBest('hard')).toEqual(endlessRecord(120));
+  it('does not count a zero distance as a best distance', () => {
+    expect(saveEndlessRecord('hard', endless(0, 0)).newBestDistance).toBe(false);
+    expect(loadEndlessRecords('hard').bestDistance).toBeNull();
   });
 
-  it('refuses to store a record from another physics version', () => {
-    saveEndlessBest('hard', endlessRecord(120));
-    expect(saveEndlessBest('hard', { ...endlessRecord(99999), physicsVersion: PHYSICS_VERSION + 1 })).toBe(false);
-    expect(loadEndlessBest('hard')).toEqual(endlessRecord(120));
+  it('ignores other physics versions, corrupted data and unknown difficulties', () => {
+    const old = { ...endless(5000, 9999), physicsVersion: PHYSICS_VERSION - 1 };
+    storage.setItem(ENDLESS_KEY, JSON.stringify({ bestDistance: old, highScores: [old] }));
+    expect(loadEndlessRecords('hard')).toEqual({ bestDistance: null, highScores: [] });
+    storage.setItem(ENDLESS_KEY, '{oops');
+    expect(loadEndlessRecords('hard')).toEqual({ bestDistance: null, highScores: [] });
+    expect(loadEndlessRecords('insane' as Difficulty)).toEqual({ bestDistance: null, highScores: [] });
+    expect(saveEndlessRecord('insane' as Difficulty, endless(100)).rank).toBeNull();
+    expect(saveEndlessRecord('hard', { ...endless(100), ticks: -1 }).rank).toBeNull();
+    expect(saveEndlessRecord('hard', { ...endless(100), distance: Infinity }).rank).toBeNull();
   });
 
-  it('rejects malformed stored data', () => {
-    const malformed = [
-      '{not json',
-      'null',
-      '[]',
-      '842',
-      JSON.stringify({ distance: '842', driftScore: 1, physicsVersion: PHYSICS_VERSION }),
-      JSON.stringify({ distance: -5, driftScore: 1, physicsVersion: PHYSICS_VERSION }),
-      JSON.stringify({ distance: 0, driftScore: 1, physicsVersion: PHYSICS_VERSION }),
-      JSON.stringify({ distance: 842, physicsVersion: PHYSICS_VERSION }),
-      JSON.stringify({ distance: 842, driftScore: 1 }),
-      JSON.stringify({ ticks: 9000, driftScore: 1, physicsVersion: PHYSICS_VERSION }),
-    ];
-    for (const raw of malformed) {
-      storage.setItem(ENDLESS_KEY, raw);
-      expect(loadEndlessBest('hard')).toBeNull();
-    }
+  it('finds the furthest run over all difficulties', () => {
+    expect(bestEndlessOverall()).toBeNull();
+    saveEndlessRecord('easy', endless(500));
+    saveEndlessRecord('hard', endless(900));
+    saveEndlessRecord('medium', endless(700));
+    expect(bestEndlessOverall()).toEqual({ difficulty: 'hard', record: endless(900) });
   });
 
-  it('refuses to store an invalid record or an unknown difficulty', () => {
-    expect(saveEndlessBest('hard', endlessRecord(0))).toBe(false);
-    expect(saveEndlessBest('hard', endlessRecord(-10))).toBe(false);
-    expect(saveEndlessBest('hard', endlessRecord(NaN))).toBe(false);
-    expect(saveEndlessBest('hard', endlessRecord(Infinity))).toBe(false);
-    expect(saveEndlessBest('hard', endlessRecord(500, NaN))).toBe(false);
-    expect(saveEndlessBest('insane' as Difficulty, endlessRecord(500))).toBe(false);
-    expect(loadEndlessBest('insane' as Difficulty)).toBeNull();
-    expect(storage.items.size).toBe(0);
-  });
-
-  it('drops fields that are not part of a record', () => {
-    saveEndlessBest('hard', { ...endlessRecord(842), cause: 'crashes' } as EndlessBest);
-    expect(JSON.parse(storage.getItem(ENDLESS_KEY) ?? '')).toEqual(endlessRecord(842));
-  });
-
-  it('reports failure when storage throws or is missing', () => {
+  it('survives storage that throws', () => {
     vi.stubGlobal('localStorage', brokenStorage);
-    expect(loadEndlessBest('hard')).toBeNull();
-    expect(saveEndlessBest('hard', endlessRecord(842))).toBe(false);
-    vi.stubGlobal('localStorage', undefined);
-    expect(loadEndlessBest('hard')).toBeNull();
-    expect(saveEndlessBest('hard', endlessRecord(842))).toBe(false);
+    expect(loadEndlessRecords('hard')).toEqual({ bestDistance: null, highScores: [] });
+    expect(saveEndlessRecord('hard', endless(100))).toStrictEqual({ newBestDistance: false, newHighScore: false, rank: null, failed: true });
+  });
+});
+
+describe('how to play flag', () => {
+  it('starts unseen and remembers once seen', () => {
+    expect(loadHowToSeen()).toBe(false);
+    saveHowToSeen();
+    expect(loadHowToSeen()).toBe(true);
+    expect(storage.getItem('sigdrift:howToSeen')).toBe('true');
+    saveHowToSeen(false);
+    expect(loadHowToSeen()).toBe(false);
+  });
+
+  it('accepts only a stored true', () => {
+    for (const raw of ['1', '"true"', '{x', 'null']) {
+      storage.setItem('sigdrift:howToSeen', raw);
+      expect(loadHowToSeen()).toBe(false);
+    }
   });
 });
 

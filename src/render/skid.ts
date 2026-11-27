@@ -19,6 +19,10 @@ const MARK_Y = 0.04;
 const MIN_STEP = 0.3;
 /** A longer step than this in one go is a teleport, not a slide. */
 const MAX_STEP = 6;
+/** The ribbon breaks where the surface height jumps by more than this between two marks (a join, a drop), m. */
+const MAX_RISE = 0.5;
+/** A wheel whose surface is further than this from the car's own height is over an edge: it leaves no mark, m. */
+const WHEEL_MATCH = 0.7;
 const SLIDE_THRESHOLD = 0.3;
 const REAR_ALPHA_MIN = 0.2;
 const REAR_ALPHA_MAX = 0.85;
@@ -45,8 +49,8 @@ interface UpdateRange {
 export interface SkidMarks {
   readonly mesh: Mesh;
   /**
-   * Call once per simulation tick. Marks are laid on `ground`, so they climb a bump with the tyres; a car in the
-   * air leaves none.
+   * Call once per simulation tick. Marks are laid on `ground` at the car's level, so they climb slopes and bumps
+   * with the tyres; a car in the air, or a wheel hanging over an edge, leaves none.
    */
   lay(car: CarState, params: CarParams, ground?: Ground): void;
   /** Call once per rendered frame, before drawing: schedules the upload of whatever `lay` wrote. */
@@ -132,7 +136,13 @@ class SkidRibbons implements SkidMarks {
       const lz = wheelOffsetZ(params, w);
       const x = car.x + lx * cos - lz * sin;
       const z = car.z + lx * sin + lz * cos;
-      this.extend(w, x, z, ground.heightAt(x, z), markAlpha(w, slide));
+      const carY = car.y || 0;
+      const y = ground.heightAt(x, z, carY);
+      if (Math.abs(y - carY) > WHEEL_MATCH) {
+        this.sliding[w] = 0;
+        continue;
+      }
+      this.extend(w, x, z, y, markAlpha(w, slide));
     }
   }
 
@@ -184,7 +194,7 @@ class SkidRibbons implements SkidMarks {
     const dx = x - prev[o + AX];
     const dz = z - prev[o + AZ];
     const d2 = dx * dx + dz * dz;
-    if (this.sliding[w] === 0 || d2 > MAX_STEP * MAX_STEP) {
+    if (this.sliding[w] === 0 || d2 > MAX_STEP * MAX_STEP || Math.abs(y - prev[o + GROUND_Y]) > MAX_RISE) {
       this.sliding[w] = 1;
       this.hasEdge[w] = 0;
       prev[o + AX] = x;

@@ -2,7 +2,10 @@
  * Shared contracts for SigDRIFT. Every module builds against these types.
  *
  * COORDINATES
- * - The simulation is 2D on the ground plane. Sim (x, z) maps directly to three.js world (x, 0, z); three's +Y is up.
+ * - The simulation is 2.5D: the car drives on road SURFACES at heights. Sim (x, z) maps to three.js (x, ?, z) and the
+ *   car's height `y` is three.js Y (+Y up). Roads can climb, descend and pass OVER or UNDER other roads.
+ * - Every road surface is at y >= 0. The city floor (buildings, the void between roads) is at TERRAIN_Y below all
+ *   roads, so leaving a road over its edge always means a real drop.
  * - Units: metres, seconds, radians, kilograms, newtons.
  * - Heading θ: the car's forward vector is (cos θ, sin θ) in (x, z). Seen from above (camera looking down -Y with
  *   +X to the right and +Z towards the viewer) increasing θ turns the car CLOCKWISE, i.e. to its own RIGHT.
@@ -10,11 +13,20 @@
  * - A mesh modelled with its nose along +X is posed with `mesh.rotation.y = -heading`.
  * - Steering input +1 = steer right (heading increases when driving forwards).
  *
+ * ROAD SURFACE HEIGHT
+ * - Each road has a centreline of PathPoints carrying `y`. The surface is level ACROSS the road and varies only
+ *   along it: at a point p over a road segment i..i+1, the surface height is the linear interpolation of path[i].y and
+ *   path[i+1].y by the projection of p onto that segment, plus any bump of that road (see Bump).
+ * - "Which surface is the car on?" Among the road pieces whose footprint (within halfWidth of the centreline) contains
+ *   the point, the car stands on the HIGHEST surface whose height is <= car.y + STEP_UP. If there is none, it is over
+ *   the city floor (TERRAIN_Y). Where two roads overlap in plan, their surfaces are always >= CROSSING_CLEARANCE apart.
+ *
  * DETERMINISM
  * - Everything under src/core, src/sim, src/gen and src/modes is pure TypeScript: no DOM, no three.js, no Date,
  *   no Math.random, and NO Math.sin/cos/tan/atan/atan2/asin/acos/pow/exp/log/hypot. Use src/core/fixedMath.ts.
  *   Math.sqrt, Math.abs, Math.min, Math.max, Math.floor, Math.ceil, Math.round, Math.sign, Math.imul, Math.fround
- *   are exact and allowed.
+ *   are exact and allowed. (Accepted exceptions: createFixedLoop in src/core/loop.ts, UTC calendar maths in
+ *   src/gen/weeklySeed.ts.)
  * - The simulation advances only in fixed steps of DT.
  */
 
@@ -22,9 +34,20 @@ export const SIM_HZ = 120;
 export const DT = 1 / SIM_HZ;
 
 /** Bump when physics behaviour changes: recorded times and replays are only comparable within one version. */
-export const PHYSICS_VERSION = 2;
-/** Bump when the generator's output for a given week would change. Old versions stay frozen. */
-export const GEN_VERSION = 1;
+export const PHYSICS_VERSION = 3;
+/** Bump when the generator's output for a given seed would change. */
+export const GEN_VERSION = 2;
+
+/** Height of the city floor under every road, m. */
+export const TERRAIN_Y = -4;
+/** Height of a road barrier above the road surface, m. */
+export const WALL_HEIGHT = 0.7;
+/** Minimum vertical distance between two road surfaces that overlap in plan (an overpass and the road below), m. */
+export const CROSSING_CLEARANCE = 7;
+/** Steepest road slope the generators may build (rise over run). */
+export const MAX_GRADE = 0.12;
+/** A grounded car follows a surface up to this far above its wheels (kerbs, bump faces, joins), m. */
+export const STEP_UP = 0.6;
 
 export interface Vec2 {
   x: number;
@@ -35,6 +58,11 @@ export interface Pose {
   x: number;
   z: number;
   heading: number;
+  /**
+   * Road surface height at the pose, m. Worlds place the car on the road surface nearest this height (it matters
+   * where roads cross). Optional: 0 when absent.
+   */
+  y?: number;
 }
 
 export interface Segment {
@@ -42,6 +70,12 @@ export interface Segment {
   az: number;
   bx: number;
   bz: number;
+}
+
+/** A road barrier: solid from the road surface (ya at a, yb at b, linear between) up to surface + WALL_HEIGHT. */
+export interface Wall extends Segment {
+  ya: number;
+  yb: number;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -69,6 +103,13 @@ export interface MetaInput {
   confirm: boolean;
   /** M key: mute / unmute all sound. */
   toggleMute: boolean;
+  /** Menu navigation (arrow keys / WASD / d-pad / left stick flicks) while a menu is open. */
+  navUp: boolean;
+  navDown: boolean;
+  navLeft: boolean;
+  navRight: boolean;
+  /** Escape / Backspace / gamepad B while a menu is open: go back one screen. */
+  back: boolean;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -118,7 +159,10 @@ export interface CarParams {
   steerReturnRate: number;
   /** Extra yaw damping, 1/s. */
   yawDamping: number;
-  /** 0..1 automatic countersteer blended into the steering while sliding. 0 = off. */
+  /**
+   * 0..1 drift assist. It must HELP HOLD a drift (catch a slide before it becomes a spin, keep the angle the player
+   * asks for), never cancel the rotation the player starts. 0 = off.
+   */
   steerAssist: number;
   /** Collision body: the car is treated as circles of this radius along its length, m. */
   collisionRadius: number;
@@ -149,7 +193,7 @@ export interface CarState {
   reversing: boolean;
 
   // ---- derived every tick (do not integrate these; recompute them) ----
-  /** |velocity|, m/s. */
+  /** Horizontal |velocity|, m/s. */
   speed: number;
   /** Velocity along the car's nose, m/s (negative when reversing). */
   forwardSpeed: number;
@@ -170,13 +214,15 @@ export interface CarState {
   brake: number;
   handbrake: boolean;
 
-  // ---- height (only ever non-zero on tracks with bumps, i.e. endless mode) ----
-  /** Height of the car's wheels above the flat ground plane (three.js Y), m. Equals the ground height while grounded. */
+  // ---- height ----
+  /** Height of the car's wheels (three.js Y), m. Equals the surface height while grounded. */
   y: number;
   /** Vertical speed, m/s, positive = up. */
   vy: number;
   /** True while the wheels are off the ground: no tyre forces, no steering, no braking; gravity and drag only. */
   airborne: boolean;
+  /** Slope of the surface under the car along its heading (rise over run, + = uphill). 0 while airborne. */
+  pitchSlope: number;
 }
 
 export interface CollisionEvent {
@@ -198,9 +244,24 @@ export interface SimBase {
   tick: number;
   /** Hardest collision that happened during the most recent step, or null. */
   lastCollision: CollisionEvent | null;
+  /**
+   * Distance from the car's collision body to the nearest solid (wall or pillar at the car's own level) after the
+   * most recent step, m; Infinity when nothing is within 8 m. Drives the close-to-the-wall scoring.
+   */
+  readonly wallDistance: number;
+  /**
+   * True once the car has come to rest on the city floor (it fell off an edge or flew over a barrier). Latched until
+   * placeCar. Worlds keep stepping physics normally on the floor.
+   */
+  readonly offTrack: boolean;
+  /**
+   * Surface a car at height `fromY` standing at (x, z) would rest on (see ROAD SURFACE HEIGHT), including bumps;
+   * TERRAIN_Y when no road is there.
+   */
+  groundHeight(x: number, z: number, fromY: number): number;
   /** Advance exactly one tick of DT. */
   step(input: InputState): void;
-  /** Teleport the car to a pose at rest (used for start and checkpoint respawn). Does not change `tick`. */
+  /** Teleport the car to a pose at rest on the road surface (see Pose.y). Clears offTrack. Does not change `tick`. */
   placeCar(pose: Pose): void;
   /** Flat list of numbers that fully describes dynamic state, for hashing in replay tests. */
   snapshot(): number[];
@@ -212,15 +273,17 @@ export interface World extends SimBase {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Level
+// Roads (shared by fixed levels and endless chunks)
 // ---------------------------------------------------------------------------------------------------------------
 
 export interface PathPoint {
   x: number;
   z: number;
+  /** Road surface height at this point, m (>= 0). */
+  y: number;
   /** Half the drivable road width at this point, m. */
   halfWidth: number;
-  /** Distance along the centreline from the start, m. */
+  /** Distance along the centreline from the start, m (horizontal distance). */
   dist: number;
 }
 
@@ -228,7 +291,9 @@ export interface PathPoint {
 export interface Gate extends Segment {
   /** Index into Level.path where this gate sits. */
   pathIndex: number;
-  /** Pose to respawn at for this gate (on the centreline, facing along the road, at rest). */
+  /** Road surface height at the gate: only a car within 3 m of this height crosses it. */
+  y: number;
+  /** Pose to respawn at for this gate (on the centreline, facing along the road, at rest, with y). */
   respawn: Pose;
 }
 
@@ -237,98 +302,147 @@ export interface Prop {
   kind: 'pillar';
   x: number;
   z: number;
+  /** Road surface height at its base, m. */
+  y: number;
   radius: number;
   height: number;
   /** Index into the render palette's accent colours. */
   hue: number;
 }
 
-/** Non-solid scenery outside the road (buildings, towers). Purely cosmetic. */
+/** Non-solid scenery standing on the city floor (buildings, towers). Purely cosmetic. */
 export interface DecorBlock {
   x: number;
   z: number;
   /** Footprint size along x and z, m. */
   w: number;
   d: number;
+  /** Height above TERRAIN_Y, m. */
   h: number;
   hue: number;
 }
 
-export interface Level {
-  /** Week id, e.g. "2026-W48". */
+/** Cosmetic column holding up a raised road, from the city floor to just under the road at `top`. */
+export interface Support {
+  x: number;
+  z: number;
+  /** Underside of the road deck, m. */
+  top: number;
+  radius: number;
+}
+
+/**
+ * A raised ridge across the whole road, added to that road's surface height. Near the bump:
+ *   u = (p - centre) · dir            (metres along the road, relative to the crest)
+ *   h = height * 0.5 * (1 + cos(PI * u / halfLength))   for |u| < halfLength, else 0
+ * and only where |(p - centre) · right(dir)| <= halfWidth, and only for a road whose surface there is within 1.5 m of
+ * `y` (a bump never lifts the road above or below it). Use fixedMath.cos.
+ */
+export interface Bump {
+  x: number;
+  z: number;
+  /** Road surface height at the crest, without the bump, m. */
+  y: number;
+  /** Unit vector along the road at the crest (horizontal). */
+  dirX: number;
+  dirZ: number;
+  /** Half the bump's length along the road, m. */
+  halfLength: number;
+  /** Half its extent across the road, m (a little more than the road's halfWidth, so it spans edge to edge). */
+  halfWidth: number;
+  /** Crest height above the road, m. */
+  height: number;
+}
+
+/** The parts every drivable road piece has, whether a whole level or an endless chunk. */
+export interface RoadPiece {
+  /** Centreline, points 2–4 m apart. */
+  path: PathPoint[];
+  /** Road edges, same length and indexing as `path` (path[i] offset by halfWidth; height path[i].y). */
+  left: Vec2[];
+  right: Vec2[];
+  /**
+   * Whether the edge segment from index i to i+1 has NO barrier (an open drop-off edge, marked by the renderer with
+   * hazard paint). Same length as `path`; the last entry is unused. Open edges are where cars fall off.
+   */
+  leftOpen: boolean[];
+  rightOpen: boolean[];
+  /** Every barrier: the edges that are not open, plus any closed ends. */
+  walls: Wall[];
+  props: Prop[];
+  bumps: Bump[];
+  supports: Support[];
+  decor: DecorBlock[];
+  bounds: { minX: number; minZ: number; maxX: number; maxZ: number; minY: number; maxY: number };
+}
+
+export interface Level extends RoadPiece {
+  /** Week id ("2026-W48") or level id ("L1".."L5"). */
   id: string;
   seed: string;
   genVersion: number;
-  /** Smoothed centreline from start to goal, points roughly 2–4 m apart. */
-  path: PathPoint[];
-  /** Road edges, same length and indexing as `path`: left[i] / right[i] are path[i] offset by halfWidth. */
-  left: Vec2[];
-  right: Vec2[];
-  /** Every solid boundary: both road edges plus the closed ends behind the start and beyond the goal. */
-  walls: Segment[];
-  props: Prop[];
-  decor: DecorBlock[];
   start: Pose;
   /** Intermediate gates in driving order (the goal is not included). */
   checkpoints: Gate[];
   goal: Gate;
-  bounds: { minX: number; minZ: number; maxX: number; maxZ: number };
   /** Centreline length, m. */
   length: number;
 }
 
+/**
+ * How a fixed level is generated. The weekly run uses WEEKLY_OPTIONS from src/gen/levels.ts; each hand-picked level
+ * has its own. All values are targets the generator aims for, deterministic per seed.
+ */
+export interface TrackOptions {
+  /** Road length in grid cells, [min, max]. */
+  cells: [number, number];
+  /** Base half width range, m. */
+  halfWidth: [number, number];
+  /** 0 (flat) .. 1 (big climbs and drops). */
+  elevation: number;
+  /** How many times the road should pass over or under itself (0..4). */
+  crossings: number;
+  /** 0..1 share of raised road (y >= 3) whose edges are open drop-offs instead of barriers. */
+  openEdges: number;
+  /** Bumps per km. */
+  bumpsPerKm: number;
+  /** 0..1 how twisty: share of bends, S-bends and hairpins. */
+  twist: number;
+  /** 0..1 how often a straight widens into a plaza. */
+  plazas: number;
+  /** Pillars per km. */
+  pillarsPerKm: number;
+}
+
+export interface LevelDef {
+  /** "L1".."L5". */
+  id: string;
+  name: string;
+  /** One short line for the level card. */
+  blurb: string;
+  /** 1 (easy) .. 5 (hard), shown as pips. */
+  difficulty: number;
+  seed: string;
+  options: TrackOptions;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
-// Endless track (infinite mode): the road arrives in chunks, and has bumps
+// Endless track (infinite mode): the road arrives in chunks
 // ---------------------------------------------------------------------------------------------------------------
 
 export type Difficulty = 'easy' | 'medium' | 'hard';
 
 /**
- * A raised ridge across the whole road. Ground height at a point p near the bump:
- *   u = (p - centre) · dir            (metres along the road, relative to the crest)
- *   h = height * 0.5 * (1 + cos(PI * u / halfLength))   for |u| < halfLength, else 0
- * and only where |(p - centre) · right(dir)| <= halfWidth. Where bumps overlap the ground is the highest of them.
- * Bumps never overlap in practice (the generator keeps them apart). Use fixedMath.cos.
- */
-export interface Bump {
-  x: number;
-  z: number;
-  /** Unit vector along the road at the crest. */
-  dirX: number;
-  dirZ: number;
-  /** Half the bump's length along the road, m. */
-  halfLength: number;
-  /** Half its extent across the road, m (a little more than the road's halfWidth, so it spans wall to wall). */
-  halfWidth: number;
-  /** Crest height, m. */
-  height: number;
-}
-
-/**
  * One generated stretch of endless road. Chunks are numbered 0, 1, 2 ... and join end to start:
- * chunk[n].path[0] is the same point as chunk[n-1].path[last] (same position and halfWidth).
+ * chunk[n].path[0] is the same point as chunk[n-1].path[last] (same x, z, y and halfWidth).
  */
-export interface TrackChunk {
+export interface TrackChunk extends RoadPiece {
   index: number;
-  /** Centreline, points 2–4 m apart; `dist` is the distance along the WHOLE endless road, continuing across chunks. */
-  path: PathPoint[];
-  /** Road edges, same indexing as `path`. */
-  left: Vec2[];
-  right: Vec2[];
-  /**
-   * Solid walls owned by this chunk: its left edge, its right edge, and for chunk 0 only a closed cap behind the
-   * start. The far end is open (the next chunk continues it).
-   */
-  walls: Segment[];
-  props: Prop[];
-  decor: DecorBlock[];
-  bumps: Bump[];
-  /** `dist` of the first and last path point. */
+  /** `dist` of the first and last path point. Path `dist` runs along the WHOLE endless road, across chunks. */
   startDist: number;
   endDist: number;
   /** 0 (gentle) .. 1 (brutal): what the generator aimed for in this chunk. For the HUD and tests. */
   intensity: number;
-  bounds: { minX: number; minZ: number; maxX: number; maxZ: number };
 }
 
 /** A deterministic, endless supply of chunks. Implemented in src/gen/endless.ts (createEndlessGenerator). */
@@ -359,13 +473,6 @@ export interface EndlessWorld extends SimBase {
   readonly trackDist: number;
   /** Index of the chunk the car is currently on. */
   readonly chunkIndex: number;
-  /**
-   * True once the car is on the ground (not airborne) outside the road, i.e. it flew over a wall. Latched until
-   * placeCar. While true the world may stop simulating the car normally.
-   */
-  readonly offTrack: boolean;
-  /** Ground height at a point, from the live chunks' bumps. */
-  groundHeight(x: number, z: number): number;
 }
 
 export interface ValidationResult {
@@ -374,7 +481,41 @@ export interface ValidationResult {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Run mode (drive from start to goal)
+// Scoring (shared by every mode)
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * Drift points. Implemented in src/modes/driftScore.ts. Rules (the modes agent owns the exact numbers):
+ * - While drifting, points flow straight into `points` every tick: base(speed, drift angle) x proximity bonus x
+ *   multiplier. Points are NEVER taken away.
+ * - The closer the car is to a wall or pillar while drifting (SimBase.wallDistance), the bigger the proximity bonus
+ *   AND the faster the multiplier climbs.
+ * - The multiplier builds while the player keeps drifting and linking drifts; it slowly decays after a pause.
+ * - Hitting something (a real impact), spinning out, falling off or resetting drops the multiplier back to 1. The
+ *   points already earned are kept. After a hit, a fall or a reset nothing scores until the car has recovered (a
+ *   wreck sliding along the wall it hit is not drifting).
+ */
+export interface ScoreState {
+  /** Total points this run. Never decreases. */
+  points: number;
+  /** Current multiplier, 1..MAX. */
+  multiplier: number;
+  /** Highest multiplier reached this run. */
+  peakMultiplier: number;
+  /** True while the car counts as drifting this tick. */
+  drifting: boolean;
+  /** 0..1 how close to a wall the current drift is (1 = brushing it). 0 when not drifting. */
+  proximity: number;
+  /** Points earned since the multiplier was last reset to 1 (for the HUD's running combo readout). */
+  combo: number;
+  /** Tick on which the multiplier was last lost, or -1. */
+  lastMultiplierLossTick: number;
+  /** Tick on which a close-to-the-wall moment last began (proximity rising past 0.5), or -1. */
+  lastCloseTick: number;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Run mode (weekly run and the five levels: drive from start to goal)
 // ---------------------------------------------------------------------------------------------------------------
 
 export type RunPhase = 'countdown' | 'running' | 'finished';
@@ -390,29 +531,37 @@ export interface RunState {
   checkpointCount: number;
   /** Tick count at which each checkpoint was crossed. */
   splits: number[];
-  /** Where a reset puts the car. */
+  /** Where a reset or a fall puts the car. */
   respawn: Pose;
+  /** Manual resets (R). */
   resets: number;
-  /** Banked drift points. */
-  driftScore: number;
-  /** Points in the drift chain currently in progress (not yet banked). */
-  chainScore: number;
-  /** Current chain multiplier, >= 1. */
-  multiplier: number;
-  /** True while the car counts as drifting this tick. */
-  drifting: boolean;
+  /** Times the car fell off the road (it is put back at the last checkpoint; the clock keeps running). */
+  falls: number;
+  /** Tick of the most recent fall, or -1. */
+  lastFallTick: number;
+  /** > 0 while the car is waiting to be put back after a fall (so the player sees the drop). */
+  respawnInTicks: number;
+  score: ScoreState;
   /** Tick on which a checkpoint was last crossed, or -1. For HUD flashes. */
   lastCheckpointTick: number;
-  /** Tick on which the chain was last lost to a wall hit or spin, or -1. */
-  lastChainBreakTick: number;
+}
+
+/** Implemented in src/modes/run.ts. Pure and deterministic. */
+export interface RunMode {
+  readonly world: World;
+  readonly state: RunState;
+  /** Advance one tick: countdown, world step, gates, resets, falls and scoring. */
+  step(input: InputState): void;
+  /** Back to the start line with a fresh countdown. */
+  restart(): void;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Endless mode (infinite road, three crashes, flying off the road is fatal)
+// Endless mode (infinite road, three crashes, falling off the road is fatal)
 // ---------------------------------------------------------------------------------------------------------------
 
 export type EndlessPhase = 'countdown' | 'running' | 'dead';
-/** 'offTrack' = landed outside the road after a jump; 'crashes' = used up every crash. */
+/** 'offTrack' = fell off the road or flew over a barrier; 'crashes' = used up every crash. */
 export type DeathCause = 'offTrack' | 'crashes';
 
 export interface EndlessState {
@@ -421,7 +570,7 @@ export interface EndlessState {
   /** Ticks elapsed while running. */
   ticks: number;
   difficulty: Difficulty;
-  /** Furthest distance reached along the road, m. This is the score that matters. */
+  /** Furthest distance reached along the road, m. */
   distance: number;
   /** Crashes so far (wall or pillar hits hard enough to count). */
   crashes: number;
@@ -435,31 +584,16 @@ export interface EndlessState {
   /** Tick on which the car last left the ground / last landed, or -1. For HUD and audio. */
   lastTakeoffTick: number;
   lastLandingTick: number;
-  // Drift scoring: same rules and meaning as RunState.
-  driftScore: number;
-  chainScore: number;
-  multiplier: number;
-  drifting: boolean;
-  lastChainBreakTick: number;
+  score: ScoreState;
 }
 
 /** Implemented in src/modes/endless.ts (createEndlessMode). Pure and deterministic. Owns chunk streaming. */
 export interface EndlessMode {
   readonly world: EndlessWorld;
   readonly state: EndlessState;
-  /** Advance one tick: countdown, world step, chunk streaming, crash counting, death, drift scoring. */
+  /** Advance one tick: countdown, world step, chunk streaming, crash counting, death, scoring. */
   step(input: InputState): void;
   /** Same seed and difficulty again from the start. */
-  restart(): void;
-}
-
-/** Implemented in src/modes/run.ts. Pure and deterministic. */
-export interface RunMode {
-  readonly world: World;
-  readonly state: RunState;
-  /** Advance one tick: handles countdown, steps the world, gates, resets and drift scoring. */
-  step(input: InputState): void;
-  /** Back to the start line with a fresh countdown. */
   restart(): void;
 }
 
@@ -467,15 +601,18 @@ export interface RunMode {
 // Rendering, settings, storage
 // ---------------------------------------------------------------------------------------------------------------
 
+/** What the player is doing: this week's generated run, one of the five fixed levels, or endless. */
+export type GameMode = 'weekly' | 'level' | 'endless';
+
 export type Quality = 'low' | 'high';
 
 export interface Settings {
   quality: Quality;
   /** 0..1 master volume. */
   volume: number;
-  /** Steering assist (auto countersteer) on or off. */
+  /** Drift assist on or off. */
   assist: boolean;
-  /** Tones down bloom pulses, screen shake and flashes. */
+  /** Tones down bloom pulses, screen shake, flashes and UI glitches. */
   reducedFlash: boolean;
   /** All sound off (the volume setting is kept for when it is switched back on). */
   muted: boolean;
@@ -487,9 +624,9 @@ export interface RenderFrame {
   /** Latest simulated car state. */
   car: CarState;
   params: CarParams;
-  /** Weekly run state, or null in endless mode. */
+  /** Run state (weekly or level), or null in endless mode. */
   run: RunState | null;
-  /** Endless mode state, or null in a weekly run. */
+  /** Endless mode state, or null otherwise. */
   endless: EndlessState | null;
   /** Car height (CarState.y) interpolated like the pose, m. */
   height: number;
@@ -500,11 +637,11 @@ export interface RenderFrame {
 /** Implemented in src/render/renderer.ts. Owns the canvas, scene, locked camera and effects. */
 export interface GameRenderer {
   readonly canvas: HTMLCanvasElement;
-  /** Show a fixed weekly level (removes any endless chunks). */
+  /** Show a fixed level (weekly or one of the five; removes any endless chunks). */
   setLevel(level: Level): void;
   /** Switch to endless mode: remove the current level and all chunks, ready for addChunk. */
   beginEndless(): void;
-  /** Build and show one chunk of endless road (road, walls, props, decor, bumps). */
+  /** Build and show one chunk of endless road. */
   addChunk(chunk: TrackChunk): void;
   /** Remove a chunk and free its GPU resources. Unknown indices are ignored. */
   removeChunk(index: number): void;
@@ -518,16 +655,34 @@ export interface GameRenderer {
   dispose(): void;
 }
 
-export interface BestRecord {
-  /** Best time in ticks. */
+/** One finished weekly or level run. */
+export interface RunRecord {
   ticks: number;
-  driftScore: number;
+  score: number;
+  /** ISO date-time the run was set (game.ts stamps it). */
+  date: string;
   physicsVersion: number;
 }
 
-export interface EndlessBest {
-  /** Best distance, m. */
+/** One ended endless run. */
+export interface EndlessRecord {
   distance: number;
-  driftScore: number;
+  score: number;
+  ticks: number;
+  date: string;
   physicsVersion: number;
+}
+
+/** What is stored per weekly run / level: the fastest time and the top five scores. */
+export interface RunRecords {
+  bestTime: RunRecord | null;
+  /** Top five by score, highest first. */
+  highScores: RunRecord[];
+}
+
+/** What is stored per endless difficulty: the furthest distance and the top five scores. */
+export interface EndlessRecords {
+  bestDistance: EndlessRecord | null;
+  /** Top five by score, highest first. */
+  highScores: EndlessRecord[];
 }

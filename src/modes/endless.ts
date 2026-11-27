@@ -2,8 +2,10 @@
  * Mode 2: an endless road. Drive as far as you can.
  *
  * The road arrives in chunks from a generator and this mode keeps a window of them alive around the car. Three
- * hard hits end the run, and so does coming down outside the road after a jump. There are no checkpoints and no
- * reset: the score is the distance. Like the weekly run, the mode owns the rules and never touches car physics.
+ * hard hits end the run, and so does leaving the road: falling off an open edge or flying over a barrier ends it as
+ * soon as the car comes to rest on the city floor (the world keeps the car falling until then, so the player sees
+ * the drop). There are no checkpoints and no reset. Drift points are scored as in every mode (driftScore.ts); the
+ * distance is the other record. Like the weekly run, the mode owns the rules and never touches car physics.
  */
 import { createEndlessGenerator } from '../gen/endless';
 import { createEndlessWorld } from '../sim/endlessWorld';
@@ -19,7 +21,7 @@ import type {
   InputState,
 } from '../types';
 import { SIM_HZ } from '../types';
-import { DriftScorer } from './driftScore';
+import { createScoreState, loseMultiplier, resetScore, stepScore } from './driftScore';
 
 export const ENDLESS_COUNTDOWN_TICKS = 3 * SIM_HZ;
 export const ENDLESS_MAX_CRASHES = 3;
@@ -60,11 +62,7 @@ function freshState(difficulty: Difficulty): EndlessState {
     intensity: 0,
     lastTakeoffTick: -1,
     lastLandingTick: -1,
-    driftScore: 0,
-    chainScore: 0,
-    multiplier: 1,
-    drifting: false,
-    lastChainBreakTick: -1,
+    score: createScoreState(),
   };
 }
 
@@ -73,7 +71,7 @@ class Endless implements EndlessMode {
   readonly state: EndlessState;
   private readonly makeGenerator: () => EndlessGenerator;
   private generator: EndlessGenerator;
-  private readonly drift: DriftScorer;
+  private readonly flags = { crashed: false, lost: false };
   private readonly rollOutInput: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
   /** Index of the newest chunk handed to the world. */
   private newestChunk = -1;
@@ -88,7 +86,6 @@ class Endless implements EndlessMode {
     this.generator = makeGenerator();
     this.world = createEndlessWorld(this.generator.start, params);
     this.state = freshState(this.generator.difficulty);
-    this.drift = new DriftScorer(this.state);
     this.layFirstRoad();
   }
 
@@ -114,9 +111,7 @@ class Endless implements EndlessMode {
     state.deathCause = null;
     state.lastTakeoffTick = -1;
     state.lastLandingTick = -1;
-    state.driftScore = 0;
-    state.lastChainBreakTick = -1;
-    this.drift.clear();
+    resetScore(state.score);
     this.layFirstRoad();
   }
 
@@ -173,20 +168,24 @@ class Endless implements EndlessMode {
     }
 
     const hit = world.lastCollision;
-    this.drift.update(car, hit);
-    if (hit !== null && hit.impact >= CRASH_IMPACT && this.isNewAccident(approachSpeed)) {
+    const hard = hit !== null && hit.impact >= CRASH_IMPACT;
+    this.flags.crashed = hard;
+    this.flags.lost = false;
+    stepScore(state.score, car, world.wallDistance, state.ticks, this.flags);
+    if (hard && this.isNewAccident(approachSpeed)) {
       state.crashes++;
       state.lastCrashTick = state.ticks;
       this.crashDist = world.trackDist;
-      this.drift.lose();
       if (state.crashes >= ENDLESS_MAX_CRASHES) {
         this.die('crashes');
         return;
       }
     }
 
+    // The progress tracker can slide along the road while the car is in the air, so distance only counts once the
+    // car is back on its wheels: a jump that ends in a fall never pads the record.
     const travelled = world.trackDist - this.startDist;
-    if (travelled > state.distance) state.distance = travelled;
+    if (!car.airborne && !world.offTrack && travelled > state.distance) state.distance = travelled;
     this.streamChunks();
     state.intensity = this.liveIntensity();
   }
@@ -210,21 +209,20 @@ class Endless implements EndlessMode {
     world.dropChunksBefore(world.chunkIndex - CHUNKS_BEHIND);
   }
 
-  /** The run is over. A chain in progress dies with it: only banked points count. */
+  /** The run is over. The points scored are kept; the multiplier goes. */
   private die(cause: DeathCause): void {
     const state = this.state;
     state.phase = 'dead';
     state.deathCause = cause;
-    this.drift.lose();
+    loseMultiplier(state.score, state.ticks);
   }
 
   /**
-   * After the last crash the wreck brakes itself to a stop, whatever the player does. A car that came down
-   * outside the road stays where it landed: there is nothing out there to simulate.
+   * After the run ends the wreck brakes itself to a stop, whatever the player does: on the road after the last
+   * crash, or on the city floor where it came down.
    */
   private rollOut(): void {
     const world = this.world;
-    if (world.offTrack) return;
     const car = world.car;
     const braking = !car.reversing && Math.abs(car.forwardSpeed) > ROLL_OUT_BRAKE_SPEED;
     this.rollOutInput.brake = braking ? 1 : 0;
