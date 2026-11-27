@@ -15,6 +15,8 @@ interface DebugHandle {
   readonly level: Level | null;
   params: CarParams;
   renderer: GameRenderer;
+  /** The whole game, for driving its loop by hand in tests. */
+  game: Game;
 }
 
 declare global {
@@ -69,6 +71,7 @@ function exposeForDebugging(game: Game): void {
     },
     params: game.params,
     renderer: game.renderer,
+    game,
   };
 }
 

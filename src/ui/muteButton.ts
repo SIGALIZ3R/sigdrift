@@ -1,3 +1,4 @@
+import { markGlitch } from './glitch';
 import { el, injectStyles } from './styles';
 
 export interface MuteButtonOptions {
@@ -88,7 +89,7 @@ function speakerIcon(): SVGSVGElement {
 export function createMuteButton(root: HTMLElement, opts: MuteButtonOptions): MuteButton {
   injectStyles();
   let muted = !opts.muted;
-  const button = el('button', 'sd-ui sd-mute');
+  const button = markGlitch(el('button', 'sd-ui sd-mute'), 'soft');
   button.type = 'button';
   button.tabIndex = -1;
   button.appendChild(speakerIcon());

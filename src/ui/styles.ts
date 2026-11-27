@@ -367,15 +367,26 @@ export const UI_CSS = `
   background: radial-gradient(ellipse at center, rgba(4, 5, 12, 0.5), rgba(4, 5, 12, 0.88));
   pointer-events: auto;
 }
-.sd-menu-panel {
+/* The frame holds the border and never scrolls, so the glitch layers drawn over it stay put; the panel inside scrolls. */
+.sd-menu-frame {
+  position: relative;
+  display: flex;
+  flex-direction: column;
   width: min(100%, 60em);
+  min-height: 0;
   max-height: 100%;
+  /* Faint static scanlines, behind the text. */
+  background:
+    repeating-linear-gradient(to bottom, rgba(var(--sd-rgb), 0.028) 0 1px, rgba(0, 0, 0, 0) 1px 3px),
+    rgba(5, 7, 16, 0.94);
+}
+.sd-menu-frame.is-narrow { width: min(100%, 25em); }
+.sd-menu-panel {
+  min-height: 0;
   padding: clamp(1.1em, 4vw, 2em);
-  background: rgba(5, 7, 16, 0.94);
   overflow: auto;
   overscroll-behavior: contain;
 }
-.sd-menu-panel.is-narrow { width: min(100%, 25em); }
 .sd-screen { display: grid; gap: 1.5em; }
 .sd-logo {
   margin: 0;
@@ -404,6 +415,7 @@ export const UI_CSS = `
 .sd-title-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.4em 1.6em; }
 .sd-section { display: grid; gap: 0.6em; align-content: start; }
 .sd-mode {
+  position: relative;
   display: grid;
   grid-template-rows: auto 1fr auto;
   gap: 0.9em;
@@ -548,13 +560,145 @@ label.sd-setting { cursor: pointer; }
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.45; transform: scale(0.8); }
 }
+/* ---- Glitch bursts ---- */
+/* glitch.ts puts sd-g and one sd-g-* class on an element for a fraction of a second, with --g-* numbers of its own
+   each time. Only transform, opacity, clip-path and filter are animated, so nothing is laid out again or moves. */
+.sd-ui [data-text] { position: relative; }
+.sd-logo [data-text] { display: inline-block; }
+/* What a displaced strip of text is painted on: the surface under it, so the strip hides the text it came from. */
+.sd-mode { --g-bg: #07131c; }
+.sd-mode-endless { --g-bg: #12091a; }
+.sd-btn-primary { --g-bg: rgb(var(--sd-rgb)); }
+
+/* 1. RGB split: magenta and cyan ghosts either side, jumping between three offsets. */
+.sd-g-rgb { animation: sd-g-rgb var(--g-dur, 140ms) steps(1, end); }
+@keyframes sd-g-rgb {
+  0% {
+    filter: drop-shadow(var(--g-x) 0 0 rgba(255, 43, 214, 0.8)) drop-shadow(calc(var(--g-x) * -1) 0 0 rgba(51, 240, 255, 0.8));
+  }
+  35% {
+    filter: drop-shadow(calc(var(--g-x) * -0.6) var(--g-y, 0px) 0 rgba(255, 43, 214, 0.8))
+      drop-shadow(calc(var(--g-x) * 0.6) 0 0 rgba(51, 240, 255, 0.8));
+  }
+  65% {
+    filter: drop-shadow(calc(var(--g-x) * 0.35) 0 0 rgba(255, 43, 214, 0.8))
+      drop-shadow(calc(var(--g-x) * -0.35) calc(var(--g-y, 0px) * -1) 0 rgba(51, 240, 255, 0.8));
+  }
+  100% { filter: none; }
+}
+
+/* 2a. Slice, text: two copies of the text (from data-text) over the original, each cut to bands and pushed aside. */
+.sd-g-slice[data-text]::before, .sd-g-slice[data-text]::after,
+.sd-g-slice > [data-text]::before, .sd-g-slice > [data-text]::after {
+  content: attr(data-text);
+  content: attr(data-text) / "";
+  position: absolute;
+  /* As wide as the text and no wider, or a strip would run on across the panel. */
+  inset: 0 auto 0 0;
+  padding: inherit;
+  white-space: nowrap;
+  background: var(--g-bg, #05070f);
+  pointer-events: none;
+  animation: sd-g-shift var(--g-dur, 180ms) steps(1, end) both;
+}
+.sd-btn.sd-g-slice::before, .sd-btn.sd-g-slice::after { inset: 0; }
+.sd-g-slice[data-text]::before, .sd-g-slice > [data-text]::before {
+  --g-sx: var(--g-x1);
+  clip-path: inset(var(--g-t1) -1em calc(100% - var(--g-u1)) -1em);
+}
+.sd-g-slice[data-text]::after, .sd-g-slice > [data-text]::after {
+  --g-sx: var(--g-x2);
+  clip-path: polygon(
+    -1em var(--g-t2), calc(100% + 1em) var(--g-t2), calc(100% + 1em) var(--g-u2), -1em var(--g-u2),
+    -1em var(--g-t3), calc(100% + 1em) var(--g-t3), calc(100% + 1em) var(--g-u3), -1em var(--g-u3)
+  );
+}
+@keyframes sd-g-shift {
+  0% { transform: translateX(var(--g-sx)); }
+  45% { transform: translateX(calc(var(--g-sx) * -0.55)); }
+  75% { transform: translateX(calc(var(--g-sx) * 0.3)); }
+  100% { transform: translateX(calc(var(--g-sx) * 0.3)); opacity: 0; }
+}
+
+/* 2b. Slice, boxes: the outline is notched where a band has moved away, and a ghost of its edges shows where to. */
+.sd-g-pslice { animation: sd-g-notch var(--g-dur, 180ms) steps(1, end); }
+.sd-g-pslice::before, .sd-g-pslice::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border: solid rgba(var(--sd-rgb), 0.85);
+  border-width: 0 1px;
+  background: rgba(var(--sd-rgb), 0.05);
+  pointer-events: none;
+  animation: sd-g-ghost var(--g-dur, 180ms) steps(1, end) both;
+}
+.sd-g-pslice::before { --g-sx: var(--g-px); clip-path: var(--g-bands-r); }
+.sd-g-pslice::after { --g-sx: calc(var(--g-px) * -1); clip-path: var(--g-bands-l); }
+@keyframes sd-g-notch {
+  0% { clip-path: var(--g-clip); }
+  55% { clip-path: var(--g-clip2); }
+  85%, 100% { clip-path: none; }
+}
+@keyframes sd-g-ghost {
+  0% { transform: translateX(var(--g-sx)); }
+  55% { transform: translateX(calc(var(--g-sx) * 0.4)); }
+  85%, 100% { transform: none; opacity: 0; }
+}
+
+/* 3. Flicker: a failing tube. Two or three dips, never more, and never a whole menu panel. */
+.sd-g-flicker { animation: var(--g-name, sd-g-flicker-2) var(--g-dur, 140ms) steps(1, end); }
+@keyframes sd-g-flicker-2 {
+  0% { opacity: var(--g-dip, 0.7); }
+  22% { opacity: 1; }
+  48% { opacity: var(--g-dip2, 0.7); }
+  68%, 100% { opacity: 1; }
+}
+@keyframes sd-g-flicker-3 {
+  0% { opacity: var(--g-dip, 0.6); }
+  14% { opacity: 1; }
+  34% { opacity: var(--g-dip2, 0.6); }
+  50% { opacity: 1; }
+  72% { opacity: var(--g-dip, 0.6); }
+  86%, 100% { opacity: 1; }
+}
+
+/* 4. Scanline: one thin line with a short trail, top to bottom, once. */
+.sd-g-scan::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to bottom, rgba(var(--sd-rgb), 0), rgba(var(--sd-rgb), 0.16) calc(100% - 2px), rgb(var(--sd-rgb)) calc(100% - 2px))
+    0 0 / 100% 0.7em no-repeat;
+  pointer-events: none;
+  animation: sd-g-scan var(--g-dur, 260ms) linear both;
+}
+@keyframes sd-g-scan {
+  0% { transform: translateY(-0.7em); opacity: var(--g-a, 0.8); }
+  88% { opacity: var(--g-a, 0.8); }
+  100% { transform: translateY(calc(100% - 0.7em)); opacity: 0; }
+}
+
+/* 5. Skew jolt: a small snap sideways and back. */
+.sd-g-skew { animation: sd-g-skew var(--g-dur, 120ms) steps(1, end); }
+@keyframes sd-g-skew {
+  0% { transform: translateX(var(--g-x)) skewX(var(--g-skew)); }
+  40% { transform: translateX(calc(var(--g-x) * -0.5)) skewX(calc(var(--g-skew) * -0.4)); }
+  70%, 100% { transform: none; }
+}
+
 .sd-calm .sd-ui { --sd-pop: sd-fade; --sd-flash: sd-fade; --sd-pop-in: sd-fade-in; }
 .sd-calm .sd-hud-drift.is-live { box-shadow: 0 0 1.4em rgba(var(--sd-rgb), 0.16); }
 .sd-calm .sd-life.is-last, .sd-calm .sd-life.is-broken i { animation: none; }
+/* The glitcher schedules nothing in either case; this is for a burst caught in flight by the switch. */
+.sd-calm .sd-g { animation: none !important; }
+.sd-calm .sd-g::before, .sd-calm .sd-g::after,
+.sd-calm .sd-g > [data-text]::before, .sd-calm .sd-g > [data-text]::after { content: none !important; animation: none !important; }
 @media (prefers-reduced-motion: reduce) {
   .sd-ui { --sd-pop: sd-fade; --sd-flash: sd-fade; --sd-pop-in: sd-fade-in; }
   .sd-ui, .sd-ui *, .sd-ui *::before, .sd-ui *::after { transition: none !important; }
   .sd-life.is-last, .sd-life.is-broken i { animation: none; }
+  .sd-g { animation: none !important; }
+  .sd-g::before, .sd-g::after, .sd-g > [data-text]::before, .sd-g > [data-text]::after { content: none !important; animation: none !important; }
 }
 @media (max-width: 760px) {
   .sd-title-grid { grid-template-columns: minmax(0, 1fr); }

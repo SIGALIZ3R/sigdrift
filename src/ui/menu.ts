@@ -1,5 +1,6 @@
 import type { BestRecord, DeathCause, Difficulty, EndlessBest, Quality, Settings } from '../types';
 import { formatDelta, formatDistance, formatScore, formatTime } from './format';
+import { markGlitch, markGlitchCover } from './glitch';
 import { announceMute, onMuteChange } from './muteButton';
 import { DIFFICULTIES, loadEndlessDifficulty, saveEndlessDifficulty } from './storage';
 import { el, injectStyles } from './styles';
@@ -97,6 +98,11 @@ const CONTROLS: readonly (readonly [action: string, keyboard: string, gamepad: s
   ['Mute', 'M', '—'],
 ];
 
+/** The main action of a screen. The glitcher may pick these buttons; the lesser ones it leaves alone. */
+const PRIMARY_BUTTON = 'sd-btn-primary';
+/** How much more often the logo glitches than any other element on the screen. */
+const LOGO_GLITCH_WEIGHT = 3;
+
 const DEATH_HEADLINES: Record<DeathCause, string> = { offTrack: 'Off the road', crashes: 'Wrecked' };
 const DEATH_REASONS: Record<DeathCause, string> = {
   offTrack: 'You landed outside the road',
@@ -115,12 +121,18 @@ function button(label: string, onClick: () => void, variant = ''): HTMLButtonEle
   const node = el('button', variant ? `sd-btn ${variant}` : 'sd-btn', label);
   node.type = 'button';
   node.addEventListener('click', onClick);
+  if (variant === PRIMARY_BUTTON) markGlitch(node, 'full', { text: label });
   return node;
+}
+
+/** A heading the glitcher may pick. Its text never changes, so the slice effect can copy it. */
+function glitchHeading<K extends 'h1' | 'h2' | 'h3'>(tag: K, className: string, text: string): HTMLElementTagNameMap[K] {
+  return markGlitch(el(tag, className, text), 'full', { text });
 }
 
 function section(title: string, ...children: Node[]): HTMLElement {
   const node = el('section', 'sd-section');
-  node.append(el('h2', 'sd-label', title), ...children);
+  node.append(glitchHeading('h2', 'sd-label', title), ...children);
   return node;
 }
 
@@ -239,16 +251,22 @@ function settingsSection(
 
 function logo(): HTMLElement {
   const header = el('header');
-  const name = el('h1', 'sd-logo', 'Sig');
+  const name = el('h1', 'sd-logo');
   name.setAttribute('aria-label', 'SigDRIFT');
-  name.append(el('b', '', 'DRIFT'));
+  // Both halves carry their own text, so a slice band can cross the whole name. It glitches more than the rest.
+  for (const [tag, text] of [['span', 'Sig'], ['b', 'DRIFT']] as const) {
+    const half = el(tag, '', text);
+    half.setAttribute('data-text', text);
+    name.appendChild(half);
+  }
+  markGlitch(name, 'full', { weight: LOGO_GLITCH_WEIGHT });
   header.append(name, el('p', 'sd-label sd-tagline', 'One car · one neon city · a new run every week'));
   return header;
 }
 
 function modeHead(title: string, detail?: string): HTMLElement {
   const head = el('div', 'sd-mode-head');
-  head.append(el('h2', 'sd-label', title));
+  head.append(glitchHeading('h2', 'sd-label', title));
   if (detail) head.append(el('span', 'sd-num', detail));
   return head;
 }
@@ -273,21 +291,21 @@ function pastWeeks(data: TitleData, onPlay: (weekId: string) => void): HTMLEleme
     list.appendChild(row);
   }
   const box = el('div', 'sd-section');
-  box.append(el('h3', 'sd-label', 'Past weeks'), list);
+  box.append(glitchHeading('h3', 'sd-label', 'Past weeks'), list);
   return box;
 }
 
 function weeklyMode(data: TitleData, drive: HTMLButtonElement, onPlay: (weekId: string) => void): HTMLElement {
   const body = el('div', 'sd-mode-body');
   if (data.pastWeeks.length > 0) body.append(pastWeeks(data, onPlay));
-  const box = el('section', 'sd-mode');
+  const box = markGlitch(el('section', 'sd-mode'), 'full', { kind: 'panel' });
   box.append(modeHead('Weekly run', data.currentWeek), body, featureRow(bestText(data.bests[data.currentWeek]), drive).row);
   return box;
 }
 
 function endlessMode(data: TitleData, onPlayEndless: (difficulty: Difficulty) => void): HTMLElement {
   let difficulty = loadEndlessDifficulty();
-  const go = button('Go endless', () => onPlayEndless(difficulty), 'sd-btn-primary');
+  const go = button('Go endless', () => onPlayEndless(difficulty), PRIMARY_BUTTON);
   const feature = featureRow(bestDistanceText(data.endlessBests[difficulty]), go);
   const picker = segmented(
     'Difficulty',
@@ -302,7 +320,7 @@ function endlessMode(data: TitleData, onPlayEndless: (difficulty: Difficulty) =>
   );
   const body = el('div', 'sd-mode-body');
   body.append(el('p', 'sd-mode-text', ENDLESS_PITCH), picker);
-  const box = el('section', 'sd-mode sd-mode-endless');
+  const box = markGlitch(el('section', 'sd-mode sd-mode-endless'), 'full', { kind: 'panel' });
   box.append(modeHead('Endless'), body, feature.row);
   return box;
 }
@@ -328,7 +346,7 @@ function titleScreen(
   callbacks: Pick<MenuCallbacks, 'onPlay' | 'onPlayEndless'>,
   onSettings: (settings: Settings) => void,
 ): Screen {
-  const drive = button('Drive', () => callbacks.onPlay(data.currentWeek), 'sd-btn-primary');
+  const drive = button('Drive', () => callbacks.onPlay(data.currentWeek), PRIMARY_BUTTON);
   const modes = el('div', 'sd-title-grid');
   modes.append(weeklyMode(data, drive, callbacks.onPlay), endlessMode(data, callbacks.onPlayEndless));
   const settings = settingsSection(data.settings, onSettings);
@@ -353,12 +371,12 @@ function pauseScreen(
   callbacks: Pick<MenuCallbacks, 'onResume' | 'onRestart' | 'onQuit'>,
   onSettings: (settings: Settings) => void,
 ): Screen {
-  const resume = button('Resume', callbacks.onResume, 'sd-btn-primary');
+  const resume = button('Resume', callbacks.onResume, PRIMARY_BUTTON);
   const actions = el('div', 'sd-actions');
   actions.append(resume, button('Restart', callbacks.onRestart), button('Quit to menu', callbacks.onQuit));
   const settings = settingsSection(initial, onSettings);
   const content = el('div', 'sd-screen');
-  content.append(el('h1', 'sd-heading', 'Paused'), actions, settings.node);
+  content.append(glitchHeading('h1', 'sd-heading', 'Paused'), actions, settings.node);
   return {
     content,
     primary: resume,
@@ -403,20 +421,25 @@ function endOfRunActions(callbacks: Pick<MenuCallbacks, 'onRestart' | 'onQuit'>)
   node: HTMLElement;
   retry: HTMLButtonElement;
 } {
-  const retry = button('Retry', callbacks.onRestart, 'sd-btn-primary');
+  const retry = button('Retry', callbacks.onRestart, PRIMARY_BUTTON);
   const node = el('div', 'sd-actions');
   node.append(retry, button('Menu', callbacks.onQuit));
   return { node, retry };
 }
 
+/** The big time or distance a result screen is about. */
+function headlineValue(text: string): HTMLElement {
+  return markGlitch(el('div', 'sd-num sd-finish-time', text), 'full', { text });
+}
+
 function finishScreen(result: FinishResult, callbacks: Pick<MenuCallbacks, 'onRestart' | 'onQuit'>): Screen {
   const head = el('div', 'sd-finish-head');
-  head.append(el('h1', 'sd-label', `Run complete — ${result.levelId}`));
+  head.append(glitchHeading('h1', 'sd-label', `Run complete — ${result.levelId}`));
   if (result.tuned) head.append(el('span', 'sd-badge sd-badge-muted', 'TUNED CAR — TIME NOT SAVED'));
   else if (result.isNewBest) head.append(el('span', 'sd-badge', 'NEW BEST'));
   const actions = endOfRunActions(callbacks);
   const content = el('div', 'sd-screen');
-  content.append(head, el('div', 'sd-num sd-finish-time', formatTime(result.ticks)), finishStats(result), actions.node);
+  content.append(head, headlineValue(formatTime(result.ticks)), finishStats(result), actions.node);
   return {
     content,
     primary: actions.retry,
@@ -459,7 +482,7 @@ function gameOverScreen(result: GameOverResult, callbacks: Pick<MenuCallbacks, '
   if (result.tuned) head.append(el('span', 'sd-badge sd-badge-muted', 'TUNED CAR — NOT SAVED'));
   else if (result.isNewBest) head.append(el('span', 'sd-badge', 'NEW BEST'));
 
-  const headline = el('h1', 'sd-over-title', DEATH_HEADLINES[result.cause]);
+  const headline = glitchHeading('h1', 'sd-over-title', DEATH_HEADLINES[result.cause]);
   headline.classList.toggle('is-off-road', result.cause === 'offTrack');
   const over = el('div', 'sd-over');
   over.append(headline, el('p', 'sd-label', DEATH_REASONS[result.cause]));
@@ -469,7 +492,7 @@ function gameOverScreen(result: GameOverResult, callbacks: Pick<MenuCallbacks, '
   content.append(
     head,
     over,
-    el('div', 'sd-num sd-finish-time', formatDistance(result.distance)),
+    headlineValue(formatDistance(result.distance)),
     gameOverStats(result),
     actions.node,
   );
@@ -486,11 +509,15 @@ function gameOverScreen(result: GameOverResult, callbacks: Pick<MenuCallbacks, '
 
 export function createMenu(root: HTMLElement, callbacks: MenuCallbacks): Menu {
   injectStyles();
-  const overlay = el('div', 'sd-ui sd-menu sd-hidden');
+  // While a menu is up the HUD behind it is dimmed, so the glitcher leaves the HUD's readouts alone.
+  const overlay = markGlitchCover(el('div', 'sd-ui sd-menu sd-hidden'));
   overlay.setAttribute('role', 'dialog');
   overlay.setAttribute('aria-modal', 'true');
-  const panel = el('div', 'sd-panel sd-menu-panel');
-  overlay.appendChild(panel);
+  // The frame is the box the player sees; the panel inside it is what scrolls when a screen is taller than the window.
+  const frame = markGlitch(el('div', 'sd-panel sd-menu-frame'), 'full', { kind: 'frame' });
+  const panel = el('div', 'sd-menu-panel');
+  frame.appendChild(panel);
+  overlay.appendChild(frame);
   root.appendChild(overlay);
 
   let open = false;
@@ -532,7 +559,7 @@ export function createMenu(root: HTMLElement, callbacks: MenuCallbacks): Menu {
 
   function show(screen: Screen): void {
     panel.replaceChildren(screen.content);
-    panel.classList.toggle('is-narrow', screen.narrow);
+    frame.classList.toggle('is-narrow', screen.narrow);
     panel.scrollTop = 0;
     overlay.setAttribute('aria-label', screen.label);
     overlay.classList.remove('sd-hidden');

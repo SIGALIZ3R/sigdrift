@@ -30,6 +30,7 @@ import type {
   Settings,
   World,
 } from './types';
+import { createGlitcher } from './ui/glitch';
 import { createHud } from './ui/hud';
 import type { Hud } from './ui/hud';
 import { createMenu } from './ui/menu';
@@ -192,6 +193,8 @@ export class Game {
         this.runTuned = true;
       },
     });
+    // Glitch accents on whatever UI is on screen. Like the rest of the game, it lives as long as the page does.
+    createGlitcher(opts.ui);
     // Includes the mute state, so a game that starts muted is silent before its first sound.
     this.applySettings(this.settings);
 

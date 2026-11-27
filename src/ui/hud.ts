@@ -1,6 +1,7 @@
 import { SIM_HZ } from '../types';
 import type { BestRecord, CarState, Difficulty, EndlessBest, EndlessState, RunState } from '../types';
 import { formatDistance, formatScore, formatTime } from './format';
+import { markGlitch, markGlitchUnder } from './glitch';
 import { el, injectStyles, replayAnimation } from './styles';
 
 export interface HudInfo {
@@ -131,8 +132,9 @@ interface Shown {
 
 function buildTop(view: Partial<HudView>): HTMLElement {
   const top = el('div', 'sd-hud-top');
-  view.week = el('div', 'sd-label');
-  view.timer = el('div', 'sd-num sd-hud-timer', formatTime(0));
+  // The glitcher only ever plays its gentlest effects on the readouts ("soft"), and none that would need their text.
+  view.week = markGlitch(el('div', 'sd-label'), 'soft');
+  view.timer = markGlitch(el('div', 'sd-num sd-hud-timer', formatTime(0)), 'soft');
   const meta = el('div', 'sd-hud-meta');
   view.checkpoint = el('span', 'sd-label sd-hud-cp');
   view.best = el('span', 'sd-label');
@@ -156,7 +158,7 @@ function buildEndlessTop(view: Partial<HudView>): HTMLElement {
   level.append(view.difficulty, meter);
   view.distanceValue = el('span', '', '0');
   view.distanceUnit = el('span', 'sd-hud-unit', 'm');
-  view.distance = el('div', 'sd-num sd-hud-timer sd-hud-dist');
+  view.distance = markGlitch(el('div', 'sd-num sd-hud-timer sd-hud-dist'), 'soft');
   view.distance.append(view.distanceValue, view.distanceUnit);
   view.endlessBest = el('div', 'sd-label');
   top.append(level, view.distance, view.endlessBest);
@@ -165,7 +167,8 @@ function buildEndlessTop(view: Partial<HudView>): HTMLElement {
 }
 
 function buildLives(view: Partial<HudView>): HTMLElement {
-  view.lives = el('div', 'sd-hud-lives sd-hidden');
+  // The row is the target, not the pips: they are rebuilt when the number of lives changes.
+  view.lives = markGlitch(el('div', 'sd-hud-lives sd-hidden'), 'soft');
   return view.lives;
 }
 
@@ -192,7 +195,7 @@ function buildCentre(view: Partial<HudView>): HTMLElement {
 }
 
 function buildDrift(view: Partial<HudView>): HTMLElement {
-  const drift = el('div', 'sd-panel sd-hud-drift');
+  const drift = markGlitch(el('div', 'sd-panel sd-hud-drift'), 'soft', { kind: 'panel' });
   const chain = el('div', 'sd-hud-chain is-empty');
   view.chainPoints = el('span', 'sd-num sd-hud-chain-pts', '0');
   view.multiplier = el('span', 'sd-num sd-hud-mult', '×1.0');
@@ -209,14 +212,15 @@ function buildDrift(view: Partial<HudView>): HTMLElement {
 
 function buildSpeed(view: Partial<HudView>): HTMLElement {
   const speed = el('div', 'sd-panel sd-hud-speed');
-  view.speed = el('span', 'sd-num sd-hud-speed-value', '0');
+  view.speed = markGlitch(el('span', 'sd-num sd-hud-speed-value', '0'), 'soft');
   speed.append(view.speed, el('span', 'sd-label', 'km/h'));
   return speed;
 }
 
 function buildView(): HudView {
   const view: Partial<HudView> = {};
-  const root = el('div', 'sd-ui sd-hud');
+  // Under a pause or result menu the readouts are dimmed: no glitch is spent on them there.
+  const root = markGlitchUnder(el('div', 'sd-ui sd-hud'));
   root.append(
     buildTop(view),
     buildEndlessTop(view),
