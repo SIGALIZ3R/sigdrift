@@ -1,4 +1,6 @@
 import type { CarParams, CarState } from '../types';
+import { STOCK_ENGINE } from './engineSounds';
+import type { EngineSound } from './engineSounds';
 import { createEngineTone, engineTone, engineWave, gritCurve, slopeStrain } from './mapping';
 import type { EngineWaveKind } from './mapping';
 import { createGlide } from './param';
@@ -10,6 +12,8 @@ export interface EngineVoice {
   /** Engine speed and gear (0-based, -1 = reverse) as last updated. */
   readonly rpm: number;
   readonly gear: number;
+  /** Switches to another car's engine character (engineSounds.ts); takes effect on the next update. */
+  setSound(sound: Readonly<EngineSound>): void;
   dispose(): void;
 }
 
@@ -53,6 +57,14 @@ const FLUTTER_SPREAD = 0.045;
 const PITCH_WANDER = 0.005;
 /** How quickly the engine's strain follows a change of slope, 1/s: a crest is felt over a few tenths of a second. */
 const STRAIN_RATE = 6;
+/** Electric whine: its pitch at a standstill and how much it rises per m/s of road speed, Hz. */
+const WHINE_BASE_HZ = 140;
+const WHINE_HZ_PER_MS = 26;
+/** Whine level at full throttle, and the share of it left off the throttle. */
+const WHINE_LEVEL = 0.16;
+const WHINE_COAST = 0.35;
+/** The exhaust low-pass never opens past this, Hz. */
+const MAX_CUTOFF = 11000;
 
 function periodicWave(ctx: BaseAudioContext, kind: EngineWaveKind): PeriodicWave {
   const table = engineWave(kind);
@@ -158,6 +170,23 @@ export function createEngineVoice(ctx: BaseAudioContext, noise: AudioBuffer, des
   const sawLow = saw(-SAW_DETUNE_CENTS);
   const sawHigh = saw(SAW_DETUNE_CENTS);
 
+  // ---- electric whine: a sine and a quiet fifth above, through a gain -> output --------------------------------
+  const whineGain = ctx.createGain();
+  whineGain.gain.value = 0;
+  whineGain.connect(output);
+  function whineOsc(type: OscillatorType, ratio: number, level: number): OscillatorNode {
+    const oscillator = ctx.createOscillator();
+    oscillator.type = type;
+    oscillator.frequency.value = WHINE_BASE_HZ * ratio;
+    const gain = ctx.createGain();
+    gain.gain.value = level;
+    oscillator.connect(gain).connect(whineGain);
+    sources.push(oscillator);
+    return oscillator;
+  }
+  const whineLow = whineOsc('sine', 1, 1);
+  const whineHigh = whineOsc('triangle', 1.5, 0.3);
+
   // One start time for all of them: the three cycle oscillators must stay in phase with each other.
   const startAt = ctx.currentTime;
   noiseSource.start(startAt, 0.37);
@@ -176,6 +205,10 @@ export function createEngineVoice(ctx: BaseAudioContext, noise: AudioBuffer, des
   const sawLevel = createGlide(sawGain.gain);
   const sawCutoff = createGlide(sawFilter.frequency);
   const outputLevel = createGlide(output.gain);
+  const whineLowPitch = createGlide(whineLow.frequency);
+  const whineHighPitch = createGlide(whineHigh.frequency);
+  const whineLevel = createGlide(whineGain.gain);
+  let sound: Readonly<EngineSound> = STOCK_ENGINE;
 
   const powertrain = createPowertrain();
   const driveInput = createDriveInput();
@@ -203,22 +236,33 @@ export function createEngineVoice(ctx: BaseAudioContext, noise: AudioBuffer, des
       engineTone(powertrain.rpm, powertrain.torque, powertrain.gate, flutter, mix, strain);
 
       const wander = active ? 1 + PITCH_WANDER * (flutter - 0.5) : 1;
-      const cycleHz = mix.cycleHz * wander;
-      const firingHz = mix.firingHz * wander;
+      const cycleHz = mix.cycleHz * wander * sound.pitch;
+      const firingHz = mix.firingHz * wander * sound.pitch;
       loadPitch.to(cycleHz, now, PITCH_SMOOTH);
       coastPitch.to(cycleHz, now, PITCH_SMOOTH);
       pulsePitch.to(cycleHz, now, PITCH_SMOOTH);
       sawLowPitch.to(firingHz, now, PITCH_SMOOTH);
       sawHighPitch.to(firingHz, now, PITCH_SMOOTH);
 
-      loadLevel.to(mix.loadGain, now, TONE_SMOOTH);
-      coastLevel.to(mix.coastGain, now, TONE_SMOOTH);
-      noiseLevel.to(mix.noiseGain, now, TONE_SMOOTH);
-      driveLevel.to(mix.drive, now, TONE_SMOOTH);
-      toneCutoff.to(mix.cutoff, now, TONE_SMOOTH);
-      sawLevel.to(mix.sawGain, now, TONE_SMOOTH);
-      sawCutoff.to(mix.sawCutoff, now, TONE_SMOOTH);
-      outputLevel.to(active ? mix.level : 0, now, active ? LEVEL_SMOOTH : FADE_SMOOTH);
+      const burn = sound.combustion;
+      loadLevel.to(mix.loadGain * burn, now, TONE_SMOOTH);
+      coastLevel.to(mix.coastGain * burn, now, TONE_SMOOTH);
+      noiseLevel.to(mix.noiseGain * burn * sound.noise, now, TONE_SMOOTH);
+      driveLevel.to(mix.drive * sound.grit, now, TONE_SMOOTH);
+      toneCutoff.to(Math.min(MAX_CUTOFF, mix.cutoff * sound.tone), now, TONE_SMOOTH);
+      sawLevel.to(mix.sawGain * sound.saw, now, TONE_SMOOTH);
+      sawCutoff.to(Math.min(MAX_CUTOFF, mix.sawCutoff * sound.tone), now, TONE_SMOOTH);
+      outputLevel.to(active ? mix.level * sound.level : 0, now, active ? LEVEL_SMOOTH : FADE_SMOOTH);
+
+      // The motor whine follows the road speed directly: an electric car has no gears to hear.
+      const whineHz = WHINE_BASE_HZ + WHINE_HZ_PER_MS * Math.abs(car.speed || 0);
+      whineLowPitch.to(whineHz, now, PITCH_SMOOTH);
+      whineHighPitch.to(whineHz * 1.5, now, PITCH_SMOOTH);
+      const push = WHINE_COAST + (1 - WHINE_COAST) * Math.min(1, Math.max(0, car.throttle || 0));
+      whineLevel.to(sound.whine * WHINE_LEVEL * push, now, TONE_SMOOTH);
+    },
+    setSound(next) {
+      sound = next;
     },
     get rpm() {
       return powertrain.rpm;

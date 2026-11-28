@@ -705,6 +705,9 @@ export const UI_CSS = `
 .sd-car-phantom { --sd-rgb: 51, 240, 255; }
 .sd-car-viper { --sd-rgb: 255, 43, 214; }
 .sd-car-brute { --sd-rgb: 255, 182, 46; }
+.sd-car-ronin { --sd-rgb: 157, 255, 0; }
+.sd-car-halo { --sd-rgb: 232, 244, 255; }
+.sd-car-kaiju { --sd-rgb: 150, 110, 255; }
 .sd-car-stats { display: grid; gap: 0.35em; margin-top: auto; }
 .sd-car-stat { display: grid; grid-template-columns: 5.2em auto; align-items: center; }
 .sd-car-tag { position: absolute; top: 1.2em; right: 1.1em; font-size: 0.62em; letter-spacing: 0.22em; color: rgb(var(--sd-rgb)); visibility: hidden; }

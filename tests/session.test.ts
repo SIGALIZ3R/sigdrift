@@ -316,7 +316,7 @@ describe('track session', () => {
     expect(renderer.begun + renderer.added).toBe(0);
   });
 
-  it('unlocks the Viper on finishing level 3 and says so on the finish screen, once', () => {
+  it('unlocks the Viper and Ronin on finishing level 3 and says so on the finish screen, once', () => {
     const finishAs = (trackId: string): FinishResult => {
       const { deps } = rig();
       const level = straightLevel();
@@ -330,7 +330,7 @@ describe('track session', () => {
       return showFinish.mock.calls[0][0];
     };
     expect(finishAs('L2').unlockedCars).toEqual([]);
-    expect(finishAs('L3').unlockedCars).toEqual(['Viper']);
+    expect(finishAs('L3').unlockedCars).toEqual(['Viper', 'Ronin']);
     expect(finishAs('L3').unlockedCars).toEqual([]);
     expect(storage.items.get('sigdrift:completedLevels')).toBe(JSON.stringify(['L2', 'L3']));
   });

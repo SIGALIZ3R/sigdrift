@@ -3,7 +3,7 @@
  * flying over barriers, the distance to the nearest wall, progress through a crossing on the endless road, and
  * equivalence with the old flat simulation.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, inject, it } from 'vitest';
 import type { CarState, EndlessWorld, InputState, Level, SimBase, TrackChunk, World } from '../../src/types';
 import { DT, TERRAIN_Y } from '../../src/types';
 import { atan2, wrapAngle } from '../../src/core/fixedMath';
@@ -454,7 +454,7 @@ describe('a flat level at y = 0', () => {
 });
 
 describe('speed', () => {
-  it('steps a world on a layered level quickly', () => {
+  it.skipIf(inject('coverage'))('steps a world on a layered level quickly', () => {
     const world = worldOn(makeCrossingLevel(true));
     const rng = new Rng('speed');
     const inputs: InputState[] = [];
@@ -470,6 +470,7 @@ describe('speed', () => {
     run(20000);
     const micros = Math.min(run(60000), run(60000));
     console.log(`world.step: ${micros.toFixed(2)} us per tick`);
-    expect(micros).toBeLessThan(40);
+    // Shared CI runners are slower and busier than a desktop: twice the budget there.
+    expect(micros).toBeLessThan(process.env.CI ? 80 : 40);
   });
 });

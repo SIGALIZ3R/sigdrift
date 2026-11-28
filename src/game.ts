@@ -1,5 +1,6 @@
 import { createAudio } from './audio/mixer';
 import type { GameAudio } from './audio/mixer';
+import { engineSoundFor } from './audio/engineSounds';
 import { SONGS } from './audio/music';
 import { lerp, lerpAngle } from './core/fixedMath';
 import { createFixedLoop } from './core/loop';
@@ -427,6 +428,7 @@ export class Game {
     Object.assign(this.params, car.params, { steerAssist: assist });
     Object.assign(this.tuningDefaults, car.params, { steerAssist: assist });
     this.renderer.setCarStyle(car.id);
+    this.audio.setEngineSound(engineSoundFor(car.id));
   }
 
   /** A mute change that did not come through a menu: the corner button or the M key. */

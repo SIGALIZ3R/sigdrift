@@ -40,19 +40,19 @@ describe('completed levels', () => {
     expect(loadCar()).toBe('phantom');
   });
 
-  it('unlocks the Viper when level 3 is finished, once', () => {
+  it('unlocks the Viper and Ronin when level 3 is finished, once', () => {
     expect(markLevelCompleted('L1')).toEqual([]);
     expect(markLevelCompleted('L2')).toEqual([]);
-    expect(markLevelCompleted('L3')).toEqual(['viper']);
+    expect(markLevelCompleted('L3')).toEqual(['viper', 'ronin']);
     expect(markLevelCompleted('L3')).toEqual([]);
-    expect(unlockedCarIds()).toEqual(['phantom', 'viper']);
+    expect(unlockedCarIds()).toEqual(['phantom', 'viper', 'ronin']);
   });
 
-  it('unlocks the Brute when level 5 is finished, whatever came before', () => {
-    expect(markLevelCompleted('L5')).toEqual(['brute']);
-    expect(unlockedCarIds()).toEqual(['phantom', 'brute']);
+  it('unlocks the Brute, Halo and Kaiju when level 5 is finished, whatever came before', () => {
+    expect(markLevelCompleted('L5')).toEqual(['brute', 'halo', 'kaiju']);
+    expect(unlockedCarIds()).toEqual(['phantom', 'brute', 'halo', 'kaiju']);
     markLevelCompleted('L3');
-    expect(unlockedCarIds()).toEqual(['phantom', 'viper', 'brute']);
+    expect(unlockedCarIds()).toEqual(['phantom', 'viper', 'brute', 'ronin', 'halo', 'kaiju']);
   });
 
   it('counts a level with a stored best time as finished (players from before the garage)', () => {

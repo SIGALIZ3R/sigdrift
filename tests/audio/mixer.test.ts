@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BLIP_KINDS, createAudio } from '../../src/audio/mixer';
 import type { BlipKind, GameAudio } from '../../src/audio/mixer';
 import { CLIP_CEILING, OUTPUT_TRIM } from '../../src/audio/mapping';
+import { STOCK_ENGINE, engineSoundFor } from '../../src/audio/engineSounds';
+import type { EngineSound } from '../../src/audio/engineSounds';
+import { CARS } from '../../src/sim/cars';
 import { DEFAULT_CAR_PARAMS } from '../../src/sim/params';
 import type { CarState } from '../../src/types';
 import { FakeAudioContext, FakeNode } from './fakeAudio';
@@ -222,7 +225,9 @@ describe('audio graph', () => {
     const saws = oscillators.filter((o) => o.type === 'sawtooth');
     expect(custom).toHaveLength(3);
     expect(saws).toHaveLength(2);
-    expect(oscillators).toHaveLength(5);
+    // Plus the electric whine (a sine and a triangle), silent unless the car is electric.
+    expect(oscillators.filter((o) => o.type === 'sine' || o.type === 'triangle')).toHaveLength(2);
+    expect(oscillators).toHaveLength(7);
     // Same start, same frequency: they can never drift apart.
     expect(new Set(custom.map((o) => o.startTime)).size).toBe(1);
     expect(new Set(custom.map((o) => o.params.frequency.value)).size).toBe(1);
@@ -368,8 +373,10 @@ describe('audio.update', () => {
     expect(tone.params.frequency.settled).toBeGreaterThan(coastCutoff + 500);
   });
 
-  it('only ever schedules smooth glides with sane values', () => {
+  /** Every parameter change is a smooth glide to a sane value, for the given engine character. */
+  function checkGlides(sound: Readonly<EngineSound>): void {
     const { audio, ctx } = started();
+    audio.setEngineSound(sound);
     const states = [
       car(),
       car({ speed: 8, forwardSpeed: 8, throttle: 1, rearSlide: 0.6, driftAngle: 0.3 }),
@@ -377,7 +384,7 @@ describe('audio.update', () => {
       car({ speed: 30, forwardSpeed: 28, handbrake: true, rearSlide: 1 }),
       car({ speed: 25, forwardSpeed: 25, throttle: 1, airborne: true, y: 1.2, vy: 3 }),
       car({ speed: 4, forwardSpeed: -4, brake: 1, reversing: true }),
-      car({ speed: 40, forwardSpeed: 40 }),
+      car({ speed: 45, forwardSpeed: 45, throttle: 1 }),
     ];
     for (const state of states) drive(audio, ctx, state, 45);
     drive(audio, ctx, states[2], 20, false);
@@ -394,8 +401,14 @@ describe('audio.update', () => {
             expect(event.value).toBeLessThan(12000);
           }
           if (node.kind === 'oscillator' && param.name === 'frequency') {
-            expect(event.value).toBeGreaterThanOrEqual((900 / 120) * 0.997);
-            expect(event.value).toBeLessThanOrEqual((7500 / 30) * 1.003);
+            if (node.type === 'sine' || node.type === 'triangle') {
+              // The electric whine: a low hum at rest up to a high whine at top speed.
+              expect(event.value).toBeGreaterThanOrEqual(100);
+              expect(event.value).toBeLessThanOrEqual(2500);
+            } else {
+              expect(event.value).toBeGreaterThanOrEqual((900 / 120) * 0.997 * Math.min(1, sound.pitch));
+              expect(event.value).toBeLessThanOrEqual((7500 / 30) * 1.003 * Math.max(1, sound.pitch));
+            }
           }
           if (param.name === 'gain') {
             expect(event.value).toBeGreaterThanOrEqual(0);
@@ -405,6 +418,14 @@ describe('audio.update', () => {
       }
     }
     expect(events).toBeGreaterThan(100);
+  }
+
+  it('only ever schedules smooth glides with sane values', () => {
+    checkGlides(STOCK_ENGINE);
+  });
+
+  it.each(CARS.map((c) => c.id))('keeps the %s engine smooth and sane too', (id) => {
+    checkGlides(engineSoundFor(id));
   });
 
   it('schedules nothing while nothing changes', () => {

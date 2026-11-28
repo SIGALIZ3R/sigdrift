@@ -1000,7 +1000,7 @@ export function createMenu(root: HTMLElement, callbacks: MenuCallbacks, initialC
     // From a finish screen BACK leaves the finished run the way MENU does.
     const back = fromFinish ? act(callbacks.onQuit) : (): void => showMain('garage');
     const content = el('div', 'sd-screen');
-    const note = el('p', 'sd-muted', 'Every car has the same top speed. They differ in launch, grip and how they slide.');
+    const note = el('p', 'sd-muted', 'Every car has the same top speed. Each one looks, sounds and slides its own way.');
     content.append(screenHead('Garage', back, 'Pick a car'), cards, note);
     show(
       {

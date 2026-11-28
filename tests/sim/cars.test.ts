@@ -13,26 +13,38 @@ import { quantizeInput } from '../../src/sim/replay';
 import { createWorld } from '../../src/sim/world';
 import { ASSIST_STRENGTH, cloneParams } from '../../src/sim/params';
 import { SIM_HZ } from '../../src/types';
-import { CORNER_DRIVER, driveCorner, measureLaunchLine, measureSustained, measureTurnIn, variations } from './handlingDrivers';
+import {
+  CORNER_DRIVER,
+  driveCorner,
+  measureHandbrakeTap,
+  measureLaunchLine,
+  measureSustained,
+  measureTurnIn,
+  variations,
+} from './handlingDrivers';
 
 const viper = getCar('viper').params;
 const brute = getCar('brute').params;
+const ronin = getCar('ronin').params;
+const halo = getCar('halo').params;
+const kaiju = getCar('kaiju').params;
 
 describe('garage data', () => {
-  it('has three cars, the first being the stock car', () => {
-    expect(CARS.map((car) => car.id)).toEqual(['phantom', 'viper', 'brute']);
+  it('has six cars, the first being the stock car', () => {
+    expect(CARS.map((car) => car.id)).toEqual(['phantom', 'viper', 'brute', 'ronin', 'halo', 'kaiju']);
+    expect(new Set(CARS.map((car) => car.name)).size).toBe(6);
     expect(CARS[0].params).toBe(DEFAULT_CAR_PARAMS);
     expect(DEFAULT_CAR).toBe('phantom');
   });
 
-  it('unlocks the Viper with level 3 and the Brute with level 5', () => {
-    expect(getCar('viper').unlockLevel).toBe('L3');
-    expect(getCar('brute').unlockLevel).toBe('L5');
+  it('unlocks the Viper and Ronin with level 3, the Brute, Halo and Kaiju with level 5', () => {
+    expect(CARS.filter((car) => car.unlockLevel === 'L3').map((car) => car.id)).toEqual(['viper', 'ronin']);
+    expect(CARS.filter((car) => car.unlockLevel === 'L5').map((car) => car.id)).toEqual(['brute', 'halo', 'kaiju']);
     expect(carsUnlockedBy([])).toEqual(['phantom']);
     expect(carsUnlockedBy(['L1', 'L2'])).toEqual(['phantom']);
-    expect(carsUnlockedBy(['L3'])).toEqual(['phantom', 'viper']);
-    expect(carsUnlockedBy(['L5'])).toEqual(['phantom', 'brute']);
-    expect(carsUnlockedBy(['L1', 'L2', 'L3', 'L4', 'L5'])).toEqual(['phantom', 'viper', 'brute']);
+    expect(carsUnlockedBy(['L3'])).toEqual(['phantom', 'viper', 'ronin']);
+    expect(carsUnlockedBy(['L5'])).toEqual(['phantom', 'brute', 'halo', 'kaiju']);
+    expect(carsUnlockedBy(['L1', 'L2', 'L3', 'L4', 'L5'])).toEqual(['phantom', 'viper', 'brute', 'ronin', 'halo', 'kaiju']);
   });
 
   it('only accepts known ids, and falls back to the stock car', () => {
@@ -113,5 +125,21 @@ describe('the cars differ the way their cards say', () => {
   it('the Brute slides wider than the Viper in the same held drift', () => {
     const angle = (p: typeof DEFAULT_CAR_PARAMS): number => measureTurnIn(25, Infinity, true, p).peakNose;
     expect(angle(brute)).toBeGreaterThan(angle(viper));
+  });
+
+  it('the Halo launches harder than the Phantom and holds the road like the Viper', () => {
+    const t = (p: typeof DEFAULT_CAR_PARAMS): number => measureLaunchLine(true, p).timeTo25;
+    expect(t(halo)).toBeLessThan(t(DEFAULT_CAR_PARAMS));
+    expect(halo.gripRear).toBeGreaterThan(DEFAULT_CAR_PARAMS.gripRear);
+  });
+
+  it('the Ronin swings round on a handbrake tap faster than the heavy Kaiju', () => {
+    expect(measureHandbrakeTap(25, 0.3, true, ronin).timeTo06).toBeLessThan(measureHandbrakeTap(25, 0.3, true, kaiju).timeTo06);
+  });
+
+  it('the Kaiju is the slowest to turn in and the heaviest', () => {
+    const turnIn = (p: typeof DEFAULT_CAR_PARAMS): number => measureTurnIn(25, Infinity, true, p).timeTo035;
+    expect(turnIn(kaiju)).toBeGreaterThan(turnIn(viper));
+    expect(Math.max(...CARS.map((car) => car.params.mass))).toBe(kaiju.mass);
   });
 });

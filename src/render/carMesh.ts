@@ -122,7 +122,23 @@ function glowGeometry(style: CarStyle, halfLength: number, halfWidth: number): B
     strip(side * (halfWidth - ACCENT_EDGE_INSET), 0, top.length - 1, style.accent);
     // Twin stripes down the bonnet, up to where the cabin starts.
     if (style.bonnetStripes) strip(side * 0.16, 0, 2, style.accent);
-    b.box(halfLength - 0.04, side * halfWidth * 0.58, 1, 0, 0.07, halfWidth * 0.2, top[0][1] - 0.1, top[0][1] + 0.06, CAR.headlight, CAR.headlight);
+    if (!style.lightBar) {
+      b.box(halfLength - 0.04, side * halfWidth * 0.58, 1, 0, 0.07, halfWidth * 0.2, top[0][1] - 0.1, top[0][1] + 0.06, CAR.headlight, CAR.headlight);
+    }
+  }
+  if (style.lightBar) {
+    // One thin bar across the whole nose.
+    b.box(halfLength - 0.03, 0, 1, 0, 0.06, halfWidth * 0.92, top[0][1] - 0.06, top[0][1] + 0.03, CAR.headlight, CAR.headlight);
+  }
+  if (style.roofLights) {
+    // Four lamps along the front edge of the roof, on the highest point of the cabin.
+    let [roofX, roofY] = style.cabin[0];
+    for (const [x, y] of style.cabin) if (y > roofY) [roofX, roofY] = [x, y];
+    const span = halfWidth * style.cabinWidth * 0.75;
+    for (let i = 0; i < 4; i++) {
+      const z = -span + (2 * span * i) / 3;
+      b.box(roofX * halfLength, z, 1, 0, 0.07, 0.1, roofY, roofY + 0.12, WING_DARK, CAR.headlight);
+    }
   }
   if (style.wing) {
     const [wx, wy] = style.wing;
@@ -139,7 +155,10 @@ function tailGeometry(style: CarStyle, halfLength: number, halfWidth: number): B
   const b = new GeometryBuilder();
   const white = new Color(1, 1, 1);
   const rear = style.bodyTop[style.bodyTop.length - 1][1];
-  b.box(-halfLength + 0.03, 0, 1, 0, 0.07, halfWidth * 0.86, rear - 0.14, rear + 0.05, white, white);
+  // A light-bar car's tail is one thin strip across its full width.
+  const span = style.lightBar ? 0.98 : 0.86;
+  const drop = style.lightBar ? 0.06 : 0.14;
+  b.box(-halfLength + 0.03, 0, 1, 0, 0.07, halfWidth * span, rear - drop, rear + 0.04, white, white);
   return b.build();
 }
 

@@ -46,6 +46,8 @@ test.describe('garage', () => {
     await page.locator('[data-key="garage"]').click();
     await expect(car(page, 'phantom')).toHaveAttribute('aria-pressed', 'true');
     await expect(car(page, 'brute')).toHaveClass(/is-locked/);
+    await expect(car(page, 'ronin')).not.toHaveClass(/is-locked/);
+    await expect(page.locator('.sd-car')).toHaveCount(6);
 
     await car(page, 'viper').click();
     await expect(car(page, 'viper')).toHaveAttribute('aria-pressed', 'true');

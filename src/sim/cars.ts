@@ -2,14 +2,15 @@ import type { CarParams } from '../types';
 import { DEFAULT_CAR_PARAMS } from './params';
 
 /**
- * The garage: three cars, each with its own handling. The first is the stock car every record before the garage
- * was set with; the other two unlock by finishing levels (see storage.ts, unlockedCarIds).
+ * The garage: six cars, each with its own handling (and, in render/carStyles.ts and audio/engineSounds.ts, its own
+ * look and engine). The first is the stock car every record before the garage was set with; finishing level 3
+ * unlocks the Viper and the Ronin, finishing level 5 the Brute, the Halo and the Kaiju (storage.ts, unlockedCarIds).
  *
  * Only the handling numbers differ. The top speed is the engine's rev limit (ENGINE in car.ts) and is the same for
- * all three, so a car is quicker by how it gets there: launch, grip, and how long it can hold a slide.
+ * every car, so a car is quicker by how it gets there: launch, grip, and how long it can hold a slide.
  */
 
-export type CarId = 'phantom' | 'viper' | 'brute';
+export type CarId = 'phantom' | 'viper' | 'brute' | 'ronin' | 'halo' | 'kaiju';
 
 export interface CarDef {
   id: CarId;
@@ -94,6 +95,96 @@ export const CARS: readonly CarDef[] = Object.freeze([
       cgToFront: 1.25,
       cgToRear: 1.35,
       collisionRadius: 0.95,
+    }),
+  },
+  {
+    // A short rally hatch: tiny wheelbase and a handbrake that bites, so it flicks into slides and out again.
+    id: 'ronin',
+    name: 'Ronin',
+    tagline: 'Short rally hatch. Flicks sideways on a handbrake tap, buzzes like a hornet.',
+    unlockLevel: 'L3',
+    stats: { launch: 3, grip: 4, drift: 4 },
+    params: tuned({
+      mass: 940,
+      inertia: 690,
+      cgHeight: 0.5,
+      gripFront: 1.7,
+      gripRear: 1.24,
+      handbrakeGrip: 0.08,
+      handbrakeForce: 3600,
+      powerSlip: 0.42,
+      slideGrip: 0.88,
+      engineForce: 9100,
+      maxSteer: 0.7,
+      maxSteerAtSpeed: 0.55,
+      steerRate: 5.2,
+      steerReturnRate: 6.6,
+      yawDamping: 0.28,
+      halfLength: 1.85,
+      halfWidth: 0.86,
+      cgToFront: 1.02,
+      cgToRear: 1.1,
+      collisionRadius: 0.85,
+    }),
+  },
+  {
+    // An electric hypercar: instant torque, a low battery-pack centre of gravity, planted and precise.
+    id: 'halo',
+    name: 'Halo',
+    tagline: 'Silent electric hypercar. Instant torque, planted and precise. Just a rising whine.',
+    unlockLevel: 'L5',
+    stats: { launch: 5, grip: 4, drift: 2 },
+    params: tuned({
+      mass: 1150,
+      inertia: 1000,
+      cgHeight: 0.34,
+      weightTransfer: 0.42,
+      gripFront: 1.72,
+      gripRear: 1.34,
+      powerSlip: 0.33,
+      slideGrip: 0.9,
+      engineForce: 11800,
+      brakeForce: 14000,
+      maxSteer: 0.62,
+      maxSteerAtSpeed: 0.48,
+      steerRate: 4.8,
+      steerReturnRate: 6.5,
+      yawDamping: 0.34,
+      halfLength: 2.15,
+      halfWidth: 0.95,
+      cgToFront: 1.2,
+      cgToRear: 1.28,
+    }),
+  },
+  {
+    // An armoured hauler: huge, slow to turn, but once its weight swings round it slides forever.
+    id: 'kaiju',
+    name: 'Kaiju',
+    tagline: 'Armoured street hauler. Slow to turn in, then the weight swings and it slides forever.',
+    unlockLevel: 'L5',
+    stats: { launch: 3, grip: 2, drift: 4 },
+    params: tuned({
+      mass: 1500,
+      inertia: 1700,
+      cgHeight: 0.6,
+      weightTransfer: 0.55,
+      gripFront: 1.5,
+      gripRear: 1.1,
+      powerSlip: 0.44,
+      slideGrip: 0.8,
+      engineForce: 14500,
+      brakeForce: 15500,
+      handbrakeForce: 5200,
+      maxSteer: 0.68,
+      maxSteerAtSpeed: 0.5,
+      steerRate: 3.6,
+      steerReturnRate: 4.8,
+      yawDamping: 0.24,
+      halfLength: 2.45,
+      halfWidth: 1.0,
+      cgToFront: 1.35,
+      cgToRear: 1.45,
+      collisionRadius: 1.0,
     }),
   },
 ] satisfies CarDef[]);

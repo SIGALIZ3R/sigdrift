@@ -72,9 +72,20 @@ describe('garage', () => {
     expect(menu.screen).toBe('garage');
   });
 
-  it('shows the three cars, the stock car picked and the others locked for a new player', () => {
+  it('shows the six cars, the stock car picked and the others locked for a new player', () => {
     menu.showGarage();
-    expect([...root.querySelectorAll('.sd-car')].map((n) => (n as HTMLElement).dataset.key)).toEqual(['phantom', 'viper', 'brute']);
+    expect([...root.querySelectorAll('.sd-car')].map((n) => (n as HTMLElement).dataset.key)).toEqual([
+      'phantom',
+      'viper',
+      'brute',
+      'ronin',
+      'halo',
+      'kaiju',
+    ]);
+    expect(root.querySelectorAll('.sd-car.is-locked')).toHaveLength(5);
+    expect(card('ronin').textContent).toContain('Finish level 3 to unlock');
+    expect(card('halo').textContent).toContain('Finish level 5 to unlock');
+    expect(card('kaiju').textContent).toContain('Finish level 5 to unlock');
     expect(card('phantom').classList.contains('is-selected')).toBe(true);
     expect(card('phantom').getAttribute('aria-pressed')).toBe('true');
     expect(card('viper').classList.contains('is-locked')).toBe(true);
@@ -125,8 +136,9 @@ describe('garage', () => {
 
 describe('finish screen unlocks', () => {
   it('announces a new car and links to the garage, whose BACK leaves the run', () => {
-    menu.showFinish(finish({ unlockedCars: ['Viper'] }));
+    menu.showFinish(finish({ unlockedCars: ['Viper', 'Ronin'] }));
     expect(q('.sd-unlocks').textContent).toContain('New car unlocked: Viper');
+    expect(q('.sd-unlocks').textContent).toContain('New car unlocked: Ronin');
     q('.sd-unlocks [data-key="garage"]').click();
     expect(menu.screen).toBe('garage');
     menu.back();

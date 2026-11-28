@@ -9,3 +9,11 @@
 - Known flaky (pre-existing, not reproduced this round): tests/gen/endless.test.ts "gets harsher with intensity and with difficulty" failed once in a full coverage run and passes alone, in its file and in full runs.
 - Coverage delta: lines 79.2% → 83.1%, branches 76.1% → 78.3%, functions 72.0% → 77.5% (whole src/, v8)
 - Safe to deploy: YES
+
+### Three more cars (Ronin, Halo, Kaiju) and per-car engine sounds — 2026-11-28
+- Files tested: src/sim/cars.ts, src/audio/engineSounds.ts, src/audio/engine.ts, src/audio/mixer.ts, src/render/carStyles.ts, src/render/carMesh.ts, src/ui/storage.ts, src/ui/menu.ts, src/session.ts
+- Tests added: 27 (each new car runs the shared handling suite: launch, turn-in, held drift, corners, bot finishes level 1; behaviour checks for the new cars; a smoothness/sanity check for every car's engine sound; whine layer structure). Unlock, garage and e2e tests updated for six cars.
+- Tests passed: 1317 unit (plain run), 8 of 8 browser runs
+- Tests failed: 0. Under coverage a third speed benchmark (tests/sim/layers.test.ts) failed from instrumentation slowdown; it now skips under coverage and gets twice the time on CI, like the other two.
+- Coverage delta: lines 83.1% → 83.1%, branches 78.3% → 78.3%, functions 77.5% → 77.6% (the new code is covered at the same rate)
+- Safe to deploy: YES

@@ -1,4 +1,6 @@
 import type { CarParams, CarState } from '../types';
+import { STOCK_ENGINE } from './engineSounds';
+import type { EngineSound } from './engineSounds';
 import { createMusicVoice } from './music';
 import type { MusicVoice } from './music';
 import { createAmbienceVoice } from './ambience';
@@ -82,6 +84,8 @@ export interface GameAudio {
   playMusic(song: number): void;
   /** 0..1, the music's own level on top of the volume (the separate music slider). */
   setMusicVolume(v: number): void;
+  /** The engine character of the car being driven (engineSounds.ts). Remembered until the AudioContext exists. */
+  setEngineSound(sound: Readonly<EngineSound>): void;
   /** The song asked for last, -1 for none. */
   readonly musicSong: number;
   dispose(): void;
@@ -470,6 +474,7 @@ export function createAudio(): GameAudio {
   let queuedBlipMs = 0;
   let song = -1;
   let musicVolume = DEFAULT_MUSIC_VOLUME;
+  let engineSound: Readonly<EngineSound> = STOCK_ENGINE;
   /** Context time each cue last played, for the rate limits. */
   const lastCue = new Map<BlipKind, number>();
 
@@ -481,6 +486,7 @@ export function createAudio(): GameAudio {
     }
     try {
       graph = buildGraph(Context, volume, muted);
+      graph.engine.setSound(engineSound);
       graph.ctx.addEventListener('statechange', onStateChange);
       playSong(graph, song, musicVolume);
       globalThis.document?.addEventListener('visibilitychange', onVisibilityChange);
@@ -559,6 +565,10 @@ export function createAudio(): GameAudio {
       gain.cancelScheduledValues(now);
       gain.setTargetAtTime(target, now, MUTE_SMOOTH);
       gain.setValueAtTime(target, now + MUTE_SETTLE);
+    },
+    setEngineSound(next) {
+      engineSound = next;
+      graph?.engine.setSound(next);
     },
     setMusicVolume(v) {
       musicVolume = clamp01(Number.isFinite(v) ? v : DEFAULT_MUSIC_VOLUME);
