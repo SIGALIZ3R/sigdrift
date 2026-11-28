@@ -33,6 +33,8 @@
  * gamepad's confirm is the handbrake button, which players mash at the end of a run. confirm() is therefore inert for
  * a moment after any click and after a screen appears (longer on result screens).
  */
+import { CARS } from '../sim/cars';
+import type { CarId } from '../sim/cars';
 import type { DeathCause, Difficulty, EndlessRecord, LevelDef, Quality, RunRecord, Settings } from '../types';
 import { formatDate, formatDelta, formatDistance, formatMultiplier, formatRank, formatScore, formatTime } from './format';
 import { markGlitch, markGlitchCover, playTransition, startRowFlicker, startSignalLoss } from './glitch';
@@ -43,13 +45,17 @@ import type { NavDir } from './nav';
 import { SCRAMBLE_ATTR, scrambleIn } from './scramble';
 import type { ScrambleHandle } from './scramble';
 import {
+  DEFAULT_SETTINGS,
   DIFFICULTIES,
   bestEndlessOverall,
   countCompleted,
   loadEndlessDifficulty,
   loadEndlessRecords,
+  loadCar,
   loadHowToSeen,
   loadRunRecords,
+  saveCar,
+  unlockedCarIds,
   saveEndlessDifficulty,
   saveHowToSeen,
 } from './storage';
@@ -67,6 +73,7 @@ export type MenuScreen =
   | 'levels'
   | 'endless'
   | 'howto'
+  | 'garage'
   | 'settings'
   | 'controls'
   | 'pause'
@@ -86,6 +93,8 @@ export interface MenuCallbacks {
   onQuit(): void;
   /** NEXT LEVEL on the finish screen of L1..L4. */
   onNextLevel(levelId: string): void;
+  /** A car picked in the garage (only ever an unlocked one). */
+  onSelectCar?(id: CarId): void;
   /** A fresh object every time the player changes a setting; already applied to the UI (reduced flash, mute). */
   onSettings(settings: Settings): void;
   onUiSound?(kind: UiSound): void;
@@ -124,6 +133,8 @@ export interface FinishResult {
   nextLevelId: string | null;
   /** Driven with tuning-panel edits, so nothing was saved. */
   tuned: boolean;
+  /** Names of the cars this finish unlocked in the garage (usually none). */
+  unlockedCars?: readonly string[];
 }
 
 export interface GameOverResult {
@@ -153,6 +164,7 @@ export interface Menu {
   /** The weekly card for `weekId` (default: this week). */
   showWeekly(weekId?: string): void;
   showHowTo(firstTime: boolean): void;
+  showGarage(): void;
   showSettings(settings: Settings, from: MenuOrigin): void;
   showControls(from: MenuOrigin): void;
   showPause(): void;
@@ -196,18 +208,18 @@ const SLIDER_STEP = 5;
 const NATIVE_KEY_WINDOW_MS = 150;
 const PRIMARY = 'sd-btn-primary';
 
-const CONTROLS: readonly (readonly [action: string, keyboard: string, gamepad: string])[] = [
-  ['Steer', 'A / D or ← →', 'Left stick'],
-  ['Throttle', 'W or ↑', 'Right trigger'],
-  ['Brake / reverse', 'S or ↓', 'Left trigger'],
-  ['Handbrake', 'Space', 'A / Cross'],
-  ['Reset to checkpoint', 'R', 'Y / Triangle'],
-  ['Restart run', 'Backspace', 'Back / Share'],
-  ['Pause', 'Esc or P', 'Start / Options'],
-  ['Mute', 'M', '—'],
-  ['Menus: move', 'Arrows', 'D-pad / left stick'],
-  ['Menus: select', 'Enter', 'A / Cross'],
-  ['Menus: back', 'Esc / Backspace', 'B / Circle'],
+const CONTROLS: readonly (readonly [action: string, keyboard: string, gamepad: string, touch: string])[] = [
+  ['Steer', 'A / D or ← →', 'Left stick', 'Left pad: slide'],
+  ['Throttle', 'W or ↑', 'Right trigger', 'GAS'],
+  ['Brake / reverse', 'S or ↓', 'Left trigger', 'BRAKE'],
+  ['Handbrake', 'Space', 'A / Cross', 'DRIFT'],
+  ['Reset to checkpoint', 'R', 'Y / Triangle', '↺'],
+  ['Restart run', 'Backspace', 'Back / Share', 'Pause → Restart'],
+  ['Pause', 'Esc or P', 'Start / Options', '❚❚'],
+  ['Mute', 'M', '—', 'Speaker, top right'],
+  ['Menus: move', 'Arrows', 'D-pad / left stick', '—'],
+  ['Menus: select', 'Enter', 'A / Cross', 'Tap'],
+  ['Menus: back', 'Esc / Backspace', 'B / Circle', 'Back arrow'],
 ];
 
 const DIFFICULTY_TEXT: Record<Difficulty, string> = {
@@ -394,23 +406,33 @@ function settingsRows(
     }),
   );
 
-  const slider = el('input', 'sd-range');
-  slider.type = 'range';
-  slider.min = '0';
-  slider.max = '100';
-  slider.step = '1';
-  slider.value = String(Math.round(current.volume * 100));
-  slider.setAttribute('aria-label', 'Volume');
-  const readout = el('span', 'sd-num', `${slider.value}%`);
-  slider.addEventListener('input', () => {
-    current.volume = slider.valueAsNumber / 100;
-    readout.textContent = `${slider.value}%`;
+  function sliderRow(label: string, value: number, onInput: (value: number) => void): HTMLElement {
+    const slider = el('input', 'sd-range');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '100';
+    slider.step = '1';
+    slider.value = String(Math.round(value * 100));
+    slider.setAttribute('aria-label', label);
+    const readout = el('span', 'sd-num', `${slider.value}%`);
+    slider.addEventListener('input', () => {
+      readout.textContent = `${slider.value}%`;
+      onInput(slider.valueAsNumber / 100);
+    });
+    const control = el('span', 'sd-setting-control');
+    control.append(slider, readout);
+    const row = el('label', 'sd-setting');
+    row.append(el('span', '', label), control);
+    return row;
+  }
+  const volume = sliderRow('Volume', current.volume, (value) => {
+    current.volume = value;
     emit();
   });
-  const control = el('span', 'sd-setting-control');
-  control.append(slider, readout);
-  const volume = el('label', 'sd-setting');
-  volume.append(el('span', '', 'Volume'), control);
+  const music = sliderRow('Music', current.musicVolume, (value) => {
+    current.musicVolume = value;
+    emit();
+  });
 
   function switchRow(label: string, on: boolean, onToggle: (on: boolean) => void): { row: HTMLElement; box: HTMLInputElement } {
     const box = el('input', 'sd-switch');
@@ -425,6 +447,7 @@ function settingsRows(
   // The slider keeps working while muted (the level is remembered for later); it only looks switched off.
   function showMuted(): void {
     volume.classList.toggle('is-off', current.muted);
+    music.classList.toggle('is-off', current.muted);
   }
   const sound = switchRow('Sound', !current.muted, (on) => {
     current.muted = !on;
@@ -442,7 +465,7 @@ function settingsRows(
   showMuted();
 
   const node = el('div', 'sd-settings');
-  node.append(quality, sound.row, volume, assist.row, calm.row);
+  node.append(quality, sound.row, volume, music, assist.row, calm.row);
   return {
     node,
     setMuted(muted) {
@@ -457,7 +480,7 @@ function settingsRows(
 function controlsTable(): HTMLElement {
   const table = el('table', 'sd-table sd-controls');
   const head = table.createTHead().insertRow();
-  for (const title of ['Action', 'Keyboard', 'Gamepad']) {
+  for (const title of ['Action', 'Keyboard', 'Gamepad', 'Touch']) {
     const cell = el('th', '', title);
     cell.scope = 'col';
     head.appendChild(cell);
@@ -637,7 +660,7 @@ export function createMenu(root: HTMLElement, callbacks: MenuCallbacks, initialC
     const name = logo(true);
     const prompt = el('button', 'sd-press');
     prompt.type = 'button';
-    prompt.append(el('span', '', 'Press Enter / Click to start'));
+    prompt.append(el('span', '', 'Press Enter / Tap to start'));
     const content = el('div', 'sd-screen sd-title');
     content.append(name, el('p', 'sd-label sd-tagline', 'Drift the neon city. Kiss the walls. Don’t fall.'), prompt);
     return {
@@ -656,6 +679,7 @@ export function createMenu(root: HTMLElement, callbacks: MenuCallbacks, initialC
     const list = el('div', 'sd-main-list');
     list.append(
       play,
+      button('Garage', () => showGarage(), 'sd-btn-big', 'garage'),
       button('How to play', () => showHowTo(false), 'sd-btn-big', 'howto'),
       button('Settings', () => showSettings(currentSettings(), 'main'), 'sd-btn-big', 'settings'),
       button('Controls', () => showControls('main'), 'sd-btn-big', 'controls'),
@@ -920,8 +944,80 @@ export function createMenu(root: HTMLElement, callbacks: MenuCallbacks, initialC
     });
   }
 
+  function statBars(label: string, value: number): HTMLElement {
+    const row = el('span', 'sd-car-stat');
+    const bars = el('span', 'sd-pips');
+    bars.setAttribute('aria-label', `${label} ${value} of 5`);
+    for (let i = 0; i < 5; i++) bars.append(el('i', i < value ? 'is-on' : ''));
+    row.append(el('span', 'sd-label', label), bars);
+    return row;
+  }
+
+  function showGarage(fromFinish = false, focusKey?: string): void {
+    const unlocked = new Set(unlockedCarIds());
+    let selected = loadCar();
+    const cards = el('div', 'sd-cards sd-cards-3 sd-garage');
+    const nodes: HTMLButtonElement[] = [];
+    let primary: HTMLElement | null = null;
+    const levelName = (id: string): string => {
+      const index = catalog.levels.findIndex((level) => level.id === id);
+      return index >= 0 ? `level ${index + 1}` : id;
+    };
+    function mark(): void {
+      for (const node of nodes) {
+        const on = node.dataset.key === selected;
+        node.classList.toggle('is-selected', on);
+        node.setAttribute('aria-pressed', String(on));
+      }
+    }
+    for (const car of CARS) {
+      const open = unlocked.has(car.id);
+      const line = open ? car.tagline : `Locked. Finish ${levelName(car.unlockLevel ?? '')} to unlock.`;
+      const node = card(
+        car.name,
+        line,
+        [],
+        () => {
+          if (!unlocked.has(car.id)) return;
+          if (selected === car.id) return;
+          selected = car.id;
+          saveCar(car.id);
+          mark();
+          callbacks.onSelectCar?.(car.id);
+        },
+        car.id,
+        `sd-car sd-car-${car.id}${open ? '' : ' is-locked'}`,
+      );
+      if (!open) node.dataset.sound = 'back';
+      const stats = el('span', 'sd-car-stats');
+      stats.append(statBars('Launch', car.stats.launch), statBars('Grip', car.stats.grip), statBars('Drift', car.stats.drift));
+      node.append(stats, el('span', 'sd-car-tag sd-label', open ? 'Selected' : 'Locked'));
+      if (car.id === selected) primary = node;
+      nodes.push(node);
+      cards.append(node);
+    }
+    mark();
+    // From a finish screen BACK leaves the finished run the way MENU does.
+    const back = fromFinish ? act(callbacks.onQuit) : (): void => showMain('garage');
+    const content = el('div', 'sd-screen');
+    const note = el('p', 'sd-muted', 'Every car has the same top speed. They differ in launch, grip and how they slide.');
+    content.append(screenHead('Garage', back, 'Pick a car'), cards, note);
+    show(
+      {
+        id: 'garage',
+        content,
+        primary: primary ?? nodes[0] ?? content,
+        label: 'Garage',
+        width: 'wide',
+        confirmGuardMs: CONFIRM_GUARD_MS,
+        back,
+      },
+      focusKey,
+    );
+  }
+
   function currentSettings(): Settings {
-    return settings ? { ...settings } : { quality: 'high', volume: 0.7, assist: true, reducedFlash: false, muted: false };
+    return settings ? { ...settings } : { ...DEFAULT_SETTINGS };
   }
 
   function originBack(from: MenuOrigin, key: string): () => void {
@@ -1040,6 +1136,13 @@ export function createMenu(root: HTMLElement, callbacks: MenuCallbacks, initialC
     );
     const rank = rankLine(result.saved, result.tuned);
     if (rank) content.append(rank);
+    const unlockedCars = result.unlockedCars ?? [];
+    if (unlockedCars.length > 0) {
+      const row = el('div', 'sd-badges sd-unlocks');
+      for (const name of unlockedCars) row.append(badge(`New car unlocked: ${name}`, 'sd-badge-lime'));
+      row.append(button('Garage', act(() => showGarage(true)), 'sd-btn-small', 'garage'));
+      content.append(row);
+    }
     content.append(table, actions);
     show({
       id: 'finish',
@@ -1128,6 +1231,7 @@ export function createMenu(root: HTMLElement, callbacks: MenuCallbacks, initialC
     showEndlessSelect,
     showWeekly: (weekId) => showWeekly(weekId ?? catalog.currentWeek),
     showHowTo: (firstTime) => showHowTo(firstTime),
+    showGarage: () => showGarage(),
     showSettings,
     showControls,
     showPause: () => showPause(),

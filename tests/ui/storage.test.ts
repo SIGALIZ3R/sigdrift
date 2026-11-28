@@ -82,7 +82,7 @@ describe('settings', () => {
   });
 
   it('round-trips saved settings', () => {
-    const settings: Settings = { quality: 'low', volume: 0.25, assist: false, reducedFlash: true, muted: true };
+    const settings: Settings = { quality: 'low', volume: 0.25, musicVolume: 0.3, assist: false, reducedFlash: true, muted: true };
     saveSettings(settings);
     expect(loadSettings()).toEqual(settings);
     expect([...storage.items.keys()]).toEqual([SETTINGS_KEY]);
@@ -91,7 +91,7 @@ describe('settings', () => {
   it('starts with sound on, including for settings saved before there was a mute switch', () => {
     expect(DEFAULT_SETTINGS.muted).toBe(false);
     storage.setItem(SETTINGS_KEY, JSON.stringify({ quality: 'low', volume: 0.25, assist: false, reducedFlash: true }));
-    expect(loadSettings()).toEqual({ quality: 'low', volume: 0.25, assist: false, reducedFlash: true, muted: false });
+    expect(loadSettings()).toEqual({ quality: 'low', volume: 0.25, musicVolume: 0.7, assist: false, reducedFlash: true, muted: false });
   });
 
   it('remembers mute without touching the volume', () => {

@@ -267,6 +267,10 @@ class NeonRenderer implements GameRenderer {
     this.applySize();
   }
 
+  setCarStyle(id: string): void {
+    this.car.setStyle(id);
+  }
+
   applySettings(settings: Settings): void {
     this.reducedFlash = settings.reducedFlash;
     const wasHigh = this.high;

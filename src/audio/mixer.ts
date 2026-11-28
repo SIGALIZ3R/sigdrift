@@ -80,6 +80,8 @@ export interface GameAudio {
    * AudioContext exists. Goes through the volume and the mute switch like everything else.
    */
   playMusic(song: number): void;
+  /** 0..1, the music's own level on top of the volume (the separate music slider). */
+  setMusicVolume(v: number): void;
   /** The song asked for last, -1 for none. */
   readonly musicSong: number;
   dispose(): void;
@@ -244,6 +246,8 @@ const CUES: Record<BlipKind, Cue> = {
 /** Length of the shared noise loop: long enough that no voice reading it is heard to repeat. */
 const NOISE_SECONDS = 4;
 const DEFAULT_VOLUME = 0.5;
+/** The music slider's starting level. */
+const DEFAULT_MUSIC_VOLUME = 0.7;
 const VOLUME_SMOOTH = 0.03;
 /** Time constant of the mute fade: 95 % of the way there after about 40 ms. */
 const MUTE_SMOOTH = 0.013;
@@ -271,6 +275,8 @@ interface Graph {
   ambience: AmbienceVoice;
   /** Built the first time a song is asked for. */
   music: MusicVoice | null;
+  /** The music's own level (the music slider), between the music voice and the master. Built with it. */
+  musicBus: GainNode | null;
 }
 
 type ContextConstructor = typeof AudioContext;
@@ -330,6 +336,7 @@ function buildGraph(Context: ContextConstructor, volume: number, muted: boolean)
     tires: createTireVoice(ctx, noise, master),
     ambience: createAmbienceVoice(ctx, noise, master),
     music: null,
+    musicBus: null,
   };
 }
 
@@ -439,10 +446,14 @@ function playThump(graph: Graph, strength: number, now: number): void {
   playBurst(graph, thumpCrunch, now);
 }
 
-function playSong(graph: Graph, song: number): void {
+function playSong(graph: Graph, song: number, musicVolume: number): void {
   if (!graph.music) {
     if (song < 0) return;
-    graph.music = createMusicVoice(graph.ctx, graph.noise, graph.master);
+    const bus = graph.ctx.createGain();
+    bus.gain.value = musicVolume;
+    bus.connect(graph.master);
+    graph.musicBus = bus;
+    graph.music = createMusicVoice(graph.ctx, graph.noise, bus);
   }
   graph.music.play(song);
 }
@@ -458,6 +469,7 @@ export function createAudio(): GameAudio {
   let queuedBlip: BlipKind | null = null;
   let queuedBlipMs = 0;
   let song = -1;
+  let musicVolume = DEFAULT_MUSIC_VOLUME;
   /** Context time each cue last played, for the rate limits. */
   const lastCue = new Map<BlipKind, number>();
 
@@ -470,7 +482,7 @@ export function createAudio(): GameAudio {
     try {
       graph = buildGraph(Context, volume, muted);
       graph.ctx.addEventListener('statechange', onStateChange);
-      playSong(graph, song);
+      playSong(graph, song, musicVolume);
       globalThis.document?.addEventListener('visibilitychange', onVisibilityChange);
     } catch {
       unavailable = true;
@@ -548,12 +560,16 @@ export function createAudio(): GameAudio {
       gain.setTargetAtTime(target, now, MUTE_SMOOTH);
       gain.setValueAtTime(target, now + MUTE_SETTLE);
     },
+    setMusicVolume(v) {
+      musicVolume = clamp01(Number.isFinite(v) ? v : DEFAULT_MUSIC_VOLUME);
+      if (graph?.musicBus) graph.musicBus.gain.setTargetAtTime(musicVolume, graph.ctx.currentTime, VOLUME_SMOOTH);
+    },
     get musicSong() {
       return song;
     },
     playMusic(next) {
       song = next;
-      if (graph) playSong(graph, next);
+      if (graph) playSong(graph, next, musicVolume);
     },
     dispose() {
       unavailable = true;

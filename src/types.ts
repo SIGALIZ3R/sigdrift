@@ -610,6 +610,8 @@ export interface Settings {
   quality: Quality;
   /** 0..1 master volume. */
   volume: number;
+  /** 0..1 background music level, on top of the master volume. */
+  musicVolume: number;
   /** Drift assist on or off. */
   assist: boolean;
   /** Tones down bloom pulses, screen shake, flashes and UI glitches. */
@@ -652,6 +654,8 @@ export interface GameRenderer {
   render(frame: RenderFrame): void;
   resize(width: number, height: number): void;
   applySettings(settings: Settings): void;
+  /** Shows the player's car with the look of garage car `id`. */
+  setCarStyle(id: string): void;
   dispose(): void;
 }
 

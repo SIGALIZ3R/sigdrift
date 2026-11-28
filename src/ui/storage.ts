@@ -5,9 +5,13 @@
  *   sigdrift:endless:<difficulty>     EndlessRecords
  *   sigdrift:endlessDifficulty        last difficulty picked
  *   sigdrift:howToSeen                the HOW TO PLAY cards were shown once
+ *   sigdrift:completedLevels          ids of levels ever finished (unlocks cars; survives physics changes)
+ *   sigdrift:car                      the car picked in the garage
  * Keys from earlier versions ("sigdrift:best:*", "sigdrift:endlessBest:*") are simply never read.
  * Everything loaded is validated; records from another PHYSICS_VERSION are dropped (and replaced on the next save).
  */
+import { DEFAULT_CAR, carsUnlockedBy, isCarId } from '../sim/cars';
+import type { CarId } from '../sim/cars';
 import { PHYSICS_VERSION } from '../types';
 import type { Difficulty, EndlessRecord, EndlessRecords, RunRecord, RunRecords, Settings } from '../types';
 
@@ -17,6 +21,10 @@ const RUN_KEY_PREFIX = `${KEY_PREFIX}run:`;
 const ENDLESS_KEY_PREFIX = `${KEY_PREFIX}endless:`;
 const ENDLESS_DIFFICULTY_KEY = `${KEY_PREFIX}endlessDifficulty`;
 const HOWTO_KEY = `${KEY_PREFIX}howToSeen`;
+const COMPLETED_KEY = `${KEY_PREFIX}completedLevels`;
+const CAR_KEY = `${KEY_PREFIX}car`;
+/** Level ids look like "L1".."L5"; anything else in the completed list is ignored. */
+const LEVEL_ID = /^L\d{1,2}$/;
 
 /** How many scores a high score table keeps. */
 export const HIGH_SCORE_SLOTS = 5;
@@ -24,6 +32,7 @@ export const HIGH_SCORE_SLOTS = 5;
 export const DEFAULT_SETTINGS: Settings = Object.freeze({
   quality: 'high',
   volume: 0.7,
+  musicVolume: 0.7,
   assist: true,
   reducedFlash: false,
   muted: false,
@@ -91,13 +100,18 @@ function prefersReducedMotion(): boolean {
 
 // ---- Settings -------------------------------------------------------------------------------------------------
 
+/** A finite number clamped to 0..1, or the fallback. */
+function unit(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : fallback;
+}
+
 function parseSettings(raw: unknown, fallback: Settings): Settings {
   const fields = isFields(raw) ? raw : {};
-  const { quality, volume, assist, reducedFlash, muted } = fields;
+  const { quality, volume, musicVolume, assist, reducedFlash, muted } = fields;
   return {
     quality: quality === 'low' || quality === 'high' ? quality : fallback.quality,
-    volume:
-      typeof volume === 'number' && Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : fallback.volume,
+    volume: unit(volume, fallback.volume),
+    musicVolume: unit(musicVolume, fallback.musicVolume),
     assist: typeof assist === 'boolean' ? assist : fallback.assist,
     reducedFlash: typeof reducedFlash === 'boolean' ? reducedFlash : fallback.reducedFlash,
     muted: typeof muted === 'boolean' ? muted : fallback.muted,
@@ -282,4 +296,44 @@ export function loadHowToSeen(): boolean {
 
 export function saveHowToSeen(seen = true): void {
   writeJson(HOWTO_KEY, seen);
+}
+
+// ---- Garage ---------------------------------------------------------------------------------------------------
+
+/**
+ * Every level ever finished: the ones marked by markLevelCompleted plus any with a stored time. Kept apart from the
+ * records so that a physics change, which drops the records, never locks a car again.
+ */
+export function loadCompletedLevels(): string[] {
+  const raw = readJson(COMPLETED_KEY);
+  const ids = new Set<string>();
+  if (Array.isArray(raw)) for (const id of raw) if (typeof id === 'string' && LEVEL_ID.test(id)) ids.add(id);
+  for (let n = 1; n <= 5; n++) if (loadRunRecords(`L${n}`).bestTime !== null) ids.add(`L${n}`);
+  return [...ids].sort();
+}
+
+/** Notes that `levelId` was finished. Returns the cars this finish unlocked (usually none). */
+export function markLevelCompleted(levelId: string): CarId[] {
+  if (!LEVEL_ID.test(levelId)) return [];
+  const before = loadCompletedLevels();
+  if (before.includes(levelId)) return [];
+  const after = [...before, levelId].sort();
+  if (!writeJson(COMPLETED_KEY, after)) return [];
+  const had = new Set(carsUnlockedBy(before));
+  return carsUnlockedBy(after).filter((id) => !had.has(id));
+}
+
+/** The cars the player may drive, in garage order. */
+export function unlockedCarIds(): CarId[] {
+  return carsUnlockedBy(loadCompletedLevels());
+}
+
+/** The car picked in the garage, or the stock car when none was picked or the pick is not unlocked. */
+export function loadCar(): CarId {
+  const stored = readJson(CAR_KEY);
+  return isCarId(stored) && unlockedCarIds().includes(stored) ? stored : DEFAULT_CAR;
+}
+
+export function saveCar(id: CarId): void {
+  if (isCarId(id)) writeJson(CAR_KEY, id);
 }

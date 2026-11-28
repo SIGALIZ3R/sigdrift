@@ -39,6 +39,9 @@ const COUNT_NONE = -1;
 const RUN_HINT = 'WASD / Arrows drive  ·  Space handbrake  ·  R reset  ·  Esc pause';
 /** No R here: endless has no checkpoints to reset to. */
 const ENDLESS_HINT = 'WASD / Arrows drive  ·  Space handbrake  ·  Backspace restart  ·  Esc pause';
+/** The same hints for the on-screen touch controls (shown instead while they are up, by CSS). */
+const TOUCH_RUN_HINT = 'Left pad steers  ·  GAS  ·  DRIFT handbrake  ·  ↺ reset';
+const TOUCH_ENDLESS_HINT = 'Left pad steers  ·  GAS  ·  DRIFT handbrake  ·  ❚❚ pause';
 const METER_CELLS = 8;
 const METRES_PER_KM = 1000;
 /** The proximity bar moves in steps this fine (1/40 of its length). */
@@ -191,6 +194,7 @@ function buildCentre(view: Partial<HudView>): HTMLElement {
   const centre = el('div', 'sd-hud-centre');
   view.count = el('div', 'sd-num sd-hud-count');
   view.hint = el('div', 'sd-label sd-hud-hint sd-hidden', RUN_HINT);
+  view.hint.dataset.touch = TOUCH_RUN_HINT;
   centre.append(view.count, view.hint);
   return centre;
 }
@@ -314,6 +318,7 @@ function syncLayout(view: HudView, shown: Shown, layout: Layout): void {
   view.lives.classList.toggle('sd-hidden', !endless);
   view.air.classList.toggle('sd-hidden', !endless);
   view.hint.textContent = endless ? ENDLESS_HINT : RUN_HINT;
+  view.hint.dataset.touch = endless ? TOUCH_ENDLESS_HINT : TOUCH_RUN_HINT;
   // The flash line is shared, and whatever the other mode last announced means nothing here.
   view.flash.classList.remove('is-on');
   view.flash.classList.toggle('is-crash', endless);

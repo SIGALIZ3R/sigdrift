@@ -702,6 +702,18 @@ export const UI_CSS = `
 .sd-table th, .sd-table td { padding: 0.45em 0.6em 0.45em 0; border-bottom: 1px solid var(--sd-faint); text-align: left; }
 .sd-table th { font-size: 0.78em; font-weight: 600; letter-spacing: 0.2em; text-transform: uppercase; color: var(--sd-dim); }
 .sd-controls td:first-child { color: var(--sd-dim); }
+.sd-car-phantom { --sd-rgb: 51, 240, 255; }
+.sd-car-viper { --sd-rgb: 255, 43, 214; }
+.sd-car-brute { --sd-rgb: 255, 182, 46; }
+.sd-car-stats { display: grid; gap: 0.35em; margin-top: auto; }
+.sd-car-stat { display: grid; grid-template-columns: 5.2em auto; align-items: center; }
+.sd-car-tag { position: absolute; top: 1.2em; right: 1.1em; font-size: 0.62em; letter-spacing: 0.22em; color: rgb(var(--sd-rgb)); visibility: hidden; }
+.sd-car.is-selected { border-color: rgb(var(--sd-rgb)); box-shadow: 0 0 1.4em rgba(var(--sd-rgb), 0.35), inset 0 0 1.2em rgba(var(--sd-rgb), 0.12); }
+.sd-car.is-selected .sd-car-tag, .sd-car.is-locked .sd-car-tag { visibility: visible; }
+.sd-car.is-locked { --sd-rgb: 130, 136, 160; cursor: not-allowed; }
+.sd-car.is-locked .sd-card-title, .sd-car.is-locked .sd-car-stats { opacity: 0.45; }
+.sd-badge.sd-badge-lime { border-color: #9dff00; box-shadow: 0 0 1.2em rgba(157, 255, 0, 0.5), inset 0 0 0.9em rgba(157, 255, 0, 0.25); }
+.sd-unlocks { align-items: center; }
 .sd-scores td { font-family: var(--sd-mono); font-variant-numeric: tabular-nums; }
 .sd-scores td:first-child { width: 2em; color: var(--sd-dim); }
 .sd-scores td:last-child { color: var(--sd-dim); }
@@ -1136,6 +1148,110 @@ label.sd-setting { cursor: pointer; }
 .sd-calm .sd-g { animation: none !important; }
 .sd-calm .sd-g::before, .sd-calm .sd-g::after,
 .sd-calm .sd-g > [data-text]::before, .sd-calm .sd-g > [data-text]::after { content: none !important; animation: none !important; }
+/* On-screen touch controls (touchControls.ts). Sized off the short side of the screen, so they fit a thumb on any
+   phone in either orientation. */
+.sd-touch {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  --sd-touch: clamp(64px, 19vmin, 132px);
+  font-size: calc(var(--sd-touch) * 0.17);
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.sd-touch-pad, .sd-touch-btn, .sd-touch-tap { pointer-events: auto; touch-action: none; }
+.sd-touch-pad {
+  position: absolute;
+  left: max(3vmin, env(safe-area-inset-left));
+  bottom: max(3vmin, env(safe-area-inset-bottom));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: calc(var(--sd-touch) * 2.3);
+  height: calc(var(--sd-touch) * 1.05);
+  padding: 0 1.1em;
+  box-sizing: border-box;
+  border: 1px solid rgba(51, 240, 255, 0.45);
+  border-radius: calc(var(--sd-touch) * 0.55);
+  background: rgba(5, 7, 16, 0.38);
+  box-shadow: inset 0 0 1.4em rgba(51, 240, 255, 0.12);
+}
+.sd-touch-arrow { font-size: 1.9em; color: rgba(51, 240, 255, 0.7); text-shadow: 0 0 0.5em rgba(51, 240, 255, 0.6); }
+.sd-touch-knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: calc(var(--sd-touch) * 0.62);
+  height: calc(var(--sd-touch) * 0.62);
+  margin: calc(var(--sd-touch) * -0.31);
+  border: 2px solid rgba(51, 240, 255, 0.8);
+  border-radius: 50%;
+  background: radial-gradient(rgba(51, 240, 255, 0.28), rgba(51, 240, 255, 0.05) 70%);
+  box-shadow: 0 0 1em rgba(51, 240, 255, 0.4);
+  transition: transform 0.05s linear;
+}
+.sd-touch-pad.is-held .sd-touch-knob { background: radial-gradient(rgba(51, 240, 255, 0.55), rgba(51, 240, 255, 0.12) 70%); }
+.sd-touch-pedals {
+  position: absolute;
+  right: max(3vmin, env(safe-area-inset-right));
+  bottom: max(3vmin, env(safe-area-inset-bottom));
+  display: grid;
+  grid-template-columns: auto auto;
+  grid-template-areas: "drift gas" ". brake";
+  gap: 2.2vmin;
+  align-items: end;
+}
+.sd-touch-btn {
+  --sd-rgb: 51, 240, 255;
+  display: grid;
+  place-items: center;
+  width: var(--sd-touch);
+  height: var(--sd-touch);
+  border: 2px solid rgba(var(--sd-rgb), 0.7);
+  border-radius: 50%;
+  background: rgba(5, 7, 16, 0.42);
+  color: rgb(var(--sd-rgb));
+  font-family: var(--sd-sans);
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  text-shadow: 0 0 0.5em rgba(var(--sd-rgb), 0.7);
+  box-shadow: 0 0 1em rgba(var(--sd-rgb), 0.25), inset 0 0 1em rgba(var(--sd-rgb), 0.12);
+}
+.sd-touch-btn.is-held { background: rgba(var(--sd-rgb), 0.32); color: #fff; box-shadow: 0 0 1.6em rgba(var(--sd-rgb), 0.6), inset 0 0 1.2em rgba(var(--sd-rgb), 0.35); }
+.sd-touch-gas { grid-area: gas; --sd-rgb: 157, 255, 0; width: calc(var(--sd-touch) * 1.2); height: calc(var(--sd-touch) * 1.2); }
+.sd-touch-brake { grid-area: brake; --sd-rgb: 255, 59, 92; justify-self: center; width: calc(var(--sd-touch) * 0.85); height: calc(var(--sd-touch) * 0.85); }
+.sd-touch-drift { grid-area: drift; --sd-rgb: 255, 43, 214; }
+.sd-touch-taps {
+  position: absolute;
+  top: max(2.5vmin, env(safe-area-inset-top));
+  left: max(3vmin, env(safe-area-inset-left));
+  display: flex;
+  gap: 2vmin;
+}
+.sd-touch-tap {
+  width: calc(var(--sd-touch) * 0.55);
+  height: calc(var(--sd-touch) * 0.55);
+  border: 1px solid rgba(238, 243, 255, 0.4);
+  border-radius: 50%;
+  background: rgba(5, 7, 16, 0.5);
+  color: var(--sd-text);
+  font: 700 1.2em var(--sd-sans);
+  cursor: pointer;
+}
+.sd-touch-tap.is-held { background: rgba(51, 240, 255, 0.3); }
+/* The HUD's bottom panels move up out of the controls' way and shrink a little. */
+.sd-touch-on .sd-hud-score, .sd-touch-on .sd-hud-speed { transform: scale(0.8); }
+.sd-touch-on .sd-hud-score { bottom: calc(max(3vmin, env(safe-area-inset-bottom)) + clamp(64px, 19vmin, 132px) * 1.3); }
+.sd-touch-on .sd-hud-speed { bottom: calc(max(3vmin, env(safe-area-inset-bottom)) + clamp(64px, 19vmin, 132px) * 2.3); }
+.sd-touch-on .sd-hud-hint { position: relative; visibility: hidden; }
+.sd-touch-on .sd-hud-hint::after { content: attr(data-touch); position: absolute; inset: 0; text-align: center; white-space: nowrap; visibility: visible; }
+.sd-touch-on .sd-hud-score { transform-origin: 0 100%; }
+.sd-touch-on .sd-hud-speed { transform-origin: 100% 100%; }
+.sd-touch-on .sd-hud-air { bottom: calc(max(3vmin, env(safe-area-inset-bottom)) + clamp(64px, 19vmin, 132px) * 1.4); }
 @media (prefers-reduced-motion: reduce) {
   .sd-ui {
     --sd-pop: sd-fade; --sd-flash: sd-fade; --sd-pop-in: sd-fade-in;
@@ -1161,6 +1277,10 @@ label.sd-setting { cursor: pointer; }
   .sd-week span:last-child { display: none; }
 }
 /* Too narrow for the life pips to sit beside the distance: they keep to the left edge instead. */
+/* Phones: the controls table keeps its keyboard and touch columns. */
+@media (max-width: 560px) {
+  .sd-controls th:nth-child(3), .sd-controls td:nth-child(3) { display: none; }
+}
 @media (max-width: 440px) {
   .sd-hud-lives { right: auto; left: max(0.6em, env(safe-area-inset-left)); gap: 0.4em; }
 }

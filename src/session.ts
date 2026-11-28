@@ -27,7 +27,8 @@ import type {
 } from './types';
 import type { EndlessHudInfo, Hud, HudInfo } from './ui/hud';
 import type { FinishResult, GameOverResult, Menu } from './ui/menu';
-import { loadEndlessRecords, loadRunRecords, saveEndlessRecord, saveRunRecord } from './ui/storage';
+import { getCar } from './sim/cars';
+import { loadEndlessRecords, loadRunRecords, markLevelCompleted, saveEndlessRecord, saveRunRecord } from './ui/storage';
 
 /** `over` covers a finished track run and a dead endless one: no more player input, no pausing. */
 export type SessionPhase = 'countdown' | 'running' | 'over';
@@ -186,6 +187,9 @@ class TrackRun implements TrackSession {
     const trackId = this.info.trackId;
     const previousBest = this.records.bestTime;
     const score = wholePoints(state.score.points);
+    // Finishing a level counts towards the garage whatever the car or its tuning. Marked before the record is
+    // saved: a stored best time also counts as finished, and would hide that this finish is the one that unlocked.
+    const unlocked = this.kind === 'level' ? markLevelCompleted(trackId) : [];
     const saved = tuned
       ? null
       : saveRunRecord(trackId, {
@@ -210,6 +214,7 @@ class TrackRun implements TrackSession {
       highScores: this.records.highScores,
       nextLevelId: this.info.nextLevelId,
       tuned,
+      unlockedCars: unlocked.map((id) => getCar(id).name),
     };
     this.audio.blip('finish');
   }

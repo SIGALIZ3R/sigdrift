@@ -2,7 +2,13 @@ import type { InputState, MetaInput } from '../types';
 import { createGamepad } from './gamepad';
 import { createKeyboard, createMetaInput } from './keyboard';
 
-export type InputDevice = 'keyboard' | 'gamepad';
+export type InputDevice = 'keyboard' | 'gamepad' | 'touch';
+
+/** Any other control surface (the on-screen touch controls): held state plus edge flags the input takes and clears. */
+export interface InputSource {
+  readonly held: InputState;
+  readonly pressed: MetaInput;
+}
 
 export interface GameInput {
   /** Current held state. Call once per sim tick. Returns a reused object. */
@@ -27,7 +33,7 @@ function largerMagnitude(a: number, b: number): number {
   return Math.abs(b) > Math.abs(a) ? b : a;
 }
 
-export function createInput(target: Window): GameInput {
+export function createInput(target: Window, extra?: InputSource): GameInput {
   let lastDevice: InputDevice = 'keyboard';
   const keyboard = createKeyboard(target, () => {
     lastDevice = 'keyboard';
@@ -41,9 +47,17 @@ export function createInput(target: Window): GameInput {
   }
 
   function take(flag: keyof MetaInput): void {
-    flags[flag] = keyboard.pressed[flag] || gamepad.pressed[flag];
+    flags[flag] = keyboard.pressed[flag] || gamepad.pressed[flag] || (extra?.pressed[flag] ?? false);
     keyboard.pressed[flag] = false;
     gamepad.pressed[flag] = false;
+    if (extra) extra.pressed[flag] = false;
+  }
+
+  /** Touch counts as the device in use while any of its controls is held. */
+  function noteExtra(): void {
+    if (!extra) return;
+    const h = extra.held;
+    if (h.steer !== 0 || h.throttle > 0 || h.brake > 0 || h.handbrake || h.reset) lastDevice = 'touch';
   }
 
   return {
@@ -56,6 +70,15 @@ export function createInput(target: Window): GameInput {
       state.brake = Math.max(keys.brake, pad.brake);
       state.handbrake = keys.handbrake || pad.handbrake;
       state.reset = keys.reset || pad.reset;
+      if (extra) {
+        noteExtra();
+        const touch = extra.held;
+        state.steer = largerMagnitude(state.steer, touch.steer);
+        state.throttle = Math.max(state.throttle, touch.throttle);
+        state.brake = Math.max(state.brake, touch.brake);
+        state.handbrake = state.handbrake || touch.handbrake;
+        state.reset = state.reset || touch.reset;
+      }
       return state;
     },
     meta() {

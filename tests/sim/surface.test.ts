@@ -2,7 +2,7 @@
  * Road surfaces in 2.5D: heights, slopes, bumps, which layer a crossing answers with, the floor everywhere else, and
  * how fast a query is.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, inject } from 'vitest';
 import type { Level } from '../../src/types';
 import { STEP_UP, TERRAIN_Y } from '../../src/types';
 import { FOOTPRINT_MARGIN, addPiece, createSurfaceIndex, nearestSurface, removePiece, surfaceAt, surfaceEmpty, surfaceStats } from '../../src/sim/surface';
@@ -214,7 +214,7 @@ describe('footprints', () => {
 });
 
 describe('speed', () => {
-  it('answers a query on a big level in well under 2 microseconds', () => {
+  it.skipIf(inject('coverage'))('answers a query on a big level in well under 2 microseconds', () => {
     // About 3 km of twisting, climbing road, 1500 path points, crossing over itself here and there.
     const shapes = [];
     for (let i = 0; i < 60; i++) shapes.push({ length: 50, turn: ((i * 7) % 5) * 0.4 - 0.8, rise: i % 4 === 1 ? 4 : i % 4 === 3 ? -4 : 0 });

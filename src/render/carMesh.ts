@@ -16,6 +16,8 @@ import { GeometryBuilder, builderMaterial } from './geometry';
 import { FLAT_GROUND } from './ground';
 import type { Ground } from './ground';
 import { HeadlightBeams } from './headlights';
+import { carStyle } from './carStyles';
+import type { CarStyle } from './carStyles';
 import { CAR } from './palette';
 
 /**
@@ -41,31 +43,10 @@ export function wheelOffsetZ(params: CarParams, wheel: number): number {
   return (wheel & 1) === 0 ? -track : track;
 }
 
-// Side silhouettes as [x / halfLength, height in metres], running front to rear.
-const BODY_TOP: readonly (readonly [number, number])[] = [
-  [1, 0.5],
-  [0.86, 0.6],
-  [0.3, 0.74],
-  [-0.72, 0.8],
-  [-1, 0.76],
-];
-const BODY_UNDERSIDE: readonly (readonly [number, number])[] = [
-  [-1, 0.3],
-  [-0.94, 0.24],
-  [0.92, 0.24],
-  [1, 0.34],
-];
-const CABIN: readonly (readonly [number, number])[] = [
-  [0.3, 0.72],
-  [0, 1.14],
-  [-0.4, 1.17],
-  [-0.76, 0.78],
-];
-const CABIN_WIDTH = 0.8;
-
 const ACCENT_HALF_WIDTH = 0.055;
 const ACCENT_EDGE_INSET = 0.085;
 const ACCENT_LIFT = 0.012;
+const WING_DARK = new Color(0x141826);
 
 const MAX_LATERAL_ACCEL = 12;
 const ROLL_PER_ACCEL = 0.0045;
@@ -122,30 +103,43 @@ function extrudeProfile(points: readonly (readonly [number, number])[], halfLeng
   return geometry;
 }
 
-/** Headlights and the two neon lines that run along the shoulders from nose to tail. */
-function glowGeometry(halfLength: number, halfWidth: number): BufferGeometry {
+/** Headlights, the two neon lines along the shoulders, and the style's bonnet stripes and wing. */
+function glowGeometry(style: CarStyle, halfLength: number, halfWidth: number): BufferGeometry {
   const b = new GeometryBuilder();
-  for (const side of [-1, 1]) {
-    const z = side * (halfWidth - ACCENT_EDGE_INSET);
-    for (let i = 0; i < BODY_TOP.length - 1; i++) {
-      const [x0, y0] = BODY_TOP[i];
-      const [x1, y1] = BODY_TOP[i + 1];
-      const v0 = b.vertex(x0 * halfLength, y0 + ACCENT_LIFT, z - ACCENT_HALF_WIDTH, CAR.accent);
-      const v1 = b.vertex(x1 * halfLength, y1 + ACCENT_LIFT, z - ACCENT_HALF_WIDTH, CAR.accent);
-      const v2 = b.vertex(x1 * halfLength, y1 + ACCENT_LIFT, z + ACCENT_HALF_WIDTH, CAR.accent);
-      const v3 = b.vertex(x0 * halfLength, y0 + ACCENT_LIFT, z + ACCENT_HALF_WIDTH, CAR.accent);
+  const top = style.bodyTop;
+  const strip = (z: number, from: number, to: number, color: Color): void => {
+    for (let i = from; i < to; i++) {
+      const [x0, y0] = top[i];
+      const [x1, y1] = top[i + 1];
+      const v0 = b.vertex(x0 * halfLength, y0 + ACCENT_LIFT, z - ACCENT_HALF_WIDTH, color);
+      const v1 = b.vertex(x1 * halfLength, y1 + ACCENT_LIFT, z - ACCENT_HALF_WIDTH, color);
+      const v2 = b.vertex(x1 * halfLength, y1 + ACCENT_LIFT, z + ACCENT_HALF_WIDTH, color);
+      const v3 = b.vertex(x0 * halfLength, y0 + ACCENT_LIFT, z + ACCENT_HALF_WIDTH, color);
       b.quad(v0, v1, v2, v3);
     }
-    b.box(halfLength - 0.04, side * halfWidth * 0.58, 1, 0, 0.07, halfWidth * 0.2, 0.4, 0.56, CAR.headlight, CAR.headlight);
+  };
+  for (const side of [-1, 1]) {
+    strip(side * (halfWidth - ACCENT_EDGE_INSET), 0, top.length - 1, style.accent);
+    // Twin stripes down the bonnet, up to where the cabin starts.
+    if (style.bonnetStripes) strip(side * 0.16, 0, 2, style.accent);
+    b.box(halfLength - 0.04, side * halfWidth * 0.58, 1, 0, 0.07, halfWidth * 0.2, top[0][1] - 0.1, top[0][1] + 0.06, CAR.headlight, CAR.headlight);
+  }
+  if (style.wing) {
+    const [wx, wy] = style.wing;
+    const x = wx * halfLength;
+    // The blade across the car, lit along its top, on two posts.
+    b.box(x, 0, 0, 1, halfWidth * 0.95, 0.16, wy - 0.05, wy, WING_DARK, style.accent);
+    for (const side of [-1, 1]) b.box(x, side * halfWidth * 0.55, 1, 0, 0.05, 0.04, top[top.length - 1][1] - 0.05, wy - 0.05, WING_DARK, WING_DARK);
   }
   return b.build();
 }
 
 /** One light bar across the tail. White vertices: the material colour sets the brightness every frame. */
-function tailGeometry(halfLength: number, halfWidth: number): BufferGeometry {
+function tailGeometry(style: CarStyle, halfLength: number, halfWidth: number): BufferGeometry {
   const b = new GeometryBuilder();
   const white = new Color(1, 1, 1);
-  b.box(-halfLength + 0.03, 0, 1, 0, 0.07, halfWidth * 0.86, 0.62, 0.81, white, white);
+  const rear = style.bodyTop[style.bodyTop.length - 1][1];
+  b.box(-halfLength + 0.03, 0, 1, 0, 0.07, halfWidth * 0.86, rear - 0.14, rear + 0.05, white, white);
   return b.build();
 }
 
@@ -191,6 +185,8 @@ export interface CarVisual {
    * 0..1, lights the body red for a counted crash.
    */
   update(frame: RenderFrame, ground?: Ground, flash?: number): void;
+  /** Switches to the look of garage car `id`; rebuilt on the next update. */
+  setStyle(id: string): void;
   dispose(): void;
 }
 
@@ -211,6 +207,8 @@ class CarModel implements CarVisual {
   private shadow: GroundMesh | null = null;
   private underglow: GroundMesh | null = null;
   private beams: HeadlightBeams | null = null;
+  private style: CarStyle = carStyle('phantom');
+  private styleChanged = false;
 
   // The dimensions the current meshes were built for; the tuning panel can change them live.
   private halfLength = 0;
@@ -233,7 +231,7 @@ class CarModel implements CarVisual {
 
   update(frame: RenderFrame, ground: Ground = FLAT_GROUND, flash = 0): void {
     const { pose, car, params, dt } = frame;
-    if (this.isStale(params)) this.rebuild(params);
+    if (this.styleChanged || this.isStale(params)) this.rebuild(params);
 
     this.group.position.set(pose.x, 0, pose.z);
     this.group.rotation.y = -pose.heading;
@@ -302,6 +300,13 @@ class CarModel implements CarVisual {
     this.bodyMaterial?.emissive.setRGB(CRASH_R * flash, CRASH_G * flash, CRASH_B * flash);
   }
 
+  setStyle(id: string): void {
+    const next = carStyle(id);
+    if (next === this.style) return;
+    this.style = next;
+    this.styleChanged = true;
+  }
+
   dispose(): void {
     this.group.removeFromParent();
     this.disposeParts();
@@ -334,7 +339,7 @@ class CarModel implements CarVisual {
     if (this.underglow) {
       const scale = 1 + (UNDERGLOW_MIN_SCALE - 1) * up;
       this.underglow.scale.set(scale, 1, scale);
-      this.underglow.material.color.copy(CAR.underglow).multiplyScalar(1 + (UNDERGLOW_MIN_LIGHT - 1) * up);
+      this.underglow.material.color.copy(this.style.underglow).multiplyScalar(1 + (UNDERGLOW_MIN_LIGHT - 1) * up);
     }
     // The beams start on the road under the car (or, in the air, whatever is below) and follow it from there.
     this.beams?.update(ground, x, z, cos, sin, Math.min(restY, carY), 1 + (BEAM_MIN_LIGHT - 1) * up);
@@ -371,6 +376,7 @@ class CarModel implements CarVisual {
 
   private rebuild(params: CarParams): void {
     this.disposeParts();
+    this.styleChanged = false;
     this.halfLength = params.halfLength;
     this.halfWidth = params.halfWidth;
     this.cgToFront = params.cgToFront;
@@ -391,13 +397,14 @@ class CarModel implements CarVisual {
   private buildBody(): void {
     const hl = this.halfLength;
     const hw = this.halfWidth;
-    const profile = [...BODY_TOP, ...BODY_UNDERSIDE];
-    this.bodyMaterial = new MeshLambertMaterial({ color: CAR.body });
+    const style = this.style;
+    const profile = [...style.bodyTop, ...style.bodyUnderside];
+    this.bodyMaterial = new MeshLambertMaterial({ color: style.body });
     this.chassis.add(
       this.part(extrudeProfile(profile, hl, hw * 2), this.bodyMaterial),
-      this.part(extrudeProfile(CABIN, hl, hw * 2 * CABIN_WIDTH), new MeshLambertMaterial({ color: CAR.glass })),
-      this.part(glowGeometry(hl, hw), builderMaterial()),
-      this.part(tailGeometry(hl, hw), this.tailMaterial, true),
+      this.part(extrudeProfile(style.cabin, hl, hw * 2 * style.cabinWidth), new MeshLambertMaterial({ color: style.glass })),
+      this.part(glowGeometry(style, hl, hw), builderMaterial()),
+      this.part(tailGeometry(style, hl, hw), this.tailMaterial, true),
     );
   }
 
@@ -407,7 +414,7 @@ class CarModel implements CarVisual {
     const centre = this.chassis.position.x;
     this.shadow = groundShadow(hl * 2 + SHADOW_MARGIN, hw * 2 + SHADOW_MARGIN, this.softTexture);
     this.shadow.position.set(centre, Y_SHADOW, 0);
-    this.underglow = groundGlow(hl * 2 + 2.2, hw * 2 + 2.2, this.softTexture, CAR.underglow);
+    this.underglow = groundGlow(hl * 2 + 2.2, hw * 2 + 2.2, this.softTexture, this.style.underglow);
     this.underglow.position.set(centre, Y_UNDERGLOW, 0);
     // One beam from each headlight, starting at the lamp.
     this.beams = new HeadlightBeams(centre + hl - 0.1, hw * 0.58);

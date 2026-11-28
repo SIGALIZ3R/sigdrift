@@ -1042,3 +1042,66 @@ describe('slopes', () => {
   });
 });
 
+
+describe('music volume (the separate music slider)', () => {
+  /** The node playMusic adds in front of the master: the music bus. */
+  function startMusic(audio: GameAudio, ctx: FakeAudioContext): FakeNode {
+    const { master } = masterChain(ctx);
+    const before = [...master.inputs];
+    audio.playMusic(0);
+    const added = master.inputs.filter((node) => !before.includes(node));
+    expect(added).toHaveLength(1);
+    expect(added[0].kind).toBe('gain');
+    return added[0];
+  }
+
+  it('puts the music behind its own gain, starting at the default music level', () => {
+    const { audio, ctx } = started();
+    const bus = startMusic(audio, ctx);
+    expect(gain(bus).value).toBeCloseTo(0.7);
+    // Only the music feeds the bus.
+    expect(bus.inputs.length).toBeGreaterThan(0);
+  });
+
+  it('applies a level set before the music (or the context) existed', () => {
+    const audio = createAudio();
+    audio.setMusicVolume(0.25);
+    audio.playMusic(1);
+    audio.resume();
+    const ctx = FakeAudioContext.instances[0];
+    const { master } = masterChain(ctx);
+    const bus = master.inputs.find((node) => node.kind === 'gain' && Math.abs(gain(node).value - 0.25) < 1e-9);
+    expect(bus).toBeDefined();
+  });
+
+  it('glides the music bus to a new level and leaves the master volume alone', () => {
+    const { audio, ctx } = started();
+    const bus = startMusic(audio, ctx);
+    const { master } = masterChain(ctx);
+    const masterEvents = gain(master).events.length;
+    ctx.currentTime = 3;
+    audio.setMusicVolume(0.2);
+    const glide = gain(bus).events.find((event) => event.kind === 'target');
+    expect(glide).toMatchObject({ value: 0.2, time: 3 });
+    expect(gain(master).events.length).toBe(masterEvents);
+  });
+
+  it('clamps out-of-range levels and falls back to the default for nonsense', () => {
+    const { audio, ctx } = started();
+    const bus = startMusic(audio, ctx);
+    audio.setMusicVolume(4);
+    expect(gain(bus).events.at(-1)?.value).toBe(1);
+    audio.setMusicVolume(-1);
+    expect(gain(bus).events.at(-1)?.value).toBe(0);
+    audio.setMusicVolume(Number.NaN);
+    expect(gain(bus).events.at(-1)?.value).toBeCloseTo(0.7);
+  });
+
+  it('is safe before resume() and after dispose()', () => {
+    const audio = createAudio();
+    expect(() => audio.setMusicVolume(0.5)).not.toThrow();
+    audio.resume();
+    audio.dispose();
+    expect(() => audio.setMusicVolume(0.1)).not.toThrow();
+  });
+});

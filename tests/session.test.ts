@@ -316,6 +316,36 @@ describe('track session', () => {
     expect(renderer.begun + renderer.added).toBe(0);
   });
 
+  it('unlocks the Viper on finishing level 3 and says so on the finish screen, once', () => {
+    const finishAs = (trackId: string): FinishResult => {
+      const { deps } = rig();
+      const level = straightLevel();
+      const session = createTrackSession(level, { kind: 'level', trackId, trackName: trackId, nextLevelId: null }, deps);
+      runCountdown(session);
+      for (let i = 0; i < 60 * SIM_HZ && session.phase !== 'over'; i++) session.step(FULL_THROTTLE);
+      expect(session.phase).toBe('over');
+      session.end(false);
+      const showFinish = vi.fn<(result: FinishResult) => void>();
+      session.showEndScreen({ showFinish } as unknown as Menu);
+      return showFinish.mock.calls[0][0];
+    };
+    expect(finishAs('L2').unlockedCars).toEqual([]);
+    expect(finishAs('L3').unlockedCars).toEqual(['Viper']);
+    expect(finishAs('L3').unlockedCars).toEqual([]);
+    expect(storage.items.get('sigdrift:completedLevels')).toBe(JSON.stringify(['L2', 'L3']));
+  });
+
+  it('never unlocks anything from a weekly run', () => {
+    const { deps } = rig();
+    const level = straightLevel();
+    level.id = 'L3';
+    const session = createTrackSession(level, weekly(level), deps);
+    runCountdown(session);
+    for (let i = 0; i < 60 * SIM_HZ && session.phase !== 'over'; i++) session.step(FULL_THROTTLE);
+    session.end(false);
+    expect(storage.items.has('sigdrift:completedLevels')).toBe(false);
+  });
+
   it('reports a respawn as a teleport and plays the checkpoint, reset and finish cues', () => {
     const { deps, blips } = rig();
     const level = straightLevel();

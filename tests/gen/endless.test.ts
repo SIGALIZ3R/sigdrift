@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, inject } from 'vitest';
 import { hashNumbers } from '../../src/core/hash';
 import { ENDLESS_CHUNK_CELLS, createEndlessGenerator, endlessLayoutStats, intensityAt } from '../../src/gen/endless';
 import { CELL } from '../../src/gen/trackGen';
@@ -268,7 +268,7 @@ describe('createEndlessGenerator', () => {
     }
   });
 
-  it('typically builds a chunk in well under 5 ms, also after 2000 chunks', () => {
+  it.skipIf(inject('coverage'))('typically builds a chunk in well under 5 ms, also after 2000 chunks', () => {
     const generator = createEndlessGenerator('speed', 'hard');
     for (let i = 0; i < 2000; i++) generator.next();
     const times: number[] = [];

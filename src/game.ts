@@ -12,6 +12,8 @@ import type { GameInput } from './input/actions';
 import { openRenderer, randomSeed, startsFromTitle, watchPixelRatio } from './platform';
 import { createEndlessSession, createTrackSession } from './session';
 import type { Session, SessionDeps, SessionPhase, TrackInfo } from './session';
+import { getCar } from './sim/cars';
+import type { CarId } from './sim/cars';
 import { ASSIST_STRENGTH, DEFAULT_CAR_PARAMS, cloneParams } from './sim/params';
 import { decodeInput, encodeInput } from './sim/replay';
 import { DT, SIM_HZ } from './types';
@@ -38,7 +40,9 @@ import { createMenu } from './ui/menu';
 import type { Menu, UiSound } from './ui/menu';
 import { createMuteButton } from './ui/muteButton';
 import type { MuteButton } from './ui/muteButton';
-import { loadSettings, saveSettings } from './ui/storage';
+import { loadCar, loadSettings, saveSettings } from './ui/storage';
+import { createTouchControls } from './ui/touchControls';
+import type { TouchControls } from './ui/touchControls';
 import { createTuningPanel } from './ui/tuning';
 import type { TuningPanel } from './ui/tuning';
 
@@ -93,6 +97,7 @@ export class Game {
   private readonly currentWeek: string;
   private readonly fixedEndlessSeed: string | null;
   private readonly input: GameInput;
+  private readonly touch: TouchControls;
   private readonly audio: GameAudio;
   private readonly hud: Hud;
   private readonly menu: Menu;
@@ -146,7 +151,8 @@ export class Game {
     this.fixedEndlessSeed = opts.endlessSeed || null;
     this.settings = loadSettings();
     this.renderer = openRenderer(opts.app, this.settings);
-    this.input = createInput(window);
+    this.touch = createTouchControls(opts.ui);
+    this.input = createInput(window, this.touch);
     this.audio = createAudio();
     this.sessionDeps = { renderer: this.renderer, audio: this.audio, params: this.params };
     this.hud = createHud(opts.ui);
@@ -164,6 +170,7 @@ export class Game {
           saveSettings(settings);
           this.applySettings(settings);
         },
+        onSelectCar: (id) => this.applyCar(id),
         onUiSound: (kind: UiSound) => this.audio.blip(UI_BLIPS[kind]),
       },
       { currentWeek: this.currentWeek, pastWeeks: previousWeekIds(this.currentWeek, PAST_WEEKS), levels: LEVELS },
@@ -180,6 +187,8 @@ export class Game {
         this.runTuned = true;
       },
     });
+    // The garage pick, before the settings put the steering assist on top of it.
+    this.applyCar(loadCar());
     // Glitch accents on whatever UI is on screen. Like the rest of the game, it lives as long as the page does.
     createGlitcher(opts.ui);
     // Includes the mute state, so a game that starts muted is silent before its first sound.
@@ -400,11 +409,24 @@ export class Game {
     this.settings = settings;
     this.renderer.applySettings(settings);
     this.audio.setVolume(settings.volume);
+    this.audio.setMusicVolume(settings.musicVolume);
     this.audio.setMuted(settings.muted);
     this.menu.setSettings(settings);
     const assist = settings.assist ? ASSIST_STRENGTH : 0;
     this.params.steerAssist = assist;
     this.tuningDefaults.steerAssist = assist;
+  }
+
+  /**
+   * Drives garage car `id` from now on: its handling goes into the one shared params object (so the world parked
+   * behind the menu and the next run both use it) and becomes what the tuning panel resets to.
+   */
+  private applyCar(id: CarId): void {
+    const car = getCar(id);
+    const assist = this.params.steerAssist;
+    Object.assign(this.params, car.params, { steerAssist: assist });
+    Object.assign(this.tuningDefaults, car.params, { steerAssist: assist });
+    this.renderer.setCarStyle(car.id);
   }
 
   /** A mute change that did not come through a menu: the corner button or the M key. */
@@ -528,6 +550,7 @@ export class Game {
     this.renderer.render(frame);
 
     if (this.screen !== 'menu') session.updateHud(this.hud);
+    this.touch.setDriving(this.screen === 'driving');
     this.tuning.update(car);
     this.audio.update(car, world.params, this.screen === 'driving' && session.engineRunning);
   }

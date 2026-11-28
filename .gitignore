@@ -6,3 +6,5 @@ dist
 coverage
 .vite
 .claude/worktrees/
+test-results
+playwright-report
