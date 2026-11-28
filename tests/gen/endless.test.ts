@@ -180,7 +180,7 @@ describe('createEndlessGenerator', () => {
     // If this changes on purpose, bump GEN_VERSION (and the endless records' version) with it: distances driven on
     // the old road are not comparable with the new one.
     const numbers = run('endless-golden', 'medium', 5).flatMap(numbersOf);
-    expect(hashNumbers(numbers)).toBe('5637d2dfdfec5ca3');
+    expect(hashNumbers(numbers)).toBe('56409797933ad8e8');
   });
 
   it('gives a different road for another seed or another difficulty', () => {
@@ -337,7 +337,8 @@ describe('the endless road is 2.5D and really random', () => {
       expect(stats.escaped).toBeLessThan(LONG * 0.05);
     }
     console.info(`endless crossings: ${rates.join(', ')}`);
-  });
+    // About 4 s alone (it rebuilds the long runs); the default 5 s is too tight when the whole suite runs in parallel.
+  }, 30_000);
 
   it('heads in all four directions over a long run and climbs, drops and reuses old ground', () => {
     for (const { chunks } of longRuns) {

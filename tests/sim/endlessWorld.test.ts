@@ -616,7 +616,8 @@ describe('coming back down to the walls', () => {
     }
     expect(died).toBeGreaterThan(100);
     expect(droveOn).toBeGreaterThan(100);
-  });
+    // About 2 s alone; the default 5 s is too tight when the whole suite runs in parallel.
+  }, 30_000);
 
   it('launches a car that is rubbing the wall just as it would in the middle of the road', () => {
     const fly = (z: number, steer: number): { air: number; peak: number; contacts: number; hardest: number } => {

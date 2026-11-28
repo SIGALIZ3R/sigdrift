@@ -15,6 +15,7 @@ import type { CarParams, RenderFrame } from '../types';
 import { GeometryBuilder, builderMaterial } from './geometry';
 import { FLAT_GROUND } from './ground';
 import type { Ground } from './ground';
+import { HeadlightBeams } from './headlights';
 import { CAR } from './palette';
 
 /**
@@ -88,8 +89,6 @@ const FLIGHT_MIN_SPEED = 8;
 const AXLE_MATCH = 0.8;
 /** The body never rides further than this above or below the ground under its centre (bump crests, dips), m. */
 const MAX_RIDE = 0.4;
-/** The headlight pool is left out where the road ahead is not at the car's level (an edge, a drop), m. */
-const BEAM_MAX_STEP = 1.5;
 
 // What stays on the ground while the car is in the air: a dark blob and the underglow. Both shrink and fade as
 // the car climbs, which is what makes its height readable from a camera that never moves.
@@ -104,7 +103,6 @@ const UNDERGLOW_MIN_LIGHT = 0.55;
 const BEAM_MIN_LIGHT = 0.35;
 const Y_SHADOW = 0.06;
 const Y_UNDERGLOW = 0.07;
-const Y_BEAM = 0.075;
 
 /** Emissive colour of the body at the peak of a crash flash: far past white in red, so it blooms. */
 const CRASH_R = 1.7;
@@ -212,9 +210,7 @@ class CarModel implements CarVisual {
   private bodyMaterial: MeshLambertMaterial | null = null;
   private shadow: GroundMesh | null = null;
   private underglow: GroundMesh | null = null;
-  private beam: GroundMesh | null = null;
-  /** How far ahead of the pose the middle of the headlight beam falls, m. */
-  private beamReach = 0;
+  private beams: HeadlightBeams | null = null;
 
   // The dimensions the current meshes were built for; the tuning panel can change them live.
   private halfLength = 0;
@@ -340,13 +336,8 @@ class CarModel implements CarVisual {
       this.underglow.scale.set(scale, 1, scale);
       this.underglow.material.color.copy(CAR.underglow).multiplyScalar(1 + (UNDERGLOW_MIN_LIGHT - 1) * up);
     }
-    if (this.beam) {
-      // The beam lands ahead of the car, on whatever height the road has there; not off an edge or down a drop.
-      const beamY = ground.heightAt(x + cos * this.beamReach, z + sin * this.beamReach, carY);
-      this.beam.visible = Math.abs(beamY - restY) < BEAM_MAX_STEP;
-      this.beam.position.y = Y_BEAM + beamY;
-      this.beam.material.color.copy(CAR.headlightBeam).multiplyScalar(1 + (BEAM_MIN_LIGHT - 1) * up);
-    }
+    // The beams start on the road under the car (or, in the air, whatever is below) and follow it from there.
+    this.beams?.update(ground, x, z, cos, sin, Math.min(restY, carY), 1 + (BEAM_MIN_LIGHT - 1) * up);
   }
 
   private isStale(params: CarParams): boolean {
@@ -368,11 +359,14 @@ class CarModel implements CarVisual {
     for (const child of [...this.body.children]) {
       if (child !== this.chassis && child !== this.frontLeft && child !== this.frontRight) this.body.remove(child);
     }
-    if (this.beam) this.group.remove(this.beam);
+    if (this.beams) {
+      this.group.remove(this.beams.mesh);
+      this.beams.dispose();
+    }
     this.bodyMaterial = null;
     this.shadow = null;
     this.underglow = null;
-    this.beam = null;
+    this.beams = null;
   }
 
   private rebuild(params: CarParams): void {
@@ -415,14 +409,13 @@ class CarModel implements CarVisual {
     this.shadow.position.set(centre, Y_SHADOW, 0);
     this.underglow = groundGlow(hl * 2 + 2.2, hw * 2 + 2.2, this.softTexture, CAR.underglow);
     this.underglow.position.set(centre, Y_UNDERGLOW, 0);
-    this.beam = groundGlow(11, 6.5, this.softTexture, CAR.headlightBeam);
-    this.beamReach = centre + hl + 4.6;
-    this.beam.position.set(this.beamReach, Y_BEAM, 0);
+    // One beam from each headlight, starting at the lamp.
+    this.beams = new HeadlightBeams(centre + hl - 0.1, hw * 0.58);
     // None of these is part of the body: light and shadow on the road must not lean or jump with the car. The
-    // beam is not in the rig either, or the slope under the car would swing its far end into the air.
+    // beams are not in the rig either: they follow the road ahead themselves.
     this.groundRig.add(this.shadow, this.underglow);
-    this.group.add(this.beam);
-    for (const mesh of [this.shadow, this.underglow, this.beam]) this.owned.push(mesh.geometry, mesh.material);
+    this.group.add(this.beams.mesh);
+    for (const mesh of [this.shadow, this.underglow]) this.owned.push(mesh.geometry, mesh.material);
   }
 
   private buildWheels(params: CarParams): void {

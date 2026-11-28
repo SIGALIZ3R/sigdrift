@@ -36,6 +36,13 @@ export class PathIndex {
   /** How far the road reaches past its first and its last point (walled run-off), m. */
   private readonly extendStart: number;
   private readonly extendEnd: number;
+  /**
+   * Unit normal of the joint line through each path point: the bisector of the two segments meeting there, as in
+   * the simulation's surface (src/sim/surface.ts). Heights are interpolated between joint lines, so the surface is
+   * continuous across a joint also on the inside of a bend, and the car does not bob there.
+   */
+  private readonly jointX: Float64Array;
+  private readonly jointZ: Float64Array;
 
   // What the last query that found a surface found.
   /** Segment index (path[i] to path[i + 1]). */
@@ -53,6 +60,30 @@ export class PathIndex {
     this.extendStart = Math.max(0, extendStart);
     this.extendEnd = Math.max(0, extendEnd);
     const n = path.length;
+    this.jointX = new Float64Array(n);
+    this.jointZ = new Float64Array(n);
+    for (let k = 0; k < n; k++) {
+      let nx = 0;
+      let nz = 0;
+      for (const j of [k - 1, k]) {
+        if (j < 0 || j + 1 >= n) continue;
+        const dx = path[j + 1].x - path[j].x;
+        const dz = path[j + 1].z - path[j].z;
+        const len = Math.sqrt(dx * dx + dz * dz);
+        if (!(len > 1e-9)) continue;
+        nx += dx / len;
+        nz += dz / len;
+      }
+      let len = Math.sqrt(nx * nx + nz * nz);
+      if (!(len > 0.2) && n > 1) {
+        const j = k + 1 < n ? k : k - 1;
+        nx = path[j + 1].x - path[j].x;
+        nz = path[j + 1].z - path[j].z;
+        len = Math.sqrt(nx * nx + nz * nz) || 1;
+      }
+      this.jointX[k] = len > 0 ? nx / len : 1;
+      this.jointZ[k] = len > 0 ? nz / len : 0;
+    }
     let minX = Infinity;
     let minZ = Infinity;
     let maxX = -Infinity;
@@ -125,7 +156,13 @@ export class PathIndex {
       const oz = z - (a.z + dz * t);
       const hw = a.halfWidth + (b.halfWidth - a.halfWidth) * along + EDGE_SLACK;
       if (ox * ox + oz * oz > hw * hw) continue;
-      const y = a.y + (b.y - a.y) * along;
+      // Between the joint lines where the point lies between them (not deep inside a very tight bend).
+      const px = x - a.x;
+      const pz = z - a.z;
+      const d0 = px * this.jointX[i] + pz * this.jointZ[i];
+      const d1 = (dx - px) * this.jointX[i + 1] + (dz - pz) * this.jointZ[i + 1];
+      const tj = d0 >= 0 && d1 >= 0 && d0 + d1 > 1e-9 ? d0 / (d0 + d1) : along;
+      const y = a.y + (b.y - a.y) * tj;
       if (y > maxY) continue;
       // How far past the segment's ends the point lies, m. Neighbouring segments of one stretch of road all
       // reach the point near a joint; the one it really lies along is the one it overshoots least.

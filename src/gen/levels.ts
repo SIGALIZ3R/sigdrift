@@ -31,7 +31,7 @@ export const LEVELS: readonly LevelDef[] = [
     name: 'Glowline Boulevard',
     blurb: 'Wide, flowing and nearly flat. Learn to hold a slide under the signs.',
     difficulty: 1,
-    seed: levelSeed('L1', 'glowline-17'),
+    seed: levelSeed('L1', 'glowline-96'),
     options: {
       cells: [16, 18],
       halfWidth: [10, 11.5],
@@ -49,7 +49,7 @@ export const LEVELS: readonly LevelDef[] = [
     name: 'Ciphers Alley',
     blurb: 'Hairpins, S-bends and open plazas packed with pillars. Pure technique.',
     difficulty: 2,
-    seed: levelSeed('L2', 'ciphers-40'),
+    seed: levelSeed('L2', 'ciphers-42'),
     options: {
       cells: [18, 22],
       halfWidth: [8.6, 10],
@@ -67,7 +67,7 @@ export const LEVELS: readonly LevelDef[] = [
     name: 'Vertigo Ramps',
     blurb: 'Climb the arcology, then drop off the crest. Big hills, one overpass.',
     difficulty: 3,
-    seed: levelSeed('L3', 'vertigo-18'),
+    seed: levelSeed('L3', 'vertigo-89'),
     options: {
       cells: [18, 22],
       halfWidth: [9, 10.5],
@@ -85,7 +85,7 @@ export const LEVELS: readonly LevelDef[] = [
     name: 'Knotwork Interchange',
     blurb: 'A tangle of flyovers: pass over and under your own line again and again.',
     difficulty: 4,
-    seed: levelSeed('L4', 'knotwork-85'),
+    seed: levelSeed('L4', 'knotwork-171'),
     options: {
       cells: [24, 27],
       halfWidth: [8.8, 10],
@@ -103,7 +103,7 @@ export const LEVELS: readonly LevelDef[] = [
     name: 'Skyway Zero',
     blurb: 'Long raised runs with open drops, bumps and no second chances. Stay on the deck.',
     difficulty: 5,
-    seed: levelSeed('L5', 'skyway-106'),
+    seed: levelSeed('L5', 'skyway-122'),
     options: {
       cells: [22, 26],
       halfWidth: [7.8, 9],

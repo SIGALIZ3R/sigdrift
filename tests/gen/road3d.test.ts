@@ -190,21 +190,43 @@ describe('wander', () => {
     }
   });
 
-  it('really goes up and down', () => {
+  it('keeps the road level apart from one clean ramp: no rolling hills', () => {
     const limits = profileLimits(1);
-    const profile = new HeightProfile(0, 0, flatLimit(limits.maxGrade), limits.gradeChange);
-    wander(profile, new Rng('hills'), 1200, 0, style);
-    let turns = 0;
-    let previous = 0;
-    for (let d = 0; d <= 1200; d += 5) {
-      const g = profile.gradeAt(d);
-      if (Math.abs(g) > 0.01 && Math.sign(g) !== previous) {
-        turns++;
-        previous = Math.sign(g);
+    // One ramp per change of height: up (or down) once, never back, with level road either side.
+    for (let i = 0; i < 30; i++) {
+      const rng = new Rng(`ramp-${i}`);
+      const start = rng.range(0, 6);
+      const target = rng.range(0, 20);
+      const profile = new HeightProfile(0, start, flatLimit(limits.maxGrade), limits.gradeChange);
+      expect(wander(profile, rng, 1200, target, style)).toBe(true);
+      expect(profile.endHeight).toBe(target);
+      let rising = 0;
+      let falling = 0;
+      let level = 0;
+      for (let d = 0; d <= 1200; d += 1) {
+        const g = profile.gradeAt(d);
+        if (g > 1e-9) rising++;
+        else if (g < -1e-9) falling++;
+        else level++;
+      }
+      // Only ever one way.
+      expect(Math.min(rising, falling), `ramp-${i}`).toBe(0);
+      // And short: the shortest ramp that makes the change, so most of the stretch is level.
+      expect(level, `ramp-${i}`).toBeGreaterThan(1200 * 0.6);
+      // Heights stay between the two ends.
+      for (let d = 0; d <= 1200; d += 10) {
+        const h = profile.heightAt(d);
+        expect(h).toBeGreaterThanOrEqual(Math.min(start, target) - 1e-9);
+        expect(h).toBeLessThanOrEqual(Math.max(start, target) + 1e-9);
       }
     }
-    expect(turns).toBeGreaterThanOrEqual(3);
-    expect(Math.max(...Array.from({ length: 241 }, (_, k) => profile.heightAt(k * 5)))).toBeGreaterThan(8);
+  });
+
+  it('holds the road level all the way when the height does not change', () => {
+    const limits = profileLimits(1);
+    const profile = new HeightProfile(0, 7, flatLimit(limits.maxGrade), limits.gradeChange);
+    expect(wander(profile, new Rng('flat'), 800, 7, style)).toBe(true);
+    for (let d = 0; d <= 800; d += 5) expect(profile.heightAt(d)).toBe(7);
   });
 
   it('is deterministic and refuses the impossible', () => {

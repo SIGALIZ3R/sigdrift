@@ -1,4 +1,6 @@
 import type { CarParams, CarState } from '../types';
+import { createMusicVoice } from './music';
+import type { MusicVoice } from './music';
 import { createAmbienceVoice } from './ambience';
 import type { AmbienceVoice } from './ambience';
 import { createEngineVoice } from './engine';
@@ -73,6 +75,13 @@ export interface GameAudio {
    * not the AudioContext exists yet.
    */
   setMuted(muted: boolean): void;
+  /**
+   * Background music: fades over to song `song` (0..SONGS.length - 1), or out with -1. Remembered until the
+   * AudioContext exists. Goes through the volume and the mute switch like everything else.
+   */
+  playMusic(song: number): void;
+  /** The song asked for last, -1 for none. */
+  readonly musicSong: number;
   dispose(): void;
 }
 
@@ -260,6 +269,8 @@ interface Graph {
   engine: EngineVoice;
   tires: TireVoice;
   ambience: AmbienceVoice;
+  /** Built the first time a song is asked for. */
+  music: MusicVoice | null;
 }
 
 type ContextConstructor = typeof AudioContext;
@@ -318,6 +329,7 @@ function buildGraph(Context: ContextConstructor, volume: number, muted: boolean)
     engine: createEngineVoice(ctx, noise, master),
     tires: createTireVoice(ctx, noise, master),
     ambience: createAmbienceVoice(ctx, noise, master),
+    music: null,
   };
 }
 
@@ -427,6 +439,14 @@ function playThump(graph: Graph, strength: number, now: number): void {
   playBurst(graph, thumpCrunch, now);
 }
 
+function playSong(graph: Graph, song: number): void {
+  if (!graph.music) {
+    if (song < 0) return;
+    graph.music = createMusicVoice(graph.ctx, graph.noise, graph.master);
+  }
+  graph.music.play(song);
+}
+
 export function createAudio(): GameAudio {
   let graph: Graph | null = null;
   let unavailable = contextConstructor() === undefined;
@@ -437,6 +457,7 @@ export function createAudio(): GameAudio {
   let lastThump = -Infinity;
   let queuedBlip: BlipKind | null = null;
   let queuedBlipMs = 0;
+  let song = -1;
   /** Context time each cue last played, for the rate limits. */
   const lastCue = new Map<BlipKind, number>();
 
@@ -449,6 +470,7 @@ export function createAudio(): GameAudio {
     try {
       graph = buildGraph(Context, volume, muted);
       graph.ctx.addEventListener('statechange', onStateChange);
+      playSong(graph, song);
       globalThis.document?.addEventListener('visibilitychange', onVisibilityChange);
     } catch {
       unavailable = true;
@@ -526,17 +548,25 @@ export function createAudio(): GameAudio {
       gain.setTargetAtTime(target, now, MUTE_SMOOTH);
       gain.setValueAtTime(target, now + MUTE_SETTLE);
     },
+    get musicSong() {
+      return song;
+    },
+    playMusic(next) {
+      song = next;
+      if (graph) playSong(graph, next);
+    },
     dispose() {
       unavailable = true;
       wanted = false;
       if (!graph) return;
-      const { ctx, engine, tires, ambience } = graph;
+      const { ctx, engine, tires, ambience, music } = graph;
       graph = null;
       ctx.removeEventListener('statechange', onStateChange);
       globalThis.document?.removeEventListener('visibilitychange', onVisibilityChange);
       engine.dispose();
       tires.dispose();
       ambience.dispose();
+      music?.dispose();
       ctx.close().catch(() => {});
     },
   };

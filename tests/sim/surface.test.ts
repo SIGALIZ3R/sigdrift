@@ -241,3 +241,53 @@ describe('speed', () => {
     expect(micros).toBeLessThan(2);
   });
 });
+
+describe('a climbing bend', () => {
+  // A quarter circle of radius 30 m in 3 m steps, climbing at 12% the whole way, 10 m half width.
+  const RADIUS = 30;
+  const HALF = 10;
+  const GRADE = 0.12;
+  const points: { x: number; z: number; y: number; halfWidth: number; dist: number }[] = [];
+  const left: { x: number; z: number }[] = [];
+  const right: { x: number; z: number }[] = [];
+  const steps = Math.round((Math.PI / 2) * RADIUS / 3);
+  for (let k = 0; k <= steps; k++) {
+    const a = (k / steps) * (Math.PI / 2);
+    const dist = a * RADIUS;
+    // Centre of the bend at the origin; the road runs anticlockwise, so its left side is the inside.
+    const x = RADIUS * Math.cos(a);
+    const z = RADIUS * Math.sin(a);
+    points.push({ x, z, y: dist * GRADE, halfWidth: HALF, dist });
+    // Edge points on the joint lines (the bisectors), as the generators lay them out.
+    const miter = 1 / Math.cos(Math.PI / 4 / steps);
+    const out = k === 0 || k === steps ? 1 : miter;
+    left.push({ x: (RADIUS - HALF * out) * Math.cos(a), z: (RADIUS - HALF * out) * Math.sin(a) });
+    right.push({ x: (RADIUS + HALF * out) * Math.cos(a), z: (RADIUS + HALF * out) * Math.sin(a) });
+  }
+  const piece = { path: points, left, right, bumps: [] } as unknown as Level;
+  const index = indexOf(piece);
+
+  it('has no step anywhere across it: a car crossing a joint on the inside is not kicked up', () => {
+    // Walk arcs across the whole width and look for a jump: a change in the climb between neighbouring samples far
+    // bigger than the climb itself bends by.
+    const STEP = 0.001;
+    let worst = 0;
+    for (let r = RADIUS - HALF + 0.3; r <= RADIUS + HALF - 0.3; r += 0.7) {
+      let previous = NaN;
+      let previousRise = NaN;
+      for (let a = 0.05; a <= Math.PI / 2 - 0.05; a += STEP) {
+        const hit = at(index, r * Math.cos(a), r * Math.sin(a), 100);
+        expect(hit.onRoad).toBe(true);
+        if (previous === previous) {
+          const rise = hit.y - previous;
+          if (previousRise === previousRise) worst = Math.max(worst, Math.abs(rise - previousRise));
+          previousRise = rise;
+        }
+        previous = hit.y;
+      }
+    }
+    // Each sample climbs about 3.6 mm. A plain projection steps by up to GRADE x half width x tan(half the joint
+    // angle) at a joint on the inside (well over a centimetre here); along joint lines only the slope bends.
+    expect(worst).toBeLessThan(1e-3);
+  });
+});

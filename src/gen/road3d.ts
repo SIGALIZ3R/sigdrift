@@ -220,37 +220,51 @@ export interface WanderStyle {
 /** Share of the steepest climb a planned ramp may use: room for rounding and for the next ramp. */
 const PLAN_SAFETY = 0.97;
 
+/** Ramps are tried in steps of this length, m, from the shortest the style allows. */
+const RAMP_LENGTH_STEP = 10;
+
 /**
- * Fills the profile from its end up to `to` with random climbs, drops and level stretches between 0 and
- * style.maxHeight, arriving level at `endHeight` exactly at `to`. Returns false, appending nothing, when even one
- * straight ramp cannot make that height change (check with `profile.climbTo(to)` first).
+ * Fills the profile from its end up to `to`, arriving level at `endHeight` exactly at `to`: level road, with at
+ * most one clean climb or drop placed at random in the stretch. There are no rolling hills: away from its ramps a
+ * street is level, so the only things that lift a car are the marked bumps and a ramp it can see coming. The ramp
+ * is the shortest (from `style.ramp[0]`) that makes the height change. Returns false, appending nothing, when even
+ * one ramp over the whole stretch cannot make it (check with `profile.climbTo(to)` first).
  */
 export function wander(profile: HeightProfile, rng: Rng, to: number, endHeight: number, style: WanderStyle): boolean {
   const goal = Math.round(to);
-  if (Math.abs(endHeight - profile.endHeight) > profile.climbTo(goal) * (1 + 1e-12) + 1e-12) return false;
-  const minRamp = style.ramp[0];
-  for (;;) {
-    const s = profile.end;
-    const h = profile.endHeight;
-    const remaining = goal - s;
-    if (remaining < 2 * minRamp + style.hold[0]) break;
-    const r = Math.round(rng.range(minRamp, Math.min(style.ramp[1], remaining - minRamp)));
-    const hold = Math.max(0, Math.min(Math.round(rng.range(style.hold[0], style.hold[1])), remaining - r - minRamp));
-    const far = rng.chance(style.drama);
-    const u = rng.next();
-    const reach = maxClimb(s, s + r, profile.limit, profile.gradeChange) * PLAN_SAFETY;
-    const rest = maxClimb(s + r + hold, goal, profile.limit, profile.gradeChange) * PLAN_SAFETY;
-    const lo = Math.max(0, h - reach, endHeight - rest);
-    const hi = Math.min(Math.max(style.maxHeight, endHeight), h + reach, endHeight + rest);
-    if (lo > hi) break;
-    // Measured from where the road is, pulled into the reachable range.
-    const from = h < lo ? lo : h > hi ? hi : h;
-    let target: number;
-    if (!far) target = lo + (hi - lo) * u;
-    else if (hi - from >= from - lo) target = from + (hi - from) * (0.5 + 0.5 * u);
-    else target = lo + (from - lo) * 0.5 * u;
-    if (!profile.rampTo(s + r, target)) break;
-    profile.holdTo(s + r + hold);
+  const change = Math.abs(endHeight - profile.endHeight);
+  if (change > profile.climbTo(goal) * (1 + 1e-12) + 1e-12) return false;
+  const s = profile.end;
+  const remaining = goal - s;
+  if (change === 0) {
+    profile.holdTo(goal);
+    return true;
+  }
+  const u = rng.next();
+  const shortest = Math.max(1, Math.round(style.ramp[0]));
+  const startOf = (r: number): number => s + Math.floor(u * (remaining - r));
+  const fits = (r: number): boolean => {
+    const start = startOf(r);
+    return maxClimb(start, start + r, profile.limit, profile.gradeChange) * PLAN_SAFETY >= change;
+  };
+  // The shortest ramp length (in RAMP_LENGTH_STEP steps) that makes the change. A longer ramp nearly always climbs
+  // further, so a binary search finds it; the scan after it covers the odd length where that does not hold.
+  const count = shortest < remaining ? Math.ceil((remaining - shortest) / RAMP_LENGTH_STEP) : 0;
+  let lo = 0;
+  let hi = count;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (fits(shortest + mid * RAMP_LENGTH_STEP)) hi = mid;
+    else lo = mid + 1;
+  }
+  for (let k = lo; k < count; k++) {
+    const r = shortest + k * RAMP_LENGTH_STEP;
+    if (!fits(r)) continue;
+    const start = startOf(r);
+    profile.holdTo(start);
+    if (!profile.rampTo(start + r, endHeight)) break;
+    profile.holdTo(goal);
+    return profile.endHeight === endHeight;
   }
   if (profile.end >= goal) return profile.endHeight === endHeight;
   return profile.rampTo(goal, endHeight);

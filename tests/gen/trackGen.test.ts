@@ -82,7 +82,7 @@ describe('generateLevel', () => {
   it('matches the pinned level for 2026-W48', () => {
     // If this changes on purpose after a release, bump GEN_VERSION in src/types.ts: weeks already played must stay
     // reproducible. (Pinned for GEN_VERSION 2: layered roads.)
-    expect(hashString(JSON.stringify(level))).toBe('3c47ec64');
+    expect(hashString(JSON.stringify(level))).toBe('8683cddc');
   });
 
   it('labels the level with its week, seed and generator version', () => {
@@ -193,7 +193,8 @@ describe('generated levels obey the rules', () => {
       const caps = level.walls.filter((w) => {
         const far = (w.ax - goal.respawn.x) * dirX + (w.az - goal.respawn.z) * dirZ;
         const across = Math.abs((w.ax - goal.respawn.x) * -dirZ + (w.az - goal.respawn.z) * dirX);
-        return far > RULES.goalRunOff && across <= halfWidth + 1e-6;
+        // Only walls that end the run-off: another road far beyond the cap may also lie straight ahead.
+        return far > RULES.goalRunOff && far <= RULES.goalCap + 1 && across <= halfWidth + 1e-6;
       });
       expect(caps.length, level.id).toBeGreaterThanOrEqual(1);
       for (const w of caps) expect([w.ya, w.yb]).toEqual([goal.y, goal.y]);

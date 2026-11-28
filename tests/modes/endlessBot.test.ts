@@ -545,7 +545,7 @@ describe('the mode can be lost', () => {
   it('is more dangerous on medium than on easy, and on hard than on medium, for the same hands at the same speed', () => {
     // Good hands, no judgement: the bot's steering at one fixed speed, slowing for nothing. How far it gets says
     // how much the road punishes that speed.
-    const speeds = [14, 16, 18, 20, 22, 24];
+    const speeds = [14, 18, 20, 22, 24, 26, 28];
     const cap = 10000;
     const mean = new Map<string, number>();
     const lines: string[] = [];
@@ -571,16 +571,17 @@ describe('the mode can be lost', () => {
     // Slow enough and every road is safe; fast enough and none is.
     for (const difficulty of DIFFICULTIES) {
       expect(at(14, difficulty)).toBe(cap);
-      expect(at(24, difficulty)).toBeLessThan(1500);
+      expect(at(26, difficulty)).toBeLessThan(1500);
     }
-    // In between, the difficulty decides. (GEN_VERSION 2: easy and medium are closer than they were, about 10-20%
-    // apart at 20-22 m/s; hard is clearly the worst, and the only one whose open edges throw this driver off.)
-    for (const speed of [20, 22, 24]) {
+    // In between, the difficulty decides. (GEN_VERSION 3 / PHYSICS_VERSION 4: streets are level between clean
+    // ramps and the surface no longer kicks the car on the inside of a climbing bend, so every road forgives a
+    // couple of m/s more than before; the spread between difficulties now shows at 22-26 m/s, widest at 24.)
+    for (const speed of [22, 24, 26]) {
       expect(at(speed, 'easy'), `${speed} m/s`).toBeGreaterThan(at(speed, 'medium'));
       expect(at(speed, 'medium'), `${speed} m/s`).toBeGreaterThan(at(speed, 'hard'));
     }
-    expect(at(20, 'easy')).toBeGreaterThan(1.5 * at(20, 'hard'));
-    expect(at(22, 'medium')).toBeGreaterThan(1.5 * at(22, 'hard'));
+    expect(at(24, 'easy')).toBeGreaterThan(1.5 * at(24, 'hard'));
+    expect(at(24, 'medium')).toBeGreaterThan(1.5 * at(24, 'hard'));
     expect(at(24, 'easy')).toBeGreaterThan(1.5 * at(24, 'medium'));
   }, 120_000);
 });
@@ -604,12 +605,14 @@ describe('the mode can be lost', () => {
  * - Review fixes: open edges keep their landing zone clear (and reserve it from later road), a crest never sits
  *   where its flight would carry a car over the next bend's barrier, the progress tracker ignores heights while the
  *   car is airborne, and the score locks out after a crash. The road changed: 973.58 m to 1034.65 m.
+ * - PHYSICS_VERSION 4 / GEN_VERSION 3: level streets between single clean ramps, and a road surface that no longer
+ *   steps at segment joints on the inside of a bend: 1034.65 m to 1033.35 m.
  */
 describe('golden endless run', () => {
-  const PINNED_PHYSICS_VERSION = 3;
-  const PINNED_GEN_VERSION = 2;
-  const PINNED_HASH = 'f0c27f81f1b28fe5';
-  const PINNED_DISTANCE = 1034.6478589079409;
+  const PINNED_PHYSICS_VERSION = 4;
+  const PINNED_GEN_VERSION = 3;
+  const PINNED_HASH = '008dfbd65c83c03c';
+  const PINNED_DISTANCE = 1033.3484446000944;
   const GOLDEN_TICKS = 60 * SIM_HZ;
 
   function golden(): { hash: string; distance: number; bumps: number; mode: EndlessMode } {

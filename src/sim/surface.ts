@@ -10,8 +10,14 @@
  * Deliberately NOT the round caps a capsule would have at each end: beside a widening, the cap of the wide end
  * bulges out past the walls of the narrower road leading up to it, and would make road out of thin air there.
  *
- * The height over a segment is linear along it (by the projection, clamped to the segment), level across it, plus
- * the highest bump that covers the point and belongs to a road within BUMP_MATCH of that height.
+ * The height over a segment is linear along it, level across it, plus the highest bump that covers the point and
+ * belongs to a road within BUMP_MATCH of that height. "Along" is measured between the JOINT LINES at its ends: the
+ * bisectors of the angle two segments of a piece meet at. Every point of a joint line has the joint's height, so the
+ * height is continuous from one segment to the next everywhere across the road, also on the inside of a bend where
+ * the two segments' bands overlap (a plain projection there would make the surface step up or down as the point
+ * moves from one band into the next: a kick on every bend of a climb). Past a joint a segment's height carries on
+ * at its own grade, which the next segment's matches to within the profile's small change of grade; past the very
+ * ends of a piece it stays level with the end point.
  *
  * A closed end of a road (the start of a level, its goal run-off) may be extended: the band of the first / last
  * segment then carries on straight past the end for that many metres, level with the end point.
@@ -87,7 +93,16 @@ const QUAD = 14;
 /** Four edges, each an inward unit normal and an offset: inside when nx * x + nz * z >= offset for all four. */
 const Q0 = 15;
 const BOX = 27;
-const SEG_STRIDE = 31;
+/**
+ * Unit normals of the joint lines at the segment's start and end: the bisector of the two segments that meet there
+ * (or square to the segment at the end of a piece). Pointing along the road.
+ */
+const NA = 31;
+const NB = 33;
+/** 1 when the start / end is a joint with the next segment of the same piece (the height runs on across it). */
+const JA = 35;
+const JB = 36;
+const SEG_STRIDE = 37;
 
 // Bump record layout.
 const B_X = 0;
@@ -270,6 +285,35 @@ function writeQuad(s: Float64Array, o: number, xs: readonly number[], zs: readon
   return true;
 }
 
+/**
+ * Writes the unit normal of the joint line through path[k] at `at`: the bisector of the segments meeting there,
+ * pointing along the road; square to the one segment at either end of the path, or where the two (nearly)
+ * double back.
+ */
+function jointNormal(path: RoadPiece['path'], k: number, s: Float64Array, at: number): void {
+  let nx = 0;
+  let nz = 0;
+  for (const j of [k - 1, k]) {
+    if (j < 0 || j + 1 >= path.length) continue;
+    const dx = path[j + 1].x - path[j].x;
+    const dz = path[j + 1].z - path[j].z;
+    const length = Math.sqrt(dx * dx + dz * dz);
+    if (!(length > 1e-9)) continue;
+    nx += dx / length;
+    nz += dz / length;
+  }
+  let length = Math.sqrt(nx * nx + nz * nz);
+  if (!(length > 0.2)) {
+    // Doubling back (or a lone point): square to the segment that starts here, or ends here.
+    const j = k + 1 < path.length ? k : k - 1;
+    nx = path[j + 1].x - path[j].x;
+    nz = path[j + 1].z - path[j].z;
+    length = Math.sqrt(nx * nx + nz * nz) || 1;
+  }
+  s[at] = nx / length;
+  s[at + 1] = nz / length;
+}
+
 const quadX = [0, 0, 0, 0];
 const quadZ = [0, 0, 0, 0];
 
@@ -314,6 +358,10 @@ export function addPiece(surface: SurfaceIndex, owner: number, piece: RoadPiece,
     s[o + T_MAX] = 1 + (i === last && extendEnd > 0 ? extendEnd / length : 0) + JOINT_SLACK;
     s[o + OWNER] = owner;
     s[o + PATH] = i;
+    jointNormal(path, i, s, o + NA);
+    jointNormal(path, i + 1, s, o + NB);
+    s[o + JA] = i > 0 ? 1 : 0;
+    s[o + JB] = i < last ? 1 : 0;
 
     // Box: the band (with its extensions) and the quad.
     const reach = Math.max(a.halfWidth, b.halfWidth) + FOOTPRINT_MARGIN;
@@ -448,6 +496,9 @@ function bumpAt(index: Index, list: readonly number[], x: number, z: number, bas
   index.bumpSZ = sz;
 }
 
+/** Slack on a joint line, so that a point exactly on it belongs to both segments that meet there. */
+const JOINT_LINE_SLACK = 1e-9;
+
 /**
  * Considers every segment of `list` under (x, z). Mode 0 keeps the highest surface not above `limit`; mode 1 keeps
  * the surface nearest `limit` (by height). The best so far is in the index's best* fields.
@@ -465,10 +516,26 @@ function scan(index: Index, list: readonly number[], bumps: readonly number[], x
     const pz = z - az;
     const t = (px * dx + pz * dz) * s[o + INV_LEN_SQ];
     const t01 = t < 0 ? 0 : t > 1 ? 1 : t;
+    // Where the point lies between the joint lines: 0 on the start one, 1 on the end one (NaN where the two lines
+    // cross before reaching the point, deep on the inside of a very tight bend: there the plain projection decides).
+    const d0 = px * s[o + NA] + pz * s[o + NA + 1];
+    const d1 = (dx - px) * s[o + NB] + (dz - pz) * s[o + NB + 1];
+    const tj = d0 > -JOINT_LINE_SLACK && d1 > -JOINT_LINE_SLACK && d0 + d1 > 1e-9 ? d0 / (d0 + d1) : NaN;
+    // Past a joint with the same piece's neighbour the point is the neighbour's, whatever this segment's band says:
+    // two segments never both answer for one point of their own piece, so the height cannot step from one to the
+    // other.
+    if (tj !== tj) {
+      const beforeStart = d0 < -JOINT_LINE_SLACK;
+      const pastEnd = d1 < -JOINT_LINE_SLACK;
+      // Both at once only beyond where the two lines cross; the band decides there.
+      if ((beforeStart && !pastEnd && s[o + JA] === 1) || (pastEnd && !beforeStart && s[o + JB] === 1)) continue;
+    }
     let inside = false;
-    if (t >= s[o + T_MIN] && t <= s[o + T_MAX]) {
-      const across = (pz * dx - px * dz) * s[o + INV_LEN];
-      const reach = s[o + HA] + s[o + DH] * t01 + FOOTPRINT_MARGIN;
+    const across = (pz * dx - px * dz) * s[o + INV_LEN];
+    const reach = s[o + HA] + s[o + DH] * (tj === tj ? tj : t01) + FOOTPRINT_MARGIN;
+    if (tj === tj) inside = across <= reach && across >= -reach;
+    if (!inside && t >= s[o + T_MIN] && t <= s[o + T_MAX]) {
+      // The plain band: also carries a closed end of the piece on past its last point.
       inside = across <= reach && across >= -reach;
     }
     if (!inside && s[o + QUAD] === 1) {
@@ -480,7 +547,7 @@ function scan(index: Index, list: readonly number[], bumps: readonly number[], x
     }
     if (!inside) continue;
     const dy = s[o + DY];
-    const base = s[o + AY] + dy * t01;
+    const base = s[o + AY] + dy * (tj === tj ? tj : t01);
     // A bump only ever raises a road: one already too high cannot come back into reach.
     if (!nearest && base > limit) continue;
     let h = base;

@@ -143,9 +143,9 @@ describe('options shape the levels', () => {
 
 /** Pinned layouts for GEN_VERSION 2. */
 const GOLDEN_LEVELS: Record<string, string> = {
-  L1: 'f1d917ec',
-  L2: 'b51ee477',
-  L3: '6a96142d',
-  L4: 'f66e1a5b',
-  L5: '7452524d',
+  L1: '310c7780',
+  L2: '136b8576',
+  L3: '4b28ffb3',
+  L4: '44b0531e',
+  L5: '3c697b95',
 };

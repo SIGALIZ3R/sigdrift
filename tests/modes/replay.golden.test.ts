@@ -12,10 +12,10 @@ import type { InputState, Level, RunMode, World } from '../../src/types';
 import { GEN_VERSION, PHYSICS_VERSION, SIM_HZ } from '../../src/types';
 
 const WEEK = '2026-W48';
-/** The rough runs need pillars, which 2026-W48 no longer has at GEN_VERSION 2. */
-const ROUGH_WEEK = '2027-W05';
-/** The fall run needs raised road with open edges taken at full throttle: Vertigo Ramps has both. */
-const FALL_LEVEL = 'L3';
+/** The rough runs need a pillar the driver hits, which 2026-W53 has at GEN_VERSION 3. */
+const ROUGH_WEEK = '2026-W53';
+/** The fall run needs raised road with open edges taken at full throttle: Skyway Zero has the most of both. */
+const FALL_LEVEL = 'L5';
 const TICK_LIMIT = 200 * SIM_HZ;
 
 /**
@@ -53,21 +53,25 @@ const TICK_LIMIT = 200 * SIM_HZ;
  *   bend's exit, and the score locks out while a wreck slides after a crash: the rough and fall pins moved (the
  *   generator's output for the weekly options changed, GEN_VERSION stays 2 before release). The clean run is
  *   unchanged.
+ * - GEN_VERSION 3, PHYSICS_VERSION 4: streets are level between single clean ramps (no rolling hills), and the road
+ *   surface is continuous across segment joints (no kick on the inside of a climbing bend). Every pin moved. The
+ *   rough runs moved to 2026-W53 with seed golden-rough-10 (the first week and seed whose script still hits a
+ *   pillar), and the fall run to L5 (the new L3 is not thrown off by this script).
  */
-const PINNED_GEN_VERSION = 2;
-const PINNED_PHYSICS_VERSION = 3;
-const PINNED_FINISH_TICKS = 6846;
-const PINNED_FINISH_HASH = 'df1b3dd29b743c1f';
-const PINNED_ROLL_OUT_HASH = '5d66b21d43398cb1';
-const PINNED_ROUGH_ASSISTED_HASH = '8032ac6d2a19b047';
-const PINNED_ROUGH_UNASSISTED_HASH = '21abae8bce4195ea';
-const PINNED_FALL_HASH = '952fcb22876474f3';
+const PINNED_GEN_VERSION = 3;
+const PINNED_PHYSICS_VERSION = 4;
+const PINNED_FINISH_TICKS = 5919;
+const PINNED_FINISH_HASH = 'f28f2a01288f4571';
+const PINNED_ROLL_OUT_HASH = '3940237698c4c5a4';
+const PINNED_ROUGH_ASSISTED_HASH = 'aebf9267fe4d084a';
+const PINNED_ROUGH_UNASSISTED_HASH = 'c1421570affdf5e6';
+const PINNED_FALL_HASH = '5bdcbaaddfeff020';
 
 const ROLL_OUT_TICKS = 4 * SIM_HZ;
 const ROUGH_TICKS = 75 * SIM_HZ;
 const ROUGH_SAMPLE_EVERY = SIM_HZ;
 /** Chosen because this script finds walls, a pillar, spins and three checkpoints. Changing it moves the pins. */
-const ROUGH_SEED = 'golden-rough-3';
+const ROUGH_SEED = 'golden-rough-10';
 const FALL_TICKS = 90 * SIM_HZ;
 /** Share of the half-second slots in which the rough driver simply follows the road. */
 const ROUGH_FOLLOW = 0.6;

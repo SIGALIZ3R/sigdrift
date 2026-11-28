@@ -34,9 +34,9 @@ export const SIM_HZ = 120;
 export const DT = 1 / SIM_HZ;
 
 /** Bump when physics behaviour changes: recorded times and replays are only comparable within one version. */
-export const PHYSICS_VERSION = 3;
+export const PHYSICS_VERSION = 4;
 /** Bump when the generator's output for a given seed would change. */
-export const GEN_VERSION = 2;
+export const GEN_VERSION = 3;
 
 /** Height of the city floor under every road, m. */
 export const TERRAIN_Y = -4;

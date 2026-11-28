@@ -98,7 +98,7 @@ export const CAR = {
   tyre: new Color(0x0b0c11),
   accent: ACCENTS[HUE.cyan].glow,
   headlight: new Color(0xfff1d0).multiplyScalar(2.4),
-  headlightBeam: new Color(0xfff1d0).multiplyScalar(0.1),
+  headlightBeam: new Color(0xfff1d0).multiplyScalar(0.2),
   /** Scaled between `tailIdle` and `tailBraking` every frame. */
   tail: new Color(0xff1a2e),
   tailIdle: 0.9,

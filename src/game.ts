@@ -1,5 +1,6 @@
 import { createAudio } from './audio/mixer';
 import type { GameAudio } from './audio/mixer';
+import { SONGS } from './audio/music';
 import { lerp, lerpAngle } from './core/fixedMath';
 import { createFixedLoop } from './core/loop';
 import type { FixedLoop } from './core/loop';
@@ -65,6 +66,8 @@ const PAST_WEEKS = 8;
 const MIN_AUDIBLE_IMPACT = 2;
 /** A car that moved further than this in one tick was put somewhere: never draw it streaking there. */
 const TELEPORT_DISTANCE = 6;
+/** On the endless road the background music changes after this much driving, s. */
+const ENDLESS_SONG_SECONDS = 120;
 const UI_BLIPS = { move: 'uiMove', select: 'uiSelect', back: 'uiBack' } as const;
 
 const NEUTRAL_INPUT: InputState = { steer: 0, throttle: 0, brake: 0, handbrake: false, reset: false };
@@ -128,6 +131,8 @@ export class Game {
    * focus away from RETRY. Nav is ignored until the driving controls have been let go.
    */
   private navHeld = false;
+  /** Driving time since the current song was picked, s. */
+  private songSeconds = 0;
   /**
    * True once the current run has been driven, even for a moment, with a car that is not the stock one. Such a
    * run is not saved: its time or score means nothing next to the stock car's. Set by any tuning-panel edit and by
@@ -281,7 +286,17 @@ export class Game {
       this.showMainMenu();
       return;
     }
+    this.pickSong();
     this.beginRun();
+  }
+
+  /** A different background song from the last one, chosen at random; its two-minute clock starts again. */
+  private pickSong(): void {
+    const last = this.audio.musicSong;
+    let next = Math.floor(Math.random() * SONGS.length);
+    if (SONGS.length > 1 && next === last) next = (next + 1 + Math.floor(Math.random() * (SONGS.length - 1))) % SONGS.length;
+    this.audio.playMusic(next);
+    this.songSeconds = 0;
   }
 
   private weeklyInfo(weekId: string): TrackInfo {
@@ -416,6 +431,11 @@ export class Game {
   private tick(): void {
     if (!this.isSimulating()) return;
     const session = this.session;
+    // On the endless road the music moves on to another song every two minutes of driving.
+    if (session.kind === 'endless' && this.screen === 'driving' && session.phase === 'running') {
+      this.songSeconds += DT;
+      if (this.songSeconds >= ENDLESS_SONG_SECONDS) this.pickSong();
+    }
     const phaseBefore = session.phase;
     const world = session.world;
     const worldTickBefore = world.tick;

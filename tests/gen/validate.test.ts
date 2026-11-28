@@ -195,8 +195,11 @@ describe('validateLevel', () => {
 
   it('rejects a wall on an open edge and a wall that belongs to nothing', () => {
     const open = broken((level) => {
-      const i = level.leftOpen.findIndex(Boolean);
-      level.walls.push(wall(level.left[i].x, level.left[i].z, level.left[i + 1].x, level.left[i + 1].z, level.path[i].y));
+      // Whichever side of the road has an open stretch.
+      const onLeft = level.leftOpen.some(Boolean);
+      const edge = onLeft ? level.left : level.right;
+      const i = (onLeft ? level.leftOpen : level.rightOpen).findIndex(Boolean);
+      level.walls.push(wall(edge[i].x, edge[i].z, edge[i + 1].x, edge[i + 1].z, level.path[i].y));
     });
     expect(has(open, 'open edge has a wall')).toBe(true);
     const stray = broken((level) => {

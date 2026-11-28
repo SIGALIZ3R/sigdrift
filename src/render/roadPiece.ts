@@ -950,18 +950,22 @@ const CREST_HALF = 0.24;
 /** The crest line stops this far short of the road edge, leaving the edge strips alone. */
 const CREST_MARGIN = 0.8;
 const CREST_BRIGHTNESS = 1.15;
-/** Hazard stripes up both faces of the bump. */
-const STRIPE_MARGIN = 1.0;
-const STRIPE_WIDTH = 0.6;
-const STRIPE_PITCH = 1.3;
-/** Stripes start this far in from the foot of the bump and stop this far from the crest line. */
-const STRIPE_FOOT_GAP = 0.2;
-const STRIPE_CREST_GAP = 0.22;
-/** Stripe brightness at the foot and at the top, as a multiple of plain amber. */
-const STRIPE_FOOT = 0.14;
-const STRIPE_TOP = 0.95;
-/** The face the car lands on is marked too, but stays clearly dimmer than the one it meets first. */
-const STRIPE_FAR_SIDE = 0.45;
+/** Contour rings up both faces of the bump: how many, how wide, how far they wobble and how bright they are. */
+const CONTOUR_LEVELS = 4;
+const CONTOUR_HALF = 0.11;
+const CONTOUR_WOBBLE = 0.22;
+const CONTOUR_SEGMENT = 0.7;
+const CONTOUR_MARGIN = 0.7;
+const CONTOUR_FOOT = 0.7;
+const CONTOUR_TOP = 1.25;
+/** The face the car lands on is marked too, but dimmer than the one it meets first. */
+const CONTOUR_FAR_SIDE = 0.7;
+/** Bump colours: violet at the foot, lime at the crest, and the light rising off it. */
+const BUMP_FOOT = ACCENTS[HUE.violet].glow;
+const BUMP_TOP = ACCENTS[HUE.lime].glow;
+const BUMP_GLOW_COLOR = ACCENTS[HUE.lime].base;
+const BUMP_GLOW = 0.8;
+const contourColor = new Color();
 /** Chevrons painted on the plain road before the bump, pointing at it. */
 const CHEVRON_COUNT = 3;
 const CHEVRON_FIRST = 3.5;
@@ -1011,25 +1015,93 @@ function addBumpStrip(
   }
 }
 
-/** Glowing amber line along the crest and hazard stripes up both faces. */
+/** Height of a bump's own profile (without the road under it) at u along the road from its crest. */
+function bumpProfile(bump: Bump, u: number): number {
+  return Math.abs(u) < bump.halfLength ? bump.height * 0.5 * (1 + Math.cos((Math.PI * u) / bump.halfLength)) : 0;
+}
+
+/**
+ * One wavy contour line across a bump at `u` along the road from its crest: a glowing ring at one height, like a
+ * line on a contour map. It wobbles along its length (seeded by the bump, so every bump looks its own) and fades
+ * out towards the road edges.
+ */
+function addContour(b: GeometryBuilder, bump: Bump, u: number, reach: number, color: Color, k: number, seed: number): void {
+  const segments = Math.max(4, Math.ceil((2 * reach) / CONTOUR_SEGMENT));
+  const rx = -bump.dirZ;
+  const rz = bump.dirX;
+  const limit = bump.halfLength - CONTOUR_HALF;
+  const first = b.vertexCount;
+  for (let i = 0; i <= segments; i++) {
+    const t = i / segments;
+    const v = -reach + 2 * reach * t;
+    const wobble =
+      CONTOUR_WOBBLE * (Math.sin(v * 0.9 + seed) * 0.65 + Math.sin(v * 2.3 + seed * 1.7) * 0.35);
+    let uc = u + wobble * (1 - Math.abs(u) / bump.halfLength);
+    uc = Math.max(-limit, Math.min(limit, uc));
+    // Brightest across the middle of the road, fading to nothing at the ends.
+    const edge = 1 - Math.abs(2 * t - 1);
+    const fade = k * Math.min(1, edge * 3.5);
+    for (const du of [-CONTOUR_HALF, CONTOUR_HALF]) {
+      const uu = uc + du;
+      const h = bump.y + bumpProfile(bump, uu);
+      b.vertex(bump.x + bump.dirX * uu + rx * v, BUMP_PAINT_Y + h, bump.z + bump.dirZ * uu + rz * v, color, fade);
+    }
+  }
+  for (let i = 0; i < segments; i++) {
+    const a = first + i * 2;
+    b.quad(a, a + 1, a + 3, a + 2);
+  }
+}
+
+/**
+ * Glowing contour rings up both faces of the bump, a bright line along its crest: the rings bunch up where the
+ * bump is steep and run from violet at its foot to lime at the top, so its shape reads from above.
+ */
 function addBumpPaint(b: GeometryBuilder, bump: Bump, roadHalfWidth: number): void {
-  const amber = ACCENTS[HUE.amber];
   const crest = roadHalfWidth - CREST_MARGIN;
   if (crest > 0.3) {
-    addBumpStrip(b, bump, -CREST_HALF, CREST_HALF, -crest, crest, amber.glow, CREST_BRIGHTNESS, CREST_BRIGHTNESS);
+    addBumpStrip(b, bump, -CREST_HALF, CREST_HALF, -crest, crest, BUMP_TOP, CREST_BRIGHTNESS, CREST_BRIGHTNESS);
   }
+  const reach = roadHalfWidth - CONTOUR_MARGIN;
+  if (reach < 1) return;
+  const seed = (bump.x * 0.37 + bump.z * 0.61) % 6.283;
+  for (let j = 1; j <= CONTOUR_LEVELS; j++) {
+    // Equal steps in height: where along the profile the bump reaches this level.
+    const level = j / (CONTOUR_LEVELS + 1);
+    const u = (bump.halfLength / Math.PI) * Math.acos(2 * level - 1);
+    if (u - CONTOUR_HALF <= CREST_HALF + 0.05) continue;
+    contourColor.copy(BUMP_FOOT).lerp(BUMP_TOP, level);
+    const k = CONTOUR_FOOT + (CONTOUR_TOP - CONTOUR_FOOT) * level;
+    addContour(b, bump, -u, reach, contourColor, k, seed + j * 1.3);
+    addContour(b, bump, u, reach, contourColor, k * CONTOUR_FAR_SIDE, seed + j * 2.1 + 1);
+  }
+}
 
-  const reach = roadHalfWidth - STRIPE_MARGIN;
-  const near = bump.halfLength - STRIPE_FOOT_GAP;
-  const far = CREST_HALF + STRIPE_CREST_GAP;
-  if (reach < STRIPE_WIDTH / 2 || near <= far) return;
-  const count = Math.max(1, Math.floor((2 * reach + STRIPE_PITCH - STRIPE_WIDTH) / STRIPE_PITCH));
-  const start = -((count - 1) * STRIPE_PITCH + STRIPE_WIDTH) / 2;
-  for (let s = 0; s < count; s++) {
-    const v0 = start + s * STRIPE_PITCH;
-    const v1 = v0 + STRIPE_WIDTH;
-    addBumpStrip(b, bump, -near, -far, v0, v1, amber.glow, STRIPE_FOOT, STRIPE_TOP);
-    addBumpStrip(b, bump, far, near, v0, v1, amber.glow, STRIPE_TOP * STRIPE_FAR_SIDE, STRIPE_FOOT * STRIPE_FAR_SIDE);
+/** Light rising off a bump: strongest on the crest, nothing at its foot. Goes in the additive glow pass. */
+function addBumpGlow(b: GeometryBuilder, bump: Bump, roadHalfWidth: number): void {
+  const reach = roadHalfWidth - 0.3;
+  if (reach < 1 || !(bump.height > 0)) return;
+  const rows = Math.max(6, Math.ceil((2 * bump.halfLength) / bumpStep(bump)));
+  const cols = 8;
+  const rx = -bump.dirZ;
+  const rz = bump.dirX;
+  const first = b.vertexCount;
+  for (let r = 0; r <= rows; r++) {
+    const u = -bump.halfLength + (2 * bump.halfLength * r) / rows;
+    const rise = bumpProfile(bump, u) / bump.height;
+    const h = bump.y + bumpProfile(bump, u) + BUMP_PAINT_Y * 0.5;
+    for (let c = 0; c <= cols; c++) {
+      const across = (c / cols) * 2 - 1;
+      const v = across * reach;
+      const k = BUMP_GLOW * rise * rise * (1 - across * across);
+      b.vertex(bump.x + bump.dirX * u + rx * v, h, bump.z + bump.dirZ * u + rz * v, BUMP_GLOW_COLOR, k);
+    }
+  }
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const a = first + r * (cols + 1) + c;
+      b.quad(a, a + 1, a + cols + 2, a + cols + 1);
+    }
   }
 }
 
@@ -1042,7 +1114,7 @@ function addChevrons(b: GeometryBuilder, piece: RoadPiece, bump: Bump, nearest: 
   const { path, ground, groundCount } = piece;
   const at = path[nearest];
   const crestDist = at.dist + (bump.x - at.x) * bump.dirX + (bump.z - at.z) * bump.dirZ;
-  const glow = ACCENTS[HUE.amber].glow;
+  const glow = BUMP_TOP;
   let j = Math.min(nearest, path.length - 2);
   for (let c = 0; c < CHEVRON_COUNT; c++) {
     const dist = crestDist - bump.halfLength - CHEVRON_FIRST - c * CHEVRON_SPACING;
@@ -1458,5 +1530,15 @@ export function addRoadPieceGlow(b: GeometryBuilder, piece: RoadPiece): void {
     addPillarGlow(b, props[i], propBase(piece, props[i]));
   }
   addHazardGlow(b, piece);
+  const { bumps, path } = piece;
+  if (path.length >= 2) {
+    for (let i = 0; i < bumps.length; i++) {
+      const bump = bumps[i];
+      if (!(bump.height > 0) || !(bump.halfLength > 0)) continue;
+      const nearest = nearestPathIndex(path, bump.x, bump.z, bump.y);
+      b.section = pointSection[nearest];
+      addBumpGlow(b, bump, Math.min(path[nearest].halfWidth, bump.halfWidth));
+    }
+  }
   b.section = 0;
 }
