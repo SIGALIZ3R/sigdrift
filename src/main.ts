@@ -29,7 +29,7 @@ const MODES: readonly GameMode[] = ['weekly', 'level', 'endless'];
 
 function requireElement(id: string): HTMLElement {
   const element = document.getElementById(id);
-  if (!element) throw new Error(`SigDRIFT: the page has no #${id} element`);
+  if (!element) throw new Error(`DriftNeo: the page has no #${id} element`);
   return element;
 }
 
@@ -38,7 +38,7 @@ function chosenWeek(query: URLSearchParams): string {
   const requested = query.get('week');
   if (requested !== null) {
     if (parseWeekId(requested)) return requested;
-    console.warn(`SigDRIFT: ignoring ?week=${requested}, which is not an ISO week such as 2026-W48`);
+    console.warn(`DriftNeo: ignoring ?week=${requested}, which is not an ISO week such as 2026-W48`);
   }
   return currentWeekId(new Date());
 }
@@ -49,7 +49,7 @@ function chosenDifficulty(query: URLSearchParams): Difficulty {
   const match = DIFFICULTIES.find((difficulty) => difficulty === requested);
   if (match) return match;
   if (requested !== null) {
-    console.warn(`SigDRIFT: ignoring ?difficulty=${requested}; it can be ${DIFFICULTIES.join(', ')}`);
+    console.warn(`DriftNeo: ignoring ?difficulty=${requested}; it can be ${DIFFICULTIES.join(', ')}`);
   }
   return loadEndlessDifficulty();
 }
@@ -59,7 +59,7 @@ function chosenMode(query: URLSearchParams): GameMode {
   const requested = query.get('mode');
   const match = MODES.find((mode) => mode === requested);
   if (match) return match;
-  if (requested !== null) console.warn(`SigDRIFT: ignoring ?mode=${requested}; it can be ${MODES.join(', ')}`);
+  if (requested !== null) console.warn(`DriftNeo: ignoring ?mode=${requested}; it can be ${MODES.join(', ')}`);
   return query.get('level') !== null ? 'level' : 'weekly';
 }
 
@@ -69,7 +69,7 @@ function chosenLevel(query: URLSearchParams): string {
   if (requested !== null) {
     const def = getLevelDef(requested.toUpperCase());
     if (def) return def.id;
-    console.warn(`SigDRIFT: ignoring ?level=${requested}; it can be ${LEVELS.map((d) => d.id).join(', ')}`);
+    console.warn(`DriftNeo: ignoring ?level=${requested}; it can be ${LEVELS.map((d) => d.id).join(', ')}`);
   }
   return LEVELS[0].id;
 }
@@ -105,7 +105,7 @@ function showBootError(ui: HTMLElement, error: unknown): void {
     'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;' +
     'gap:12px;padding:24px;text-align:center;font:16px/1.5 system-ui,sans-serif;color:#e8ecff;background:#05060d;';
   const title = document.createElement('strong');
-  title.textContent = 'SigDRIFT could not start';
+  title.textContent = 'DriftNeo could not start';
   const detail = document.createElement('span');
   detail.style.maxWidth = '34em';
   detail.textContent = error instanceof Error ? error.message : String(error);

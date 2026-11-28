@@ -498,9 +498,9 @@ function controlsTable(): HTMLElement {
 
 function logo(big: boolean): HTMLElement {
   const name = el('h1', big ? 'sd-logo sd-logo-big' : 'sd-logo');
-  name.setAttribute('aria-label', 'SigDRIFT');
+  name.setAttribute('aria-label', 'DriftNeo');
   // Both halves carry their own text, so a slice band can cross the whole name.
-  for (const [tag, text] of [['span', 'Sig'], ['b', 'DRIFT']] as const) {
+  for (const [tag, text] of [['span', 'Drift'], ['b', 'NEO']] as const) {
     const half = el(tag, '', text);
     half.setAttribute('data-text', text);
     name.appendChild(half);
@@ -667,7 +667,7 @@ export function createMenu(root: HTMLElement, callbacks: MenuCallbacks, initialC
       id: 'title',
       content,
       primary: prompt,
-      label: 'SigDRIFT',
+      label: 'DriftNeo',
       width: 'bare',
       confirmGuardMs: CONFIRM_GUARD_MS,
       start: () => startSignalLoss(name, root),

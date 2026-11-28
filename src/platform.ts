@@ -3,7 +3,7 @@ import { createRenderer } from './render/renderer';
 import type { GameRenderer, Settings } from './types';
 
 const WEBGL_MESSAGE =
-  'SigDRIFT needs WebGL 2, which this browser or device could not provide. ' +
+  'DriftNeo needs WebGL 2, which this browser or device could not provide. ' +
   'Try a current browser with hardware acceleration switched on.';
 
 /** The renderer, or an error whose message the boot screen can show as it is. */

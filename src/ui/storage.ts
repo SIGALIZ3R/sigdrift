@@ -1,5 +1,6 @@
 /**
- * Everything SigDRIFT keeps in localStorage. Keys are prefixed "sigdrift:":
+ * Everything DriftNeo keeps in localStorage. Keys are prefixed "sigdrift:" (the game's first name): kept as it is so
+ * that the rename never threw away anyone's records, settings or unlocked cars.
  *   sigdrift:settings                 Settings
  *   sigdrift:run:<trackId>            RunRecords for a weekly run ("2026-W48") or a level ("L1".."L5")
  *   sigdrift:endless:<difficulty>     EndlessRecords

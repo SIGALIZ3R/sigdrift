@@ -1,5 +1,5 @@
 /**
- * Shared contracts for SigDRIFT. Every module builds against these types.
+ * Shared contracts for DriftNeo. Every module builds against these types.
  *
  * COORDINATES
  * - The simulation is 2.5D: the car drives on road SURFACES at heights. Sim (x, z) maps to three.js (x, ?, z) and the

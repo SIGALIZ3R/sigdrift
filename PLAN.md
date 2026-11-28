@@ -1,6 +1,6 @@
-# SigDRIFT — game plan
+# DriftNeo — game plan
 
-Working title: **SigDRIFT** (the folder name; check the name is free before going public).
+Working title: **DriftNeo** (the folder name; check the name is free before going public).
 
 An original browser drift game: one rear-wheel-drive car, a locked isometric camera, a neon cyberpunk look, and a new generated level every week. It shares its genre and handling ideas with Absolute Drift, but the name, car design, art, sound and levels are our own.
 
@@ -146,7 +146,7 @@ Already in place on this Mac: git 2.50, GitHub CLI 2.97 signed in as `SIGALIZ3R`
 
 1. **Local repository.** `git init -b main`, add a `.gitignore`, first commit.
 2. **Create the GitHub repo and push.** `gh repo create sigdrift --public --source=. --remote=origin --push`. Public is needed for free Pages hosting; this publishes the code.
-3. **Project board.** `gh auth refresh -s project` (opens the browser once), then `gh project create --owner @me --title "SigDRIFT Roadmap"` and `gh project link`.
+3. **Project board.** `gh auth refresh -s project` (opens the browser once), then `gh project create --owner @me --title "DriftNeo Roadmap"` and `gh project link`.
 4. **Milestones and issues.** One GitHub milestone per row in section 4, one issue per task, added to the board.
 5. **CI and deploy.** `.github/workflows/ci.yml` runs typecheck, tests and build on every push, and deploys `dist` to Pages from `main` (actions: checkout v7, setup-node v7, upload-pages-artifact v5, deploy-pages v5).
 6. **Enable Pages.** Settings → Pages → Source: GitHub Actions. Set `base: '/sigdrift/'` in `vite.config.ts` for CI builds.

@@ -1,7 +1,7 @@
 /**
  * Browser flows for the garage, the music slider and the touch controls.
  *
- * SigDRIFT has no accounts: a "player" is what is in localStorage. Two seeded players stand in for test users:
+ * DriftNeo has no accounts: a "player" is what is in localStorage. Two seeded players stand in for test users:
  *   NEW_PLAYER  has finished nothing (only the stock car)
  *   VETERAN     has finished levels 1-3 (the Viper is unlocked, the Brute is not)
  * Each test starts from a fresh browser context with its player written before the page loads.

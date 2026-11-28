@@ -1,6 +1,6 @@
-# SigDRIFT
+# DriftNeo
 
-Original neon drift game (TypeScript, three.js, Vite). Deploys to GitHub Pages from `main` via `.github/workflows/ci.yml`.
+Original neon drift game (TypeScript, three.js, Vite), formerly SigDRIFT. Save data keeps the `sigdrift:` localStorage prefix on purpose. Deploys to GitHub Pages from `main` via `.github/workflows/ci.yml`.
 
 ## Commands
 - `npm run typecheck`, `npm test` (Vitest), `npm run build`

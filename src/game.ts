@@ -268,7 +268,7 @@ export class Game {
   playLevel(levelId: string): void {
     const def = getLevelDef(levelId);
     if (!def) {
-      console.warn(`SigDRIFT: there is no level ${levelId}`);
+      console.warn(`DriftNeo: there is no level ${levelId}`);
       this.showMainMenu();
       return;
     }
@@ -292,7 +292,7 @@ export class Game {
     try {
       this.adopt(build());
     } catch (error) {
-      console.error(`SigDRIFT: could not build ${what}`, error);
+      console.error(`DriftNeo: could not build ${what}`, error);
       this.showMainMenu();
       return;
     }
