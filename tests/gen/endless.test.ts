@@ -279,7 +279,8 @@ describe('createEndlessGenerator', () => {
     }
     times.sort((a, b) => a - b);
     console.info(`endless next() after 2000 chunks: median ${times[100].toFixed(2)} ms, p90 ${times[180].toFixed(2)} ms`);
-    expect(times[100]).toBeLessThan(5);
+    // Shared CI runners are slower and busier than a desktop: twice the budget there.
+    expect(times[100]).toBeLessThan(process.env.CI ? 10 : 5);
   }, 30_000);
 });
 

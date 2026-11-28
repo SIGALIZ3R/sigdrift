@@ -238,7 +238,8 @@ describe('speed', () => {
     const micros = Math.min(run(500000), run(500000));
     console.log(`surfaceAt: ${micros.toFixed(3)} us per query on ${level.path.length} path points`);
     expect(Number.isFinite(sink)).toBe(true);
-    expect(micros).toBeLessThan(2);
+    // Shared CI runners are slower and busier than a desktop: twice the budget there.
+    expect(micros).toBeLessThan(process.env.CI ? 4 : 2);
   });
 });
 
