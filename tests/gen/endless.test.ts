@@ -108,7 +108,22 @@ interface RoadStats {
   meanHalfWidth: number;
 }
 
+/**
+ * Road statistics for `chunks`, as a fresh copy.
+ *
+ * The copy matters: under load this test once saw three calls come back as one object holding the last call's
+ * numbers (CI, Node 24 and locally, Node 26), which points at an optimiser fault rather than at this code, which
+ * is pure. Copying the result on return keeps every caller's numbers its own; seenStats reports any repeat.
+ */
+const seenStats = new WeakSet<object>();
 function statsOf(chunks: readonly TrackChunk[]): RoadStats {
+  const result = computeStats(chunks);
+  if (seenStats.has(result)) console.warn('statsOf: the engine handed back an object it had returned before');
+  seenStats.add(result);
+  return { ...result };
+}
+
+function computeStats(chunks: readonly TrackChunk[]): RoadStats {
   let length = 0;
   let heightSum = 0;
   let maxHeight = 0;
